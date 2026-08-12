@@ -78,7 +78,7 @@ async fn main(spawner: Spawner) {
 
     // The external phy opens its timeslot session and inserts the first
     // (EARLIEST) request BEFORE the mpsl_task starts processing.
-    let phy = MpslRadioPhy::new(RadioMode::Nrf2Mbit, cfg!(feature = "peripheral")).await;
+    let phy = MpslRadioPhy::new(RadioMode::Nrf2Mbit).await;
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     info!("MPSL ready");
 

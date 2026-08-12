@@ -250,8 +250,10 @@ static mut FIRST_REQUEST: bool = true;
 /// + the peripheral's own phase drift) and nudges the distance +/-1 us to
 /// keep the chain period matched. The phase then stays inside the RX window
 /// indefinitely - no re-request needed.
+/// Sync: the link layer's peripheral phase-locks the chain by nudging this
+/// correction (+/-1 us on the chained request's distance) - see
+/// `thunders::link::Peripheral::frame` and the `Phy::adjust_period` hook.
 static mut DISTANCE_CORRECTION: i32 = 0;
-static mut LAST_CATCH: Option<embassy_time::Instant> = None;
 /// The chained (NORMAL) request handed to the MPSL in the callback.
 static mut NEXT_REQ: core::mem::MaybeUninit<nrf_mpsl::raw::mpsl_timeslot_request_t> =
     core::mem::MaybeUninit::uninit();
@@ -337,10 +339,6 @@ fn mpsl_request_timeslot() -> i32 {
 /// [`timeslot_do_work`] on `SIGNAL_START`.
 pub struct MpslRadioPhy<'d> {
     _mode: RadioMode,
-    /// Role-gated "connection formed" sync: only the peripheral re-anchors
-    /// its chain on the peer's TX phase. The central must stay free-running
-    /// (it is the master - re-anchoring it breaks the PING cadence).
-    sync: bool,
     _phantom: core::marker::PhantomData<&'d ()>,
 }
 
@@ -351,7 +349,7 @@ impl<'d> MpslRadioPhy<'d> {
     /// [`timeslot_do_work`] on `SIGNAL_START`), lets the MPSL low-priority
     /// processing run, and issues the first (EARLIEST) timeslot request.
     /// MPSL must already be initialized.
-    pub async fn new(_radio_mode: RadioMode, sync: bool) -> Self {
+    pub async fn new(_radio_mode: RadioMode) -> Self {
         // The bare path power-cycles the radio (POWER off/on = hardware reset)
         // before first use; the MPSL's init does not. On the nRF5340 the RX
         // frontend appears to need that reset (the MPSL RX was RF-deaf: radio
@@ -432,7 +430,6 @@ impl<'d> MpslRadioPhy<'d> {
 
         Self {
             _mode: _radio_mode,
-            sync,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -512,26 +509,6 @@ impl<'d> Phy for MpslRadioPhy<'d> {
         DONE.store(false, Ordering::Release);
         unsafe {
             if RX_OK && RX_RESULT > 0 && RX_RESULT <= buf.len() {
-                if self.sync {
-                    // Peripheral: phase-lock the chain to the peer. The
-                    // catch-to-catch interval is the peer's 1000 us period
-                    // plus the peripheral's own phase drift; nudge the chain
-                    // distance to cancel it (bang-bang, +/-1 us per catch).
-                    let now = embassy_time::Instant::now();
-                    if let Some(prev) = unsafe { LAST_CATCH } {
-                        let d = (now - prev).as_micros() as i32;
-                        unsafe {
-                            DISTANCE_CORRECTION = if d > 1000 {
-                                -1
-                            } else if d < 1000 {
-                                1
-                            } else {
-                                DISTANCE_CORRECTION
-                            };
-                        }
-                    }
-                    unsafe { LAST_CATCH = Some(now) };
-                }
                 buf[..RX_RESULT].copy_from_slice(&RX_OUT[1..1 + RX_RESULT]);
                 Ok(Some(RX_RESULT))
             } else {
@@ -541,4 +518,12 @@ impl<'d> Phy for MpslRadioPhy<'d> {
     }
 
     async fn flush(&mut self) {}
+
+    async fn adjust_period(&mut self, corr: i32) {
+        // The link layer's peripheral phase-locks the chain by nudging the
+        // chained request's distance; the callback applies it next slot.
+        unsafe {
+            DISTANCE_CORRECTION = corr;
+        }
+    }
 }

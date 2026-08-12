@@ -24,19 +24,18 @@ pub enum Packet {
         /// Flags (reserved for future use).
         flags: u8,
     },
-    /// Data packet carrying a payload and piggy-backed ACK.
+    /// Data packet carrying a payload.
+    ///
+    /// Reliability is seq-based: the receiver accepts a frame only when its
+    /// seq is inside the accept window (freshness/ordering check), and the
+    /// peer's replies serve as the implicit acknowledgment that the link is
+    /// alive. No explicit ACK field or ACK packet - keeps the on-air time
+    /// minimal for high frame rates.
     Data {
         /// Sequence number of this packet.
         seq: u8,
-        /// Sequence number being acknowledged.
-        ack: u8,
         /// Up to [`MAX_PAYLOAD`] bytes of user data.
         payload: Vec<u8, MAX_PAYLOAD>,
-    },
-    /// Stand-alone acknowledgement.
-    Ack {
-        /// Sequence number being acknowledged.
-        ack: u8,
     },
     /// Pairing request from a peripheral.
     PairingRequest {
@@ -72,11 +71,7 @@ mod tests {
     fn round_trip_data() {
         let mut payload = Vec::<u8, MAX_PAYLOAD>::new();
         payload.extend_from_slice(&[1, 2, 3, 4]).unwrap();
-        let pkt = Packet::Data {
-            seq: 7,
-            ack: 9,
-            payload,
-        };
+        let pkt = Packet::Data { seq: 7, payload };
         let mut buf = [0u8; 64];
         let n = pkt.to_bytes(&mut buf).unwrap();
         let decoded = Packet::from_bytes(&buf[..n]).unwrap();

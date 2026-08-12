@@ -151,7 +151,6 @@ impl<P: Phy> Central<P> {
             self.state.encrypt_payload(&mut payload, true)?;
             Packet::Data {
                 seq: self.state.tx_seq,
-                ack: self.state.rx_seq,
                 payload,
             }
         } else {
@@ -195,8 +194,7 @@ impl<P: Phy> Central<P> {
 
         let mut received = None;
         match reply {
-            Packet::Data { seq, ack, mut payload } => {
-                self.handle_ack(ack);
+            Packet::Data { seq, mut payload } => {
                 self.state.decrypt_payload(&mut payload, seq, false)?;
                 if self.accept_seq(seq) {
                     let len = payload.len();
@@ -211,25 +209,12 @@ impl<P: Phy> Central<P> {
                     self.state.tx_seq = self.state.tx_seq.wrapping_add(1);
                 }
             }
-            Packet::Ack { ack } => {
-                self.handle_ack(ack);
-                if sent_data {
-                    self.state.tx_seq = self.state.tx_seq.wrapping_add(1);
-                }
-            }
             _ => {}
         }
 
         self.state.scheduler.advance();
         self.state.epoch = self.state.epoch.wrapping_add(1);
         Ok(received)
-    }
-
-    fn handle_ack(&mut self, ack: u8) {
-        // For a stop-and-wait style link, any ack tells us the peer is
-        // alive.  More sophisticated windowing would track outstanding
-        // packets here.
-        let _ = ack;
     }
 
     fn accept_seq(&self, seq: u8) -> bool {
@@ -251,6 +236,8 @@ pub struct Peripheral<P: Phy> {
     phy: P,
     state: LinkState,
     missed_frames: u8,
+    /// Last frame catch time (the phase-lock reference for the sync PLL).
+    last_catch: Option<embassy_time::Instant>,
     tx_buf: [u8; MAX_PAYLOAD + 16],
     rx_pkt_buf: [u8; MAX_PAYLOAD + 16],
 }
@@ -264,6 +251,7 @@ impl<P: Phy> Peripheral<P> {
             phy,
             state: LinkState::new(&cfg),
             missed_frames: 0,
+            last_catch: None,
             tx_buf: [0u8; MAX_PAYLOAD + 16],
             rx_pkt_buf: [0u8; MAX_PAYLOAD + 16],
         })
@@ -291,7 +279,22 @@ impl<P: Phy> Peripheral<P> {
             )
             .await?
         {
-            Some(len) => len,
+            Some(len) => {
+                // "Connection formed" sync: phase-lock our chain to the
+                // central's. The catch-to-catch interval is the central's
+                // 1000 us period plus our own phase drift; nudge the phy's
+                // period to cancel it (bang-bang, +/-1 us per catch).
+                let now = embassy_time::Instant::now();
+                if let Some(prev) = self.last_catch {
+                    let d = (now - prev).as_micros() as i32;
+                    let corr = if d > 1000 { -1 } else if d < 1000 { 1 } else { 0 };
+                    if corr != 0 {
+                        self.phy.adjust_period(corr).await;
+                    }
+                }
+                self.last_catch = Some(now);
+                len
+            }
             None => {
                 self.missed_frames = self.missed_frames.saturating_add(1);
                 self.state.scheduler.advance();
@@ -307,8 +310,7 @@ impl<P: Phy> Peripheral<P> {
         // Extract any data from the central and build the reply.
         let mut received = None;
         let reply = match incoming {
-            Packet::Data { seq, ack, mut payload } => {
-                self.handle_ack(ack);
+            Packet::Data { seq, mut payload } => {
                 self.state.decrypt_payload(&mut payload, seq, true)?;
                 if self.accept_seq(seq) {
                     let len = payload.len();
@@ -353,7 +355,6 @@ impl<P: Phy> Peripheral<P> {
         }
         Ok(Packet::Data {
             seq: self.state.tx_seq,
-            ack: self.state.rx_seq,
             payload,
         })
     }

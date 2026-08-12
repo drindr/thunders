@@ -40,4 +40,11 @@ pub trait Phy {
 
     /// Flush any stale RX/TX state.
     async fn flush(&mut self);
+
+    /// Adjust the RX/TX period by `corr` microseconds (sync, no-op by
+    /// default). The link layer's peripheral uses this to phase-lock its
+    /// schedule to the central's once frames start flowing ("connection
+    /// formed"). The bare radio needs no adjustment; the MPSL backend
+    /// nudges its chained timeslot distance.
+    async fn adjust_period(&mut self, _corr: i32) {}
 }
