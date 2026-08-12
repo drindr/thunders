@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 thunders = { path = "../../../thunders", features = ["defmt"] }
 thunders-phy-nrf = { path = "../../../thunders-phy-nrf", features = ["nrf54l20", "mpsl", "defmt"] }
-nrf-mpsl = { path = "../../../vendor/nrf-sdc/nrf-mpsl", features = ["nrf54lm20-app-s", "critical-section-impl"] }
+nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "f54b6389ffa2750d4d3a4f5435660cb66b47e51a", features = ["nrf54lm20-app-s", "critical-section-impl"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
 embassy-time = { version = "0.5.1" }
 embassy-nrf = { version = "0.11.0", features = ["nrf54lm20-app-s", "rt", "time-driver-grtc"] }

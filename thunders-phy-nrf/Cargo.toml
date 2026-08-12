@@ -14,7 +14,7 @@ embassy-time = { workspace = true }
 embassy-sync = { workspace = true }
 embassy-futures = { workspace = true }
 defmt = { workspace = true, optional = true }
-nrf-mpsl = { path = "../vendor/nrf-sdc/nrf-mpsl", optional = true }
+nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "f54b6389ffa2750d4d3a4f5435660cb66b47e51a", optional = true }
 rtt-target = { version = "0.5", optional = true }
 
 [features]
