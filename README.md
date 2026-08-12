@@ -66,8 +66,8 @@ PING payload is 8 bytes; bandwidth = received payload bytes/s.
 |---|---|---|---|---|---|---|
 | 5340 central ↔ LM20 peripheral | **bare** | 542 Hz | 4.3 KB/s | 322 RXOK / 2 s = **1.3 KB/s** | 322 / 2 s = 1.3 KB/s | 0 |
 | LM20 central ↔ 5340 peripheral | **bare** | 233 Hz | 1.9 KB/s | 329 RXOK / 2 s = **1.3 KB/s** | 320 / 2 s = 1.3 KB/s | 0 |
-| 5340 central ↔ LM20 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | ~100 PINGs / s = **~800 B/s** | GOT=72 (≈19 B/s) | 0 |
-| LM20 central ↔ 5340 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | ~78 PINGs / s = **~630 B/s** | GOT=60 (≈16 B/s) | 0 |
+| 5340 central ↔ LM20 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | **~660 B/s steady** (phase-locked) | GOT=22 | 0 |
+| LM20 central ↔ 5340 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | **~600 B/s steady** (phase-locked) | GOT=67 | 0 |
 
 Two different ceilings are visible:
 
@@ -81,12 +81,18 @@ Two different ceilings are visible:
   overlaps the central's TX. Two knobs already help: the RX listen window per
   slot was raised (`RX_POLL_BOUND` 1000→2000 on the 5340, 1000→3000 on the
   LM20 — the slot budget allows it, the 106:179 overrun assert still holds),
-  which lifted the peer catch from ~100 B/s to **~800 B/s**. The round-trip RX
-  (the echo caught back) stays rarer (~16-19 B/s) because a full echo needs
-  the two slots aligned *twice*. The remaining lever is real phase sync: this
-  MPSL version has only EARLIEST + NORMAL requests (no ABSOLUTE), so the
-  options are re-anchoring the peripheral's chain via a fresh EARLIEST after
-  each catch, or a newer MPSL with the ABSOLUTE request type.
+  which lifted the peer catch from ~100 B/s to **~800 B/s**. The remaining
+  lever is phase sync, and it is now implemented: a **distance PLL** on the
+  peripheral (see `thunders-phy-nrf/src/mpsl.rs`). The MPSL's absolute-time
+  requests don't exist here (only EARLIEST + NORMAL), and re-anchoring via a
+  fresh EARLIEST is blocked while the session is active (-NRF_EAGAIN: the
+  chain never truly goes idle). So the peripheral instead measures its
+  catch-to-catch interval (the peer's 1000 us period plus its own phase
+  drift) and nudges the chained request's `distance_us` by ±1 us per catch —
+  a bang-bang PLL that holds the phase inside the RX window indefinitely.
+  The catch is now **steady ~600-660 B/s** instead of the bursty
+  drift-dependent pattern. The central stays free-running (it is the master;
+  re-anchoring it breaks the PING cadence).
 
 ## nRF54L field notes (things the SVD won't tell you)
 

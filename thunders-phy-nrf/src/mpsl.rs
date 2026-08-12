@@ -242,6 +242,16 @@ static mut OP: OpKind = OpKind::Idle;
 /// First request must be EARLIEST; afterwards the callback chains NORMAL
 /// requests, so we never call mpsl_timeslot_request again from the app.
 static mut FIRST_REQUEST: bool = true;
+/// Sync ("connection formed"): the peripheral's chain period is corrected
+/// to match the peer's. The MPSL's EARLIEST re-request is blocked while the
+/// session is active (-NRF_EAGAIN: the session is not IDLE - the chain never
+/// truly ends), so the phase lock instead uses the chained NORMAL request's
+/// distance: the app measures the catch-to-catch interval (the peer's period
+/// + the peripheral's own phase drift) and nudges the distance +/-1 us to
+/// keep the chain period matched. The phase then stays inside the RX window
+/// indefinitely - no re-request needed.
+static mut DISTANCE_CORRECTION: i32 = 0;
+static mut LAST_CATCH: Option<embassy_time::Instant> = None;
 /// The chained (NORMAL) request handed to the MPSL in the callback.
 static mut NEXT_REQ: core::mem::MaybeUninit<nrf_mpsl::raw::mpsl_timeslot_request_t> =
     core::mem::MaybeUninit::uninit();
@@ -270,7 +280,9 @@ unsafe extern "C" fn timeslot_cb(
                 normal: nrf_mpsl::raw::mpsl_timeslot_request_normal_t {
                     hfclk: nrf_mpsl::raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8,
                     priority: nrf_mpsl::raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8,
-                    distance_us: 1000,
+                    // Distance PLL: the app nudges the period +/-1 us so the
+                    // chain stays phase-locked to the peer (see DISTANCE_CORRECTION).
+                    distance_us: (1000 + unsafe { DISTANCE_CORRECTION }) as u32,
                     length_us: 900,
                 },
             },
@@ -325,6 +337,10 @@ fn mpsl_request_timeslot() -> i32 {
 /// [`timeslot_do_work`] on `SIGNAL_START`.
 pub struct MpslRadioPhy<'d> {
     _mode: RadioMode,
+    /// Role-gated "connection formed" sync: only the peripheral re-anchors
+    /// its chain on the peer's TX phase. The central must stay free-running
+    /// (it is the master - re-anchoring it breaks the PING cadence).
+    sync: bool,
     _phantom: core::marker::PhantomData<&'d ()>,
 }
 
@@ -335,7 +351,7 @@ impl<'d> MpslRadioPhy<'d> {
     /// [`timeslot_do_work`] on `SIGNAL_START`), lets the MPSL low-priority
     /// processing run, and issues the first (EARLIEST) timeslot request.
     /// MPSL must already be initialized.
-    pub async fn new(_radio_mode: RadioMode) -> Self {
+    pub async fn new(_radio_mode: RadioMode, sync: bool) -> Self {
         // The bare path power-cycles the radio (POWER off/on = hardware reset)
         // before first use; the MPSL's init does not. On the nRF5340 the RX
         // frontend appears to need that reset (the MPSL RX was RF-deaf: radio
@@ -416,6 +432,7 @@ impl<'d> MpslRadioPhy<'d> {
 
         Self {
             _mode: _radio_mode,
+            sync,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -495,6 +512,26 @@ impl<'d> Phy for MpslRadioPhy<'d> {
         DONE.store(false, Ordering::Release);
         unsafe {
             if RX_OK && RX_RESULT > 0 && RX_RESULT <= buf.len() {
+                if self.sync {
+                    // Peripheral: phase-lock the chain to the peer. The
+                    // catch-to-catch interval is the peer's 1000 us period
+                    // plus the peripheral's own phase drift; nudge the chain
+                    // distance to cancel it (bang-bang, +/-1 us per catch).
+                    let now = embassy_time::Instant::now();
+                    if let Some(prev) = unsafe { LAST_CATCH } {
+                        let d = (now - prev).as_micros() as i32;
+                        unsafe {
+                            DISTANCE_CORRECTION = if d > 1000 {
+                                -1
+                            } else if d < 1000 {
+                                1
+                            } else {
+                                DISTANCE_CORRECTION
+                            };
+                        }
+                    }
+                    unsafe { LAST_CATCH = Some(now) };
+                }
                 buf[..RX_RESULT].copy_from_slice(&RX_OUT[1..1 + RX_RESULT]);
                 Ok(Some(RX_RESULT))
             } else {
