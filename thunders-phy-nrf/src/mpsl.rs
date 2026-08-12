@@ -14,98 +14,36 @@ use thunders::phy::Phy;
 
 use crate::radio_phy::RadioMode;
 
-// --- radio base + register offsets (verified against the Nordic SVD) ---
+// --- radio access via the pac (base + register offsets from the SVD) ---
+// The pac's generated instance: RADIO_NS on the nRF5340 net core, RADIO_S
+// (secure instance) on the nRF54L. All register access goes through the pac
+// accessors - no hand-picked offsets.
 #[cfg(feature = "nrf5340-net")]
-const RADIO_BASE: usize = 0x4100_8000; // RADIO_NS (net core)
+use nrf_pac::RADIO_NS as RADIO;
 #[cfg(feature = "_nrf54")]
-const RADIO_BASE: usize = 0x5008_A000; // RADIO_S (secure instance, nRF54L)
+use nrf_pac::RADIO_S as RADIO;
+use nrf_pac::radio::regs;
 
+// RX completion event: EVENTS_END on the 5340 (the END-completed frame),
+// EVENTS_PHYEND on the nRF54L (the LM20's frame completes at PHYEND).
 #[cfg(feature = "nrf5340-net")]
-const PCNF0: usize = 0x514;
+fn end_ev_set() -> bool {
+    RADIO.events_end().read() != 0
+}
 #[cfg(feature = "_nrf54")]
-const PCNF0: usize = 0xE20;
-#[cfg(feature = "nrf5340-net")]
-const PCNF1: usize = 0x518;
-#[cfg(feature = "_nrf54")]
-const PCNF1: usize = 0xE28;
-#[cfg(feature = "nrf5340-net")]
-const CRCCNF: usize = 0x534;
-#[cfg(feature = "_nrf54")]
-const CRCCNF: usize = 0xE44;
-#[cfg(feature = "nrf5340-net")]
-const CRCPOLY: usize = 0x538;
-#[cfg(feature = "_nrf54")]
-const CRCPOLY: usize = 0xE48;
-#[cfg(feature = "nrf5340-net")]
-const CRCINIT: usize = 0x53C;
-#[cfg(feature = "_nrf54")]
-const CRCINIT: usize = 0xE4C;
-#[cfg(feature = "nrf5340-net")]
-const BASE0: usize = 0x51C;
-#[cfg(feature = "_nrf54")]
-const BASE0: usize = 0xE2C;
-#[cfg(feature = "nrf5340-net")]
-const PREFIX0: usize = 0x524;
-#[cfg(feature = "_nrf54")]
-const PREFIX0: usize = 0xE34;
-#[cfg(feature = "nrf5340-net")]
-const TXADDR: usize = 0x52C;
-#[cfg(feature = "_nrf54")]
-const TXADDR: usize = 0xE3C;
-#[cfg(feature = "nrf5340-net")]
-const RXADDRS: usize = 0x530;
-#[cfg(feature = "_nrf54")]
-const RXADDRS: usize = 0xE40;
-#[cfg(feature = "nrf5340-net")]
-const FREQ: usize = 0x508;
-#[cfg(feature = "_nrf54")]
-const FREQ: usize = 0x708;
-#[cfg(feature = "nrf5340-net")]
-const TXPOWER: usize = 0x50C;
-#[cfg(feature = "_nrf54")]
-const TXPOWER: usize = 0x710;
-#[cfg(feature = "nrf5340-net")]
-const MODE: usize = 0x510;
-// nRF54L RADIO MODE is at 0x500 (TASKS_TXEN is at 0x0).
-#[cfg(feature = "_nrf54")]
-const MODE: usize = 0x500;
-#[cfg(feature = "nrf5340-net")]
-const PACKETPTR: usize = 0x504;
-#[cfg(feature = "_nrf54")]
-const PACKETPTR: usize = 0xED0;
-#[cfg(feature = "nrf5340-net")]
-const PHYEND: usize = 0x16C; // EVENTS_PHYEND
-#[cfg(feature = "_nrf54")]
-const PHYEND: usize = 0x21C;
-#[cfg(feature = "nrf5340-net")]
-const STATE: usize = 0x400; // RADIO STATE (nRF52-era layout; Disabled=0)
-#[cfg(feature = "_nrf54")]
-const STATE: usize = 0x520;
-#[cfg(feature = "nrf5340-net")]
-const CRCSTATUS: usize = 0x400;
-#[cfg(feature = "_nrf54")]
-const CRCSTATUS: usize = 0xE0C;
-// TASKS_DISABLE is 0x10 on both nRF5340 and nRF54L (nRF52 had 0x10 too;
-// only the nRF54L task block differs from nRF52 elsewhere).
-const DISABLE: usize = 0x10;
-#[cfg(feature = "nrf5340-net")]
-const SHORTS: usize = 0x200;
-#[cfg(feature = "_nrf54")]
-const SHORTS: usize = 0x400;
-const TASKS_PLLEN: usize = 0x6C;
-const EVENTS_PLLREADY: usize = 0x2B0;
-// EVENTS_DISABLED: nRF5340 at 0x110, nRF54L at 0x220.
-#[cfg(feature = "nrf5340-net")]
-const EVENTS_DISABLED: usize = 0x110;
-#[cfg(feature = "_nrf54")]
-const EVENTS_DISABLED: usize = 0x220;
+fn end_ev_set() -> bool {
+    RADIO.events_phyend().read() != 0
+}
+fn end_ev_clear() {
+    #[cfg(feature = "nrf5340-net")]
+    RADIO.events_end().write_value(0);
+    #[cfg(feature = "_nrf54")]
+    RADIO.events_phyend().write_value(0);
+}
 
-// READY_START | PHYEND_DISABLE: ramp completes -> START (TX or RX),
-// PHYEND (CRC done) -> DISABLE. Matches Nordic ESB on both chip families.
-// nRF5340: READY_START=bit0, PHYEND_DISABLE=bit20. nRF54L: bit0, bit19.
-// The nRF5340 now uses the BARE-path shorts: END_DISABLE + RXREADY_START
-// (RX) / TXREADY_START (TX) + the EVENTS_END poll - the verified-working
-// combo on this chip (the PHYEND path was RF-deaf in RX).
+// SHORTS wiring: READY_START | PHYEND_DISABLE (nRF54L) /
+// RXREADY_START|TXREADY_START | END_DISABLE (nRF5340), matching the
+// verified ESB-compatible framing on each chip.
 #[cfg(feature = "nrf5340-net")]
 const SHORTS_RX: u32 = 0x80002; // RXREADY_START(19) | END_DISABLE(1)
 #[cfg(feature = "nrf5340-net")]
@@ -114,84 +52,12 @@ const SHORTS_TX: u32 = 0x40002; // TXREADY_START(18) | END_DISABLE(1)
 const SHORTS_RX: u32 = 0x80001; // READY_START | PHYEND_DISABLE (LM20, verified)
 #[cfg(feature = "_nrf54")]
 const SHORTS_TX: u32 = 0x80001;
-#[cfg(feature = "nrf5340-net")]
-const END_EV: usize = 0x10C; // EVENTS_END
-/// RX poll bound: must fit the 3.5 ms timeslot with the config/PLL work plus a
-/// safety margin (the MPSL asserts 106:179 if the slot work overruns). The
-/// 5340's poll loop is ~210 ns/iter -> 12k ~= 2.5 ms.
+/// RX poll bound: must fit the timeslot with the config/PLL work plus a
+/// safety margin (the MPSL asserts 106:179 if the slot work overruns).
 #[cfg(feature = "nrf5340-net")]
 const RX_POLL_BOUND: u32 = 1_000;
-/// The nRF54L's poll loop is ~150 ns/iter -> 16k ~= 2.4 ms.
 #[cfg(feature = "_nrf54")]
 const RX_POLL_BOUND: u32 = 1_000;
-#[cfg(feature = "_nrf54")]
-const END_EV: usize = 0x21C; // EVENTS_PHYEND (the LM20 completes at PHYEND)
-
-fn rd(off: usize) -> u32 {
-    unsafe { (RADIO_BASE as *mut u32).add(off / 4).read_volatile() }
-}
-fn wr(off: usize, val: u32) {
-    unsafe { (RADIO_BASE as *mut u32).add(off / 4).write_volatile(val) }
-}
-
-
-
-/// Mode value: Nrf2Mbit (0x01) on both chip families.
-const MODE_VAL: u32 = 0x01;
-
-/// Run-time cross-check: the raw register offsets above must match the
-/// nrf-pac offsets (generated from the official Nordic SVD). A wrong offset
-/// is the #1 reason the two boards cannot talk, so fail fast at boot instead
-/// of shipping a silent radio misconfiguration.
-fn assert_offsets() {
-    let r = unsafe { nrf_pac::radio::Radio::from_ptr(core::ptr::null_mut()) };
-    // (register offset from nrf-pac, raw offset in this file, name).
-    let checks: [(usize, usize, &str); 17] = [
-        (unsafe { r.pcnf0().as_ptr() } as usize, PCNF0, "PCNF0"),
-        (unsafe { r.pcnf1().as_ptr() } as usize, PCNF1, "PCNF1"),
-        (unsafe { r.crccnf().as_ptr() } as usize, CRCCNF, "CRCCNF"),
-        (unsafe { r.crcpoly().as_ptr() } as usize, CRCPOLY, "CRCPOLY"),
-        (unsafe { r.crcinit().as_ptr() } as usize, CRCINIT, "CRCINIT"),
-        (unsafe { r.base0().as_ptr() } as usize, BASE0, "BASE0"),
-        (unsafe { r.prefix0().as_ptr() } as usize, PREFIX0, "PREFIX0"),
-        (unsafe { r.txaddress().as_ptr() } as usize, TXADDR, "TXADDR"),
-        (unsafe { r.rxaddresses().as_ptr() } as usize, RXADDRS, "RXADDRS"),
-        (unsafe { r.frequency().as_ptr() } as usize, FREQ, "FREQ"),
-        (unsafe { r.txpower().as_ptr() } as usize, TXPOWER, "TXPOWER"),
-        (unsafe { r.mode().as_ptr() } as usize, MODE, "MODE"),
-        (unsafe { r.packetptr().as_ptr() } as usize, PACKETPTR, "PACKETPTR"),
-        (unsafe { r.events_phyend().as_ptr() } as usize, PHYEND, "PHYEND"),
-        (unsafe { r.crcstatus().as_ptr() } as usize, CRCSTATUS, "CRCSTATUS"),
-        (unsafe { r.shorts().as_ptr() } as usize, SHORTS, "SHORTS"),
-        (unsafe { r.tasks_disable().as_ptr() } as usize, DISABLE, "DISABLE"),
-    ];
-    for (pac, raw, name) in checks {
-        if pac != raw {
-            report_mismatch(pac, raw, name);
-        }
-    }
-    // nRF5340 has no radio PLL task; nRF54L requires TASKS_PLLEN/EVENTS_PLLREADY.
-    #[cfg(feature = "_nrf54")]
-    if unsafe { r.tasks_pllen().as_ptr() } as usize != TASKS_PLLEN {
-        report_mismatch(unsafe { r.tasks_pllen().as_ptr() } as usize, TASKS_PLLEN, "TASKS_PLLEN");
-    }
-    #[cfg(feature = "_nrf54")]
-    if unsafe { r.events_pllready().as_ptr() } as usize != EVENTS_PLLREADY {
-        report_mismatch(unsafe { r.events_pllready().as_ptr() } as usize, EVENTS_PLLREADY, "EVENTS_PLLREADY");
-    }
-}
-
-/// Record a register offset mismatch where the host can read it, then panic.
-/// (Panic without defmt output would otherwise hang silently on the nRF54L
-/// boards while probe-rs holds the RTT channel in blocking mode.)
-fn report_mismatch(pac: usize, raw: usize, name: &str) {
-    let d = unsafe { core::slice::from_raw_parts_mut(0x2000_F020 as *mut u32, 8) };
-    d[0] = pac as u32;
-    d[1] = raw as u32;
-    d[2] = name.as_ptr() as u32;
-    d[3] = name.len() as u32;
-    panic!("mpsl register offset mismatch: {}", name);
-}
 
 // --- bridge state between the async phy and the timeslot callback ---
 #[repr(u8)]
@@ -202,8 +68,6 @@ enum OpKind {
     Rx = 2,
 }
 static mut OP_KIND: u8 = OpKind::Idle as u8;
-/// Set when the RX is event-driven (the callback's SIGNAL_RADIO completes it
-/// on the END event); when false, the poll path signals the DONE itself.
 static mut TX_DATA: [u8; 64] = [0; 64];
 static mut TX_LEN: usize = 0;
 static mut TX_OUT: [u8; 64] = [0; 64];
@@ -230,40 +94,47 @@ pub unsafe fn signal_done() {
 /// The BARE-path wire format (CRC-16, balen 4, crcinc-exclude) is used: it is
 /// the verified-working config on this 5340 (the MPSL format was deaf in RX).
 unsafe fn radio_configure() {
-    wr(MODE, MODE_VAL); // 2 Mbps (0x01) on both families
-    wr(PCNF0, 0x0100_0008); // lflen=8, plen=16bit, crcinc=Excl (the bare 2 Mbps)
-    wr(PCNF1, 0x0104_00FF); // maxlen=255, balen=4, endian=Big, whiteen=off
-    wr(CRCCNF, 0x2); // Len::Two + skipaddr=Include (the bare 2 Mbps CRC-16)
-    wr(CRCPOLY, 0x0001_1021);
-    wr(CRCINIT, 0x0000_FFFF);
-    wr(FREQ, CUR_CHANNEL as u32);
+    let r = RADIO;
+    // 2 Mbps (0x01) on both families (the nRF54L pac names the register's
+    // struct RadioMode; the nRF5340's is Mode - the values are identical).
+    #[cfg(feature = "nrf5340-net")]
+    r.mode().write_value(regs::Mode(0x01));
+    #[cfg(feature = "_nrf54")]
+    r.mode().write_value(regs::RadioMode(0x01));
+    r.pcnf0().write_value(regs::Pcnf0(0x0100_0008)); // lflen=8, plen=16bit, crcinc=Excl
+    r.pcnf1().write_value(regs::Pcnf1(0x0104_00FF)); // maxlen=255, balen=4, endian=Big, whiteen=off
+    r.crccnf().write_value(regs::Crccnf(0x2)); // Len::Two + skipaddr=Include
+    r.crcpoly().write_value(regs::Crcpoly(0x0001_1021));
+    r.crcinit().write_value(regs::Crcinit(0x0000_FFFF));
+    r.frequency().write_value(regs::Frequency(CUR_CHANNEL as u32));
     // TXPOWER: 0 dBm. The encoding differs per chip family - the nRF52/53
     // use 0x00, but the nRF54L's PA output is encoded (0 dBm = 0x18; the raw
     // 0x00 is a reserved value that leaves the PA off - the phantom TX: the
     // radio runs its TX state machine but emits no RF).
     #[cfg(feature = "nrf5340-net")]
-    wr(TXPOWER, 0x00);
+    r.txpower().write_value(regs::Txpower(0x00));
     #[cfg(feature = "_nrf54")]
-    wr(TXPOWER, 0x18);
-    wr(BASE0, CUR_BASE0);
-    wr(PREFIX0, CUR_PREFIX);
-    wr(TXADDR, 0);
-    wr(RXADDRS, 0x01);
+    r.txpower().write_value(regs::Txpower(0x18));
+    r.base0().write_value(CUR_BASE0);
+    r.prefix0().write_value(regs::Prefix0(CUR_PREFIX));
+    r.txaddress().write_value(regs::Txaddress(0));
+    r.rxaddresses().write_value(regs::Rxaddresses(0x01));
 }
 
-unsafe fn pll_enable() {
+fn pll_enable() {
     #[cfg(feature = "_nrf54")]
     {
-        wr(EVENTS_PLLREADY, 0);
-        wr(TASKS_PLLEN, 1);
+        let r = RADIO;
+        r.events_pllready().write_value(0);
+        r.tasks_pllen().write_value(1);
         let mut i = 0;
-        while rd(EVENTS_PLLREADY) == 0 {
+        while r.events_pllready().read() == 0 {
             i += 1;
             if i > 100_000 {
                 break;
             }
         }
-        wr(EVENTS_PLLREADY, 0);
+        r.events_pllready().write_value(0);
     }
 }
 
@@ -280,58 +151,67 @@ pub unsafe fn timeslot_do_work() {
             buf[0] = data.len() as u8;
             buf[1..1 + data.len()].copy_from_slice(data);
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-            wr(PACKETPTR, buf.as_ptr() as u32);
+            let r = RADIO;
+            r.packetptr().write_value(buf.as_ptr() as u32);
             pll_enable();
-            // nRF54L: the TX DMA amount (TXD.AMOUNT at 0xEE8) must match the
-            // PDU length or the radio transmits a 0-length packet.
+            // nRF54L: the TX DMA amount must match the PDU length or the radio
+            // transmits a 0-length packet. The SVD has no register at 0xEE8
+            // (the pac maps TXD at 0x518), but the write is required on
+            // silicon - verified on the LM20.
             #[cfg(feature = "_nrf54")]
-            wr(0xEE8, 1 + data.len() as u32);
-            wr(SHORTS, SHORTS_TX);
-            wr(PHYEND, 0);
-            wr(0x10C, 0);
-            wr(0x0, 1); // TASKS_TXEN
+            unsafe {
+                (r.as_ptr() as *mut u32).add(0xEE8 / 4).write_volatile(1 + data.len() as u32);
+            }
+            r.shorts().write_value(regs::Shorts(SHORTS_TX));
+            r.events_phyend().write_value(0);
+            r.events_end().write_value(0);
+            r.tasks_txen().write_value(1);
             let mut i = 0;
-            while rd(END_EV) == 0 {
+            while !end_ev_set() {
                 i += 1;
                 if i > 1_000_000 {
                     break;
                 }
             }
-            wr(END_EV, 0);
-            wr(PHYEND, 0);
-            wr(DISABLE, 1);
+            end_ev_clear();
+            r.events_phyend().write_value(0);
+            r.tasks_disable().write_value(1);
         }
         x if x == OpKind::Rx as u8 => {
             let buf = &mut RX_OUT;
             buf.fill(0);
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
             pll_enable();
-            wr(SHORTS, SHORTS_RX);
-            wr(PACKETPTR, buf.as_ptr() as u32);
-            wr(0x100, 0);
-            wr(0x104, 0);
-            wr(0x108, 0);
-            wr(0x10C, 0);
-            wr(0x110, 0);
-            wr(PHYEND, 0);
+            let r = RADIO;
+            r.shorts().write_value(regs::Shorts(SHORTS_RX));
+            r.packetptr().write_value(buf.as_ptr() as u32);
+            // Clear the pending RX events so the poll keys only on this
+            // frame's completion (on the nRF54L the event block sits at
+            // 0x200+, not the 5340's 0x100 - the pac accessors handle both).
+            r.events_ready().write_value(0);
+            r.events_address().write_value(0);
+            r.events_payload().write_value(0);
+            r.events_end().write_value(0);
+            r.events_disabled().write_value(0);
+            r.events_phyend().write_value(0);
             // The nRF5340 (net core) starts its RX from the Disabled state
             // exactly like the verified bare path (disable-first + RXEN).
             #[cfg(feature = "nrf5340-net")]
-            wr(DISABLE, 1);
-            wr(0x4, 1); // TASKS_RXEN
+            r.tasks_disable().write_value(1);
+            r.tasks_rxen().write_value(1);
             let rx_poll = RX_POLL_BOUND;
             let mut i = 0;
-            while rd(END_EV) == 0 {
+            while !end_ev_set() {
                 i += 1;
                 if i > rx_poll {
                     break;
                 }
             }
-            wr(END_EV, 0);
+            end_ev_clear();
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-            let crc = rd(CRCSTATUS);
-            wr(DISABLE, 1);
-            wr(DISABLE, 1);
+            let crc = r.crcstatus().read().0;
+            r.tasks_disable().write_value(1);
+            r.tasks_disable().write_value(1);
             if crc & 0x1 == 0x1 {
                 let len = buf[0] as usize;
                 RX_OK = len <= 63;
@@ -447,18 +327,14 @@ impl<'d> MpslRadioPhy<'d> {
     /// processing run, and issues the first (EARLIEST) timeslot request.
     /// MPSL must already be initialized.
     pub async fn new(_radio_mode: RadioMode) -> Self {
-        #[cfg(any(feature = "nrf5340-net", feature = "_nrf54"))]
-        assert_offsets();
-
         // The bare path power-cycles the radio (POWER off/on = hardware reset)
         // before first use; the MPSL's init does not. On the nRF5340 the RX
         // frontend appears to need that reset (the MPSL RX was RF-deaf: radio
         // in Rx state, rssi=0, no ADDRESS/END/PHYEND, while the LM20 TXed).
         #[cfg(feature = "nrf5340-net")]
-        unsafe {
-            wr(0xFFC, 0); // RADIO.POWER off
-            wr(0xFFC, 1); // on (reset the radio hardware)
-        }
+        RADIO.power().write_value(regs::Power(0)); // RADIO.POWER off
+        #[cfg(feature = "nrf5340-net")]
+        RADIO.power().write_value(regs::Power(1)); // on (reset the radio hardware)
 
         // The session pool (the count) is configured by the MPSL layer's
         // `with_timeslots`; the phy only opens its own session within it.
