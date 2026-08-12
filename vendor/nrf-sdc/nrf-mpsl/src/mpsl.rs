@@ -430,12 +430,6 @@ impl<const N: usize> Default for SessionMem<N> {
 
 // Low priority interrupts
 /// The low-priority interrupt handler.
-///
-/// Zephyr ESB glue: the MPSL C lib only completes the radio arming (RAAL)
-/// when the low-priority work is processed from this interrupt context;
-/// thread-mode processing (the old `run()` loop) defers the arming forever
-/// and the session deadline check asserts (106:179). So process HERE, in the
-/// interrupt, and wake the (now idle) `run()` task.
 pub struct LowPrioInterruptHandler;
 impl<T: Interrupt> Handler<T> for LowPrioInterruptHandler {
     unsafe fn on_interrupt() {
