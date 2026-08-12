@@ -66,8 +66,8 @@ PING payload is 8 bytes; bandwidth = received payload bytes/s.
 |---|---|---|---|---|---|---|
 | 5340 central ↔ LM20 peripheral | **bare** | 542 Hz | 4.3 KB/s | 322 RXOK / 2 s = **1.3 KB/s** | 322 / 2 s = 1.3 KB/s | 0 |
 | LM20 central ↔ 5340 peripheral | **bare** | 233 Hz | 1.9 KB/s | 329 RXOK / 2 s = **1.3 KB/s** | 320 / 2 s = 1.3 KB/s | 0 |
-| 5340 central ↔ LM20 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | ~13 PINGs / s = **~100 B/s** (bursty ~460 B/s) | GOT=57 (≈15 B/s) | 0 |
-| LM20 central ↔ 5340 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | ~12 PINGs / s = **~100 B/s** | GOT=56 (≈15 B/s) | 0 |
+| 5340 central ↔ LM20 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | ~100 PINGs / s = **~800 B/s** | GOT=72 (≈19 B/s) | 0 |
+| LM20 central ↔ 5340 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | ~78 PINGs / s = **~630 B/s** | GOT=60 (≈16 B/s) | 0 |
 
 Two different ceilings are visible:
 
@@ -75,15 +75,18 @@ Two different ceilings are visible:
   central poll); the old 18× gap is gone. The central always frames RX+TX (2
   slots), the peripheral mostly RX (1 slot, ~830 Hz on the MPSL).
 - **Data rate** — the *caught* bytes are lower than the emitted rate on both
-  backends, and much lower on the MPSL. The bare radio stays in RX between
-  TXes (long poll windows), catching ~60% of the emitted PINGs. The MPSL's
-  free-running timeslot chains drift against each other, so the peer's 1 ms RX
-  slot only overlaps the central's TX intermittently: the sustained catch is
-  ~100 B/s, bursting to ~460 B/s while the chains happen to align. The
-  round-trip RX (the echo caught back) is rarer still (~15 B/s) because a full
-  echo needs the two slots aligned *twice*. Throughput on the MPSL path is
-  alignment-bound, not rate-bound — the remaining lever is the SDC-session
-  path (slot scheduling, not the free-running chains).
+  backends. The bare radio stays in RX between TXes (long poll windows),
+  catching ~60% of the emitted PINGs. The MPSL's free-running timeslot chains
+  drift against each other, so the peer's RX window only intermittently
+  overlaps the central's TX. Two knobs already help: the RX listen window per
+  slot was raised (`RX_POLL_BOUND` 1000→2000 on the 5340, 1000→3000 on the
+  LM20 — the slot budget allows it, the 106:179 overrun assert still holds),
+  which lifted the peer catch from ~100 B/s to **~800 B/s**. The round-trip RX
+  (the echo caught back) stays rarer (~16-19 B/s) because a full echo needs
+  the two slots aligned *twice*. The remaining lever is real phase sync: this
+  MPSL version has only EARLIEST + NORMAL requests (no ABSOLUTE), so the
+  options are re-anchoring the peripheral's chain via a fresh EARLIEST after
+  each catch, or a newer MPSL with the ABSOLUTE request type.
 
 ## nRF54L field notes (things the SVD won't tell you)
 

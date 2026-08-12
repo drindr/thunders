@@ -52,12 +52,21 @@ const SHORTS_TX: u32 = 0x40002; // TXREADY_START(18) | END_DISABLE(1)
 const SHORTS_RX: u32 = 0x80001; // READY_START | PHYEND_DISABLE (LM20, verified)
 #[cfg(feature = "_nrf54")]
 const SHORTS_TX: u32 = 0x80001;
-/// RX poll bound: must fit the timeslot with the config/PLL work plus a
-/// safety margin (the MPSL asserts 106:179 if the slot work overruns).
+/// RX poll bound: how many iterations the RX listens for the END event
+/// inside a granted slot. The slot is 900 us but the poll loop is ~210 ns/iter
+/// (5340) / ~150 ns/iter (LM20), so 1000 iters = only ~150-210 us of the slot
+/// - the radio sits deaf for the rest. Raised as far as the slot budget allows
+/// (the MPSL asserts 106:179 if the slot work overruns):
+///   5340: 2000 x 210 ns = 420 us RX + config + TX ~= 720 us of 900 us
+///   LM20: 3000 x 150 ns = 450 us RX + config      ~= 550 us of 900 us
+/// The free-running chains still drift; this widens the listen window so the
+/// overlap lands more often. The real sync (phase-lock) needs a newer MPSL
+/// with the ABSOLUTE request type - this vendored version has only
+/// EARLIEST + NORMAL, so the fallback is re-anchoring via a fresh EARLIEST.
 #[cfg(feature = "nrf5340-net")]
-const RX_POLL_BOUND: u32 = 1_000;
+const RX_POLL_BOUND: u32 = 2_000;
 #[cfg(feature = "_nrf54")]
-const RX_POLL_BOUND: u32 = 1_000;
+const RX_POLL_BOUND: u32 = 3_000;
 
 // --- bridge state between the async phy and the timeslot callback ---
 #[repr(u8)]
