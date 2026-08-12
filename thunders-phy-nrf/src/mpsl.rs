@@ -193,34 +193,6 @@ fn report_mismatch(pac: usize, raw: usize, name: &str) {
     panic!("mpsl register offset mismatch: {}", name);
 }
 
-// --- MPSL low-latency platform integration (moved out of the vendored nrf-mpsl
-// fork into the thunders phy) ---
-// The MPSL C lib invokes these callbacks around its time-critical work (radio
-// activity). The nRF54L reference (Zephyr subsys/mpsl/init/mpsl_init.c) does
-// two things on acquire: trigger CONSTLAT *and* keep the RRAM out of PowerOff
-// so code fetches from RRAM don't stall the MPSL's time-critical scheduler
-// work (the RRAM PowerOff fetch latency made the chained timeslot arming miss
-// its deadline - assert 106:179).
-#[cfg(feature = "_nrf54")]
-static mut RRAM_LOWPOWER_SAVE: u32 = 0;
-
-#[cfg(feature = "_nrf54")]
-#[no_mangle]
-unsafe extern "C" fn mpsl_low_latency_acquire_callback() {
-    nrf_pac::POWER_S.tasks_constlat().write_value(1);
-    let lowpower = nrf_pac::RRAMC_S.power().lowpowerconfig();
-    RRAM_LOWPOWER_SAVE = lowpower.read().mode().to_bits() as u32;
-    lowpower.write(|w| w.set_mode(nrf_pac::rramc::vals::Mode::Standby));
-}
-
-#[cfg(feature = "_nrf54")]
-#[no_mangle]
-unsafe extern "C" fn mpsl_low_latency_release_callback() {
-    let lowpower = nrf_pac::RRAMC_S.power().lowpowerconfig();
-    lowpower.write(|w| w.set_mode(nrf_pac::rramc::vals::Mode::from_bits(RRAM_LOWPOWER_SAVE as u8)));
-    nrf_pac::POWER_S.tasks_lowpwr().write_value(1);
-}
-
 // --- bridge state between the async phy and the timeslot callback ---
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -538,6 +510,14 @@ impl<'d> MpslRadioPhy<'d> {
             use embassy_nrf::interrupt::typelevel::{Interrupt as _, RADIO_0, TIMER10};
             RADIO_0::enable();
             TIMER10::enable();
+            // The MPSL's CONSTLAT-only low-latency callbacks (the official
+            // upstream) handle the CPU constant-latency. The nRF54L additionally
+            // needs the RRAM (code-fetch RAM) out of PowerOff - its high fetch
+            // latency made the chained timeslot arming miss its deadline
+            // (assert 106:179). The upstream callbacks don't touch it, so set
+            // it once here; the RRAM stays in Standby for the session.
+            let lowpower = nrf_pac::RRAMC_S.power().lowpowerconfig();
+            lowpower.write(|w| w.set_mode(nrf_pac::rramc::vals::Mode::Standby));
         }
         // The MPSL docs: "If the Timeslot API is used for RADIO access, the
         // application is responsible for enabling and disabling the interrupt
