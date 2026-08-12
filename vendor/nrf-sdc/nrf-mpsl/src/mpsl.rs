@@ -281,35 +281,6 @@ unsafe extern "C" fn assert_handler(file: *const core::ffi::c_char, line: u32) {
     )
 }
 
-// Zephyr's nrf54l platform reference (subsys/mpsl/init/mpsl_init.c) does two
-// things on acquire: trigger CONSTLAT *and* keep the RRAM out of PowerOff so
-// code fetches from RRAM don't stall the MPSL's time-critical scheduler work.
-// The fork only did CONSTLAT - the RRAM PowerOff fetch latency is what made
-// the chained timeslot arming miss its deadline (assert 106:179).
-#[cfg(feature = "_nrf54l")]
-static mut RRAM_LOWPOWER_SAVE: u32 = 0;
-
-#[cfg(feature = "_nrf54l")]
-#[no_mangle]
-unsafe extern "C" fn mpsl_low_latency_acquire_callback() {
-    let p = embassy_nrf::pac::POWER;
-    p.tasks_constlat().write_value(1);
-    // GLOBAL_RRAMC_S->POWER.LOWPOWERCONFIG at 0x5004_E008.
-    // MODE: 0 = PowerOff (reset value, high fetch latency), 1 = Standby (low).
-    let rram = 0x5004_E008usize as *mut u32;
-    RRAM_LOWPOWER_SAVE = rram.read_volatile();
-    rram.write_volatile(1);
-}
-
-#[cfg(feature = "_nrf54l")]
-#[no_mangle]
-unsafe extern "C" fn mpsl_low_latency_release_callback() {
-    let rram = 0x5004_E008usize as *mut u32;
-    rram.write_volatile(RRAM_LOWPOWER_SAVE);
-    let p = embassy_nrf::pac::POWER;
-    p.tasks_lowpwr().write_value(1);
-}
-
 impl Drop for MultiprotocolServiceLayer<'_> {
     fn drop(&mut self) {
         unsafe { raw::mpsl_uninit() };
@@ -360,12 +331,6 @@ impl<'d> MultiprotocolServiceLayer<'d> {
         RadioIrq::set_priority(Priority::P0);
         RtcIrq::set_priority(Priority::P0);
         TimerIrq::set_priority(Priority::P0);
-
-        // The MPSL docs: "If the Timeslot API is used for RADIO access, the
-        // application is responsible for enabling and disabling the interrupt
-        // for RADIO." The MPSL's radio processing (release, SIGNAL_RADIO)
-        // runs on the RADIO IRQ - without the NVIC enable it never runs.
-        unsafe { RadioIrq::enable() };
 
         CLOCK_POWER::set_priority(Priority::P4);
 
