@@ -67,8 +67,13 @@ async fn main(spawner: Spawner) {
         skip_wait_lfclk_started: raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
     };
 
+    // The MPSL layer is initialized WITH timeslot support: the SessionMem is
+    // passed to the constructor, which configures the session count internally
+    // (the phy then opens its own session within that pool).
     static MPSL: StaticCell<MultiprotocolServiceLayer> = StaticCell::new();
-    let mpsl = MPSL.init(MultiprotocolServiceLayer::new(mpsl_p, Irqs, lfclk_cfg).unwrap());
+    static MPSL_MEM: StaticCell<nrf_mpsl::SessionMem<8>> = StaticCell::new();
+    let mem = MPSL_MEM.init(nrf_mpsl::SessionMem::new());
+    let mpsl = MPSL.init(MultiprotocolServiceLayer::with_timeslots(mpsl_p, Irqs, lfclk_cfg, mem).unwrap());
 
     // The external phy opens its timeslot session and inserts the first
     // (EARLIEST) request BEFORE the mpsl_task starts processing.

@@ -193,8 +193,6 @@ fn report_mismatch(pac: usize, raw: usize, name: &str) {
     panic!("mpsl register offset mismatch: {}", name);
 }
 
-static mut SESSIONS: Option<nrf_mpsl::SessionMem<8>> = None;
-
 // --- bridge state between the async phy and the timeslot callback ---
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -462,20 +460,8 @@ impl<'d> MpslRadioPhy<'d> {
             wr(0xFFC, 1); // on (reset the radio hardware)
         }
 
-        // The phy owns its timeslot session memory and configures it here.
-        // Reserve the full session count so a concurrently running SDC (which
-        // reconfigures sessions on sdc_enable) still leaves a slot for us.
-        // Call this BEFORE building the SDC.
-        unsafe {
-            let m = SESSIONS.get_or_insert_with(nrf_mpsl::SessionMem::new);
-            let ret = nrf_mpsl::raw::mpsl_timeslot_session_count_set(
-                m.as_mut_ptr() as *mut _,
-                8,
-            );
-            #[cfg(feature = "defmt")]
-            defmt::info!("session_count_set ret={} ptr={:#x}", ret, m.as_mut_ptr() as usize);
-        }
-
+        // The session pool (the count) is configured by the MPSL layer's
+        // `with_timeslots`; the phy only opens its own session within it.
         let mut session_id: u8 = 0;
         let ret = unsafe {
             nrf_mpsl::raw::mpsl_timeslot_session_open(Some(timeslot_cb), &mut session_id)

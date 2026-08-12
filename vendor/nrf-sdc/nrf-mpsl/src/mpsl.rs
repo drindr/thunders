@@ -448,19 +448,12 @@ impl<'d> MultiprotocolServiceLayer<'d> {
 ///
 /// This buffer must be provided to [`MultiprotocolServiceLayer::with_timeslots`] to enable timeslot support.
 #[repr(align(4))]
-// MPSL requires the session memory 4-byte aligned (-NRF_EFAULT otherwise).
-#[repr(align(4))]
 pub struct SessionMem<const N: usize>(MaybeUninit<[[u8; raw::MPSL_TIMESLOT_CONTEXT_SIZE as usize]; N]>);
 
 impl<const N: usize> SessionMem<N> {
     /// Creates a new `SessionMem` instance.
     pub fn new() -> Self {
         Self(MaybeUninit::uninit())
-    }
-
-    /// Expose the session memory pointer for `mpsl_timeslot_session_count_set`.
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.0.as_mut_ptr() as *mut u8
     }
 }
 
