@@ -1,0 +1,23 @@
+[package]
+name = "thunders"
+version = "0.1.0"
+edition = "2021"
+authors = ["Drin"]
+description = "Core no_std RF protocol stack for nRF and external PHYs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+postcard = { workspace = true, features = ["heapless"] }
+serde = { workspace = true }
+heapless = { workspace = true, features = ["serde"] }
+embassy-time = { workspace = true }
+embassy-sync = { workspace = true }
+embassy-futures = { workspace = true, optional = true }
+defmt = { workspace = true, optional = true }
+chacha20poly1305 = { version = "0.11", default-features = false, optional = true }
+aead = { version = "0.6", default-features = false, optional = true }
+
+[features]
+default = []
+defmt = ["dep:defmt", "heapless/defmt"]
+secure = ["dep:chacha20poly1305", "dep:aead"]

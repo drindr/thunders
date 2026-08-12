@@ -1,0 +1,57 @@
+[package]
+authors = ["Alex Moon <alex@moonspot.org>"]
+description = "High level rust bindings to the Nordic Softdevice Controller"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+name = "nrf-sdc"
+repository = "https://github.com/alexmoon/nrf-sdc"
+version = "0.4.0"
+rust-version="1.77"
+
+[package.metadata.docs.rs]
+features = ["nrf52840", "peripheral", "central", "defmt"]
+default-target = "thumbv7em-none-eabihf"
+targets = ["thumbv7em-none-eabihf"]
+
+[features]
+nrf52805 = ["nrf-mpsl/nrf52805", "nrf52"]
+nrf52810 = ["nrf-mpsl/nrf52810", "nrf52"]
+nrf52811 = ["nrf-mpsl/nrf52811", "nrf52"]
+nrf52820 = ["nrf-mpsl/nrf52820", "nrf52"]
+nrf52832 = ["nrf-mpsl/nrf52832", "nrf52"]
+nrf52833 = ["nrf-mpsl/nrf52833", "nrf52"]
+nrf52840 = ["nrf-mpsl/nrf52840", "nrf52"]
+nrf5340-net = ["nrf-mpsl/nrf5340-net", "nrf53"]
+nrf54l05-app-ns = ["nrf-mpsl/nrf54l05-app-ns", "nrf-sdc-sys/nrf54l-ns", "nrf54l"]
+nrf54l05-app-s = ["nrf-mpsl/nrf54l05-app-s", "nrf-sdc-sys/nrf54l-s", "nrf54l"]
+nrf54l10-app-ns = ["nrf-mpsl/nrf54l10-app-ns", "nrf-sdc-sys/nrf54l-ns", "nrf54l"]
+nrf54l10-app-s = ["nrf-mpsl/nrf54l10-app-s", "nrf-sdc-sys/nrf54l-s", "nrf54l"]
+nrf54l15-app-ns = ["nrf-mpsl/nrf54l15-app-ns", "nrf-sdc-sys/nrf54l-ns", "nrf54l"]
+nrf54l15-app-s = ["nrf-mpsl/nrf54l15-app-s", "nrf-sdc-sys/nrf54l-s", "nrf54l"]
+nrf54lm20-app-s = ["nrf-mpsl/nrf54lm20-app-s", "nrf-sdc-sys/nrf54lm20-app-s", "nrf54l"]
+
+nrf52 = ["nrf-sdc-sys/nrf52"]
+nrf53 = ["nrf-sdc-sys/nrf53"]
+nrf54l = []
+
+multirole = ["central", "peripheral"]
+peripheral = ["nrf-sdc-sys/peripheral"]
+central = ["nrf-sdc-sys/central"]
+
+defmt = ["dep:defmt", "nrf-mpsl/defmt", "bt-hci/defmt"]
+log = ["dep:log", "nrf-mpsl/log", "bt-hci/log"]
+
+[dependencies]
+defmt = { version = "1", optional = true }
+log = { version = "0.4.27", optional = true }
+
+nrf-mpsl = { version = "0.3.0", path = "../nrf-mpsl" }
+nrf-sdc-sys = { version = "0.2.0", path = "../nrf-sdc-sys" }
+
+embassy-nrf = "0.11"
+embassy-sync = "0.8"
+critical-section = "1.2.0"
+rand_core = "0.9"
+embedded-io = "0.7"
+embedded-io-async = "0.7"
+bt-hci = "0.9"

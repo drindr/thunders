@@ -1,0 +1,11 @@
+# Rust / cargo build artifacts
+target/
+**/target/
+Cargo.lock.orig
+
+# Probe logs / scratch
+*.log
+
+# Editor
+.vscode/
+.idea/

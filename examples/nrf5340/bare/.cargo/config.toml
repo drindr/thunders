@@ -1,0 +1,8 @@
+[build]
+target = "thumbv8m.main-none-eabi"
+
+[target.thumbv8m.main-none-eabi]
+runner = "probe-rs run --chip nRF5340_xxAA"
+
+[env]
+DEFMT_LOG = "info"

@@ -1,0 +1,29 @@
+[package]
+name = "thunders-phy-nrf"
+version = "0.1.0"
+edition = "2021"
+authors = ["Drin"]
+description = "Nordic RADIO PHY implementation for thunders"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+thunders = { path = "../thunders" }
+embassy-nrf = { workspace = true }
+nrf-pac = { version = "0.4.0", default-features = false }
+embassy-time = { workspace = true }
+embassy-sync = { workspace = true }
+embassy-futures = { workspace = true }
+defmt = { workspace = true, optional = true }
+nrf-mpsl = { path = "../vendor/nrf-sdc/nrf-mpsl", optional = true }
+rtt-target = { version = "0.5", optional = true }
+
+[features]
+nrf52833 = ["embassy-nrf/nrf52833", "nrf-pac/nrf52833"]
+nrf52840 = ["embassy-nrf/nrf52840", "nrf-pac/nrf52840"]
+nrf5340 = ["embassy-nrf/nrf5340-app-s", "nrf-pac/nrf5340-app"]
+nrf5340-net = ["embassy-nrf/nrf5340-net", "nrf-pac/nrf5340-net"]
+nrf54l15 = ["embassy-nrf/nrf54l15-app-s", "nrf-pac/nrf54l15-app", "_nrf54"]
+nrf54l20 = ["embassy-nrf/nrf54lm20-app-s", "nrf-pac/nrf54lm20a-app", "_nrf54"]
+mpsl = ["dep:nrf-mpsl", "dep:rtt-target"]
+defmt = ["dep:defmt", "embassy-nrf/defmt", "thunders/defmt"]
+_nrf54 = []

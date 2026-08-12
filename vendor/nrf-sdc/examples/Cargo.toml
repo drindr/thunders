@@ -1,0 +1,65 @@
+[package]
+authors = ["Alex Moon <alex@moonspot.org>"]
+edition = "2021"
+name = "nrf-sdc-examples"
+version = "0.0.0"
+rust-version = "1.77"
+publish = false
+
+[dependencies]
+nrf-sdc = { version = "0.4.0", path = "../nrf-sdc", features = ["defmt", "peripheral"] }
+nrf-mpsl = { version = "0.3.0", path = "../nrf-mpsl", features = ["defmt", "critical-section-impl"] }
+bt-hci = { version = "0.9", default-features = false }
+
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt", "executor-interrupt"] }
+embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-nrf = { version = "0.11", features = ["defmt", "time-driver-grtc", "gpiote", "unstable-pac"] }
+embassy-sync = { version = "0.8", features = ["defmt"] }
+
+chacha20 = { version = "0.9.1", default-features = false }
+rand_core = "0.9.3"
+
+defmt = "1"
+defmt-rtt = "1"
+
+futures = { version = "0.3", default-features = false }
+
+cortex-m = { version = "0.7.7" }
+cortex-m-rt = "0.7.5"
+panic-probe = { version = "1", features = ["print-defmt"] }
+static_cell = "2"
+
+[features]
+nrf52832 = [
+  "nrf-sdc/nrf52832",
+  "embassy-nrf/nrf52832",
+  "nrf52"
+]
+
+nrf52840 = [
+  "nrf-sdc/nrf52840",
+  "embassy-nrf/nrf52840",
+  "nrf52"
+]
+nrf54l15 = [
+  "nrf-sdc/nrf54l15-app-s",
+  "embassy-nrf/nrf54l15-app-s",
+  "nrf54l"
+]
+
+nrf54lm20 = [
+  "nrf-sdc/nrf54lm20-app-s",
+  "embassy-nrf/nrf54lm20-app-s",
+  "nrf54l"
+]
+
+nrf52 = []
+nrf54l = []
+
+[[bin]]
+name = "flash"
+path = "src/bin/flash.rs"
+
+[[bin]]
+name = "adv-simple"
+path = "src/bin/adv-simple.rs"
