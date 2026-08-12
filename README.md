@@ -60,18 +60,30 @@ Run the peripheral first, then the central — the logs show the PINGs, the
 ## Benchmarks
 
 30 s runs, 5340 central ↔ LM20 peripheral and the swapped pair, both backends.
+PING payload is 8 bytes; bandwidth = received payload bytes/s.
 
-| Pairing | Backend | Central poll | Frame | Round-trip | Peer RX | Errors |
+| Pairing | Backend | Central poll | TX emitted | **Peer catches (data rate)** | Round-trip RX | Errors |
 |---|---|---|---|---|---|---|
-| 5340 central ↔ LM20 peripheral | **bare** | 542 Hz | 1.84 ms | 322 RXOK / 2 s window | 322 frames | 0 |
-| LM20 central ↔ 5340 peripheral | **bare** | 233 Hz | — | 320 RXOK | 329 frames | 0 |
-| 5340 central ↔ LM20 peripheral | **mpsl** | **500 Hz** | 2.0 ms (RX+TX) | **GOT=57** | 395 PINGs | 0 |
-| LM20 central ↔ 5340 peripheral | **mpsl** | **500 Hz** | 2.0 ms | **GOT=56** | 373 PINGs | 0 |
+| 5340 central ↔ LM20 peripheral | **bare** | 542 Hz | 4.3 KB/s | 322 RXOK / 2 s = **1.3 KB/s** | 322 / 2 s = 1.3 KB/s | 0 |
+| LM20 central ↔ 5340 peripheral | **bare** | 233 Hz | 1.9 KB/s | 329 RXOK / 2 s = **1.3 KB/s** | 320 / 2 s = 1.3 KB/s | 0 |
+| 5340 central ↔ LM20 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | ~13 PINGs / s = **~100 B/s** (bursty ~460 B/s) | GOT=57 (≈15 B/s) | 0 |
+| LM20 central ↔ 5340 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | ~12 PINGs / s = **~100 B/s** | GOT=56 (≈15 B/s) | 0 |
 
-The MPSL backend runs at the same order as the raw radio (500 Hz vs 540 Hz
-central poll) — the old 18× gap is gone; both are limited by the per-frame RX
-poll, not the MPSL. The central always frames RX+TX (2 slots), the peripheral
-mostly RX (1 slot, ~830 Hz on the MPSL).
+Two different ceilings are visible:
+
+- **Poll rate** — the MPSL backend matches the raw radio (500 Hz vs 542 Hz
+  central poll); the old 18× gap is gone. The central always frames RX+TX (2
+  slots), the peripheral mostly RX (1 slot, ~830 Hz on the MPSL).
+- **Data rate** — the *caught* bytes are lower than the emitted rate on both
+  backends, and much lower on the MPSL. The bare radio stays in RX between
+  TXes (long poll windows), catching ~60% of the emitted PINGs. The MPSL's
+  free-running timeslot chains drift against each other, so the peer's 1 ms RX
+  slot only overlaps the central's TX intermittently: the sustained catch is
+  ~100 B/s, bursting to ~460 B/s while the chains happen to align. The
+  round-trip RX (the echo caught back) is rarer still (~15 B/s) because a full
+  echo needs the two slots aligned *twice*. Throughput on the MPSL path is
+  alignment-bound, not rate-bound — the remaining lever is the SDC-session
+  path (slot scheduling, not the free-running chains).
 
 ## nRF54L field notes (things the SVD won't tell you)
 
