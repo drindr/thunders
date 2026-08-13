@@ -16,6 +16,8 @@ pub enum Error<P> {
     SyncLost,
     /// Buffer provided by the caller was too small.
     BufferTooSmall,
+    /// The requested operation is not supported by this PHY.
+    Unsupported,
     /// Encryption or decryption failure.
     Crypto(CryptoError),
 }

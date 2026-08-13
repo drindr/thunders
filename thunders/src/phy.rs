@@ -41,10 +41,58 @@ pub trait Phy {
     /// Flush any stale RX/TX state.
     async fn flush(&mut self);
 
+    /// Transmit then immediately listen for a reply as one combined
+    /// operation. The default is [`transmit`](Self::transmit) followed by
+    /// [`receive`](Self::receive); a backend may override it to keep the
+    /// radio armed across the turnaround (one await point instead of two -
+    /// the frame's TX+RX costs one executor hop, not two). Returns the
+    /// number of reply bytes, or `None` on a receive timeout.
+    async fn transmit_receive(
+        &mut self,
+        tx: &[u8],
+        rx: &mut [u8],
+        timeout: Duration,
+    ) -> Result<Option<usize>, Error<Self::Error>> {
+        self.transmit(tx).await?;
+        self.receive(rx, timeout).await
+    }
+
     /// Adjust the RX/TX period by `corr` microseconds (sync, no-op by
     /// default). The link layer's peripheral uses this to phase-lock its
     /// schedule to the central's once frames start flowing ("connection
     /// formed"). The bare radio needs no adjustment; the MPSL backend
     /// nudges its chained timeslot distance.
     async fn adjust_period(&mut self, _corr: i32) {}
+
+    /// Begin a TX burst: ramp the radio once, so the following
+    /// [`transmit_burst_send`](Self::transmit_burst_send) packets skip the
+    /// per-packet ramp (the on-air time only - the 8 kHz one-way path).
+    /// Synchronous (no await hop): the burst is the hot loop. Backends
+    /// without the chained TX return [`Error::Unsupported`].
+    fn transmit_burst_begin(&mut self, _pkt: &[u8]) -> Result<(), Error<Self::Error>> {
+        Err(Error::Unsupported)
+    }
+
+    /// Send the next packet in a burst (the radio is already ramped - the
+    /// on-air only). Synchronous; see [`transmit_burst_begin`](Self::transmit_burst_begin).
+    fn transmit_burst_send(&mut self, _pkt: &[u8]) -> Result<(), Error<Self::Error>> {
+        Err(Error::Unsupported)
+    }
+
+    /// Encrypt/decrypt a payload with the hardware AES-CCM (the AEAD: the
+    /// counter-mode encryption + the CBC-MAC). `mic` is the 4-byte tag (the
+    /// output on encrypt, the expected on decrypt); the payload is the
+    /// in-place ciphertext/plaintext (the MIC is appended after it).
+    /// Synchronous. The default returns [`Error::Unsupported`]; the `secure`
+    /// feature's CCM mode uses it.
+    fn ccm_crypt(
+        &mut self,
+        _key: &[u8; 16],
+        _nonce: &[u8; 13],
+        _payload: &mut [u8],
+        _mic: &mut [u8; 4],
+        _encrypt: bool,
+    ) -> Result<(), Error<Self::Error>> {
+        Err(Error::Unsupported)
+    }
 }

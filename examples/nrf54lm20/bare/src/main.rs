@@ -16,6 +16,8 @@ use embassy_time::Instant;
 use {defmt_rtt as _, panic_probe as _};
 use defmt::info;
 
+static FRAME_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 use thunders::{Address, Config, Role};
 use thunders_phy_nrf::{NrfRadioPhy, RadioIrqHandler, RadioMode};
 
@@ -83,6 +85,8 @@ async fn main(_spawner: Spawner) {
             None
         };
 
+        let t_loop = Instant::now();
+        let t_frame = Instant::now();
         match link.frame(tx, &mut rx_buf).await {
             Ok(Some(n)) => {
                 ok += 1;
@@ -92,19 +96,26 @@ async fn main(_spawner: Spawner) {
                     echo[..n].copy_from_slice(&rx_buf[..n]);
                     echo_len = n;
                 }
-                info!("RX {} bytes: {:02x}", n, &rx_buf[..n]);
+                // Throttled: the per-frame RTT log is the hot-path cost.
+                if FRAME_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 1000 == 0 {
+                    info!("RX {} bytes: {:02x}", n, &rx_buf[..n]);
+                }
             }
             Ok(None) => {}
             Err(e) => info!("frame err: {:?}", defmt::Debug2Format(&e)),
         }
+        thunders_phy_nrf::radio_phy::LOOP_US.fetch_add((t_loop.elapsed().as_micros() as i64 - t_frame.elapsed().as_micros() as i64).max(0) as u32, core::sync::atomic::Ordering::Relaxed);
         frames += 1;
         let now = Instant::now();
         if now - report_at >= embassy_time::Duration::from_secs(2) {
             let elapsed = (now - report_at).as_micros() as u32;
-            let rate = frames * 1_000_000 / elapsed.max(1);
+            let rate = (frames as u64) * 1_000_000 / elapsed.max(1) as u64;
             let rxst =
                 thunders_phy_nrf::radio_phy::RX_STATS.load(core::sync::atomic::Ordering::Relaxed);
-            info!("BENCH frames={} ok={} rate={}/s rxst={:#x}", frames, ok, rate, rxst);
+            let rxp = thunders_phy_nrf::radio_phy::RX_POLL.load(core::sync::atomic::Ordering::Relaxed);
+            let txp = thunders_phy_nrf::radio_phy::TX_POLL.load(core::sync::atomic::Ordering::Relaxed);
+            let txs = thunders_phy_nrf::radio_phy::TX_STATS.load(core::sync::atomic::Ordering::Relaxed);
+            info!("BENCH frames={} ok={} rate={}/s rxst={:#x} rxp={} txp={} txs={:#x}", frames, ok, rate, rxst, rxp, txp, txs);
             frames = 0;
             ok = 0;
             report_at = now;

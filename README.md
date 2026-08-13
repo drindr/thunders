@@ -1,33 +1,70 @@
 # thunders
 
-A minimal reliable link layer for the Nordic 2.4 GHz RADIO, with two backends:
-a raw RADIO driver and an MPSL timeslot backend (the Zephyr ESB-on-MPSL
-pattern). Verified across two heterogeneous boards — an **nRF5340** (net core)
-and an **nRF54LM20** — in either role, over either backend.
+A slot-based link layer for the Nordic 2.4 GHz RADIO, over two backends — a
+raw RADIO driver and an MPSL timeslot backend (the Zephyr ESB-on-MPSL
+pattern). Three heterogeneous boards interoperate on one wire format:
+**nRF52840**, **nRF5340** (net core), **nRF54LM20** — any role, any backend.
 
 ```
-┌─────────────┐   PING (frame)   ┌─────────────┐
+┌─────────────┐   Data (seq)     ┌─────────────┐
 │ Central     │ ───────────────▶ │ Peripheral  │
-│  (TX+echo)  │ ◀─────────────── │  (RX+echo)  │
-└─────────────┘                  └─────────────┘
+│  TX slots   │ ◀─────────────── │  RX slots    │
+└─────────────┘   reverse Data   └─────────────┘
 ```
+
+The link is **slot-based**: every slot is a TX or an RX (never both), and the
+mix is the `Config::tx_rx_ratio` — `(8, 1)` by default (the 8 kHz one-way +
+a 1 kHz reverse channel on the bare path). Full-duplex is the interleaved
+slots, not the in-frame turnaround. Reliability is the **sequence window**, not
+acks.
 
 ## Architecture
 
+Three layers — see `docs/architecture.md` for the full picture:
+
+```
+postcard   Packet::to_bytes / from_bytes  (the wire format)
+thunders   Central/Peripheral, Config, Scheduler, Security
+phy        Phy trait → NrfRadioPhy (bare) / MpslRadioPhy (timeslots)
+```
+
 | Crate | Role |
 |---|---|
-| `thunders` | Protocol core: framing, CRC-16, sequence sync, `Phy` trait, `Central`/`Peripheral` link loops. Board-agnostic. |
-| `thunders-phy-nrf` | nRF RADIO PHY. Two backends: **bare** (direct RADIO, interrupt-driven) and **mpsl** (radio inside MPSL timeslots — coexists with BLE). All register access goes through the `nrf-pac` accessors (SVD-derived, no hand-picked offsets). |
-| `examples/nrf5340/{bare,mpsl}` | nRF5340 net-core firmware. One binary, either role. |
-| `examples/nrf54lm20/{bare,mpsl}` | nRF54LM20 firmware. One binary, either role. |
+| `thunders` | Protocol core: the slot-aware `Central`/`Peripheral`, the `Config` (the ratio, the channels), the `Scheduler` (the hop), the `Security` (the ChaCha/CCM), the `Phy` trait. Board-agnostic. |
+| `thunders-phy-nrf` | The nRF PHY. Two backends: **bare** (the direct RADIO, the burst TX, the hardware CCM) and **mpsl** (the radio inside the MPSL timeslots). All registers via the `nrf-pac` accessors. |
+| `examples/{nrf52840,nrf5340,nrf54lm20}/{bare,mpsl}` | The role-agnostic firmware, one binary per role. |
 
 The MPSL layer is the **stock official** [`alexmoon/nrf-sdc`](https://github.com/alexmoon/nrf-sdc)
-as a git dependency — no vendored fork. The nRF54L-specific bits that upstream
-doesn't provide (RRAM fetch-latency, NVIC enables) live in `thunders-phy-nrf`.
+git dependency — no vendored fork. The nRF54L-specific bits (the RRAM
+fetch-latency, the NVIC enables) live in `thunders-phy-nrf`.
+
+## The protocol (see `docs/hopping-txrx-ratio-full-duplex.md`)
+
+- **The slot model** — the 125 µs slot on the bare (the 8 kHz target), the
+  500 µs slot on the MPSL (its grant floor). `Central::frame` /
+  `Peripheral::frame` run one slot each, the TX/RX type from the ratio.
+- **The TX:RX ratio** — `Config::with_tx_rx_ratio(tx, rx)`. The central runs
+  `tx` TX slots then `rx` RX slots; the peripheral mirrors.
+- **The hopping** — beacon-driven: the central advances the 25-channel
+  sequence after `HOP_MISS_THRESHOLD` consecutive misses, the peripheral
+  follows the beacon's `channel_index`. No free-running local hop.
+- **The burst** — the central's TX run uses `Phy::transmit_burst_begin/send`
+  (the ramp once, the on-air per packet, ~10-12 kHz one-way on the bare). The
+  MPSL falls back to the plain per-slot transmit.
+- **The typed interface** — `send<T: Serialize>(&T)` / `recv<T:
+  DeserializeOwned>()` — the app works with its own struct; the postcard, the
+  crypto, the CRC and the radio are invisible.
+
+## Security
+
+`Security::new(key)` uses the software ChaCha20-Poly1305 (the default);
+`Security::with_ccm(key)` uses the radio's **hardware AES-CCM** (the AEAD over
+the EasyDMA; the nRF52840/nRF5340 bare backends — the nRF54L falls back to
+`Unsupported`). The CRC is always the radio's hardware CRC-16 — no software CRC.
 
 ## Roles
 
-Each example builds once, and the role is selected at build time:
+Each example builds once; the role is a build-time feature:
 
 ```sh
 cargo build --release                          # central (default)
@@ -35,90 +72,102 @@ cargo build --release --no-default-features \
   --features peripheral                        # peripheral
 ```
 
-The central polls the link and PINGs; the peripheral RXes and echoes.
+## nRF5340 host/controller split
+
+`examples/nrf5340-app/` is the **host** on the nRF5340's application core; the
+**controller** (the radio link) runs on the network core (`examples/nrf5340/mpsl`).
+They share a 4 KiB mailbox at `0x2007F000` (the app core's top RAM, made
+non-secure via the SPU) plus two IPC channels: `event0` = host → net (a TX
+payload is ready), `event1` = net → host (an RX payload was stored). The host
+`put_tx`s a payload and triggers `event0`; the net core polls the mailbox,
+transmits it on its TX slot, and on each catch stores the RX and triggers
+`event1`.
+
+Role pairing (the MPSL phase-lock is peripheral-only and was verified on the
+nRF5340): the **5340 net core = peripheral** (follower), the **peer = 52840
+central** (time master). Build/flash with cargo-make:
+
+```sh
+cd examples/nrf5340-app
+cargo make flash        # build+flash net (peripheral), then flash+run the host
+cargo make run          # host only (the net core's flash persists)
+```
+
+Run the 52840 peer as the central first (`cargo build --release` in
+`examples/nrf52840/mpsl`), then `cargo make run` on the 5340. The host's RTT
+shows `host TX` / `host RX` pairs — the full `host TX → radio → echo → host RX`
+loop.
 
 ## Building & flashing
 
-Prereqs: `probe-rs`, the `thumbv8m.main-none-eabi` (nRF5340) and
-`thumbv8m.main-none-eabihf` (nRF54L) targets, and the patched embassy HAL at
-`../../embassy-nrf54` (see the `[patch.crates-io]` in each example's Cargo.toml).
+Prereqs: `probe-rs`, the `thumbv7em-none-eabihf` (nRF52840),
+`thumbv8m.main-none-eabi` (nRF5340) and `thumbv8m.main-none-eabihf` (nRF54L)
+targets, and the patched embassy HAL at `../../embassy-nrf54` (the
+`[patch.crates-io]` in each example's Cargo.toml).
 
 ```sh
-# nRF5340 (net core), DAPLink probe
+# nRF52840, DAPLink
+probe-rs run --chip nRF52840_xxAA \
+  --probe "0d28:0204-3:0700000100440055360000054e534d4ca5a5a5a597969908" \
+  target/thumbv7em-none-eabihf/release/thunders-<name>
+
+# nRF5340 (net core), DAPLink
 probe-rs run --chip nRF5340_xxAA \
   --probe "0d28:0204-3:13040003001100e10465599500004fca0000000097969921" \
   --allow-erase-all target/thumbv8m.main-none-eabi/release/thunders-<name>
 
-# nRF54LM20, J-Link probe
+# nRF54LM20, J-Link
 probe-rs run --chip nRF54LM20A --probe 1366:1069 --speed 100 \
   target/thumbv8m.main-none-eabihf/release/thunders-<name>
 ```
 
-Run the peripheral first, then the central — the logs show the PINGs, the
-`GOT reply` round-trips and the periodic `BENCH` summary.
+Flash the peripheral first, then the central — the logs show the seq'd Data
+and the periodic `BENCH` summary.
 
 ## Benchmarks
 
-30 s runs, 5340 central ↔ LM20 peripheral and the swapped pair, both backends.
-PING payload is 8 bytes; bandwidth = received payload bytes/s.
+The full matrix (the ratio `(8, 1)`, the central's slot rate):
 
-| Pairing | Backend | Central poll | TX emitted | **Peer catches (data rate)** | Round-trip RX | Errors |
-|---|---|---|---|---|---|---|
-| 5340 central ↔ LM20 peripheral | **bare** | 542 Hz | 4.3 KB/s | 322 RXOK / 2 s = **1.3 KB/s** | 322 / 2 s = 1.3 KB/s | 0 |
-| LM20 central ↔ 5340 peripheral | **bare** | 233 Hz | 1.9 KB/s | 329 RXOK / 2 s = **1.3 KB/s** | 320 / 2 s = 1.3 KB/s | 0 |
-| 5340 central ↔ LM20 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | **~660 B/s steady** (phase-locked) | GOT=22 | 0 |
-| LM20 central ↔ 5340 peripheral | **mpsl** | **500 Hz** | 4.0 KB/s | **~600 B/s steady** (phase-locked) | GOT=67 | 0 |
+| pair | backend | central | peripheral catches |
+|---|---|---|---|
+| 52840 ↔ 5340 | bare | 1799/s (txp 432 — the burst) | — |
+| 52840 ↔ LM20 | bare | 1800/s | 3600 ✓ |
+| 5340 ↔ LM20 | bare | 1933/s | 3674 ✓ |
+| 52840 ↔ 5340 | mpsl | ~2 kHz (occ 49%) | ~98/s |
+| 52840 ↔ LM20 | mpsl | ~2 kHz | ~98/s |
+| 5340 ↔ LM20 | mpsl | ~2 kHz | ~98/s |
 
-Two different ceilings are visible:
-
-- **Poll rate** — the MPSL backend matches the raw radio (500 Hz vs 542 Hz
-  central poll); the old 18× gap is gone. The central always frames RX+TX (2
-  slots), the peripheral mostly RX (1 slot, ~830 Hz on the MPSL).
-- **Data rate** — the *caught* bytes are lower than the emitted rate on both
-  backends. The bare radio stays in RX between TXes (long poll windows),
-  catching ~60% of the emitted PINGs. The MPSL's free-running timeslot chains
-  drift against each other, so the peer's RX window only intermittently
-  overlaps the central's TX. Two knobs already help: the RX listen window per
-  slot was raised (`RX_POLL_BOUND` 1000→2000 on the 5340, 1000→3000 on the
-  LM20 — the slot budget allows it, the 106:179 overrun assert still holds),
-  which lifted the peer catch from ~100 B/s to **~800 B/s**. The remaining
-  lever is phase sync, and it is now implemented: a **distance PLL** on the
-  peripheral (see `thunders-phy-nrf/src/mpsl.rs`). The MPSL's absolute-time
-  requests don't exist here (only EARLIEST + NORMAL), and re-anchoring via a
-  fresh EARLIEST is blocked while the session is active (-NRF_EAGAIN: the
-  chain never truly goes idle). So the peripheral instead measures its
-  catch-to-catch interval (the peer's 1000 us period plus its own phase
-  drift) and nudges the chained request's `distance_us` by ±1 us per catch —
-  a bang-bang PLL that holds the phase inside the RX window indefinitely.
-  The catch is now **steady ~600-660 B/s** instead of the bursty
-  drift-dependent pattern. The central stays free-running (it is the master;
-  re-anchoring it breaks the PING cadence).
+The ceilings: the bare path runs the TX burst (the ramp amortized — the
+`txp=432` is ~36 µs of on-air); the MPSL is flat at its ~2 kHz grant-floor
+slot (the 500 µs, `occ=49%`). The MPSL recv rate is governed by the
+peripheral's phase-lock (the hopping doc §6): the chained slot distance is
+nudged until the RX window slides to and centres on the central's TX.
 
 ## nRF54L field notes (things the SVD won't tell you)
 
-- **TXPOWER is encoded** on the nRF54L: 0 dBm = `0x18`. The raw `0x00` is a
-  reserved value that leaves the PA off — the radio runs its TX state machine
-  but emits no RF ("phantom TX").
+- **TXPOWER is encoded**: 0 dBm = `0x18`. The raw `0x00` leaves the PA off
+  (the "phantom TX" — the radio runs its TX state machine but emits no RF).
 - **RRAM fetch latency**: the MPSL's timeslot arming needs the code-fetch RAM
-  out of PowerOff (`RRAMC.LOWPOWERCONFIG = Standby`, set once at phy init) or
-  the session deadline asserts (106:179). The official upstream's low-latency
-  callbacks only handle the CPU CONSTLAT.
+  out of PowerOff (`RRAMC.LOWPOWERCONFIG = Standby`) or the session deadline
+  asserts (106:179).
 - **Event block at 0x200+**: the nRF54L radio's events sit at 0x200-0x220 (the
-  nRF5340's at 0x100-0x110). Use the pac accessors — the earlier raw `0x100`
-  clears were hitting reserved space.
-- **TXD/RXD DMA amounts**: the SVD has no registers at 0xEE8/0xED4 (the pac
-  maps TXD/RXD to the DFE sub-registers instead), but the writes are required
-  on silicon — the TX transmits 0-length PDUs and the RX transfers nothing
-  without them. Verified, kept raw.
+  nRF5340's at 0x100-0x110).
+- **TXD/RXD DMA amounts**: no SVD registers at 0xEE8/0xED4, but the writes are
+  required on silicon (0-length PDUs / no RX otherwise).
 - **Errata 54L/49**: the first on-air payload bits need a hidden register
-  (0x5008C58C) set — not in the SVD by definition.
+  (0x5008C58C) set.
 
 ## Repository layout
 
 ```
-thunders/            protocol core (framing, CRC, seq, Central/Peripheral)
-thunders-phy-nrf/    nRF PHY: bare + MPSL backends (pac-typed register access)
+thunders/                 protocol core (the slot machine, the config, the security)
+thunders-phy-nrf/         nRF PHY: bare + MPSL backends (the pac-typed registers)
+docs/
+  architecture.md          the three-layer stack
+  hopping-txrx-ratio-full-duplex.md   the slot protocol
 examples/
-  nrf5340/{bare,mpsl}    role-agnostic examples (central default / peripheral)
-  nrf54lm20/{bare,mpsl}  role-agnostic examples
+  nrf52840/{bare,mpsl}    role-agnostic (thumbv7em-none-eabihf)
+  nrf5340/{bare,mpsl}     role-agnostic (thumbv8m.main-none-eabi)
+  nrf5340-app/            the host/controller host (thumbv8m.main-none-eabihf)
+  nrf54lm20/{bare,mpsl}   role-agnostic (thumbv8m.main-none-eabihf)
 ```

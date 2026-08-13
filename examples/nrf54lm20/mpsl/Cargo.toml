@@ -6,10 +6,12 @@ description = "thunders link over MPSL timeslots (nRF54LM20 app core) - role-agn
 publish = false
 
 [dependencies]
+heapless = "0.9.3"
 thunders = { path = "../../../thunders", features = ["defmt"] }
 thunders-phy-nrf = { path = "../../../thunders-phy-nrf", features = ["nrf54l20", "mpsl", "defmt"] }
 nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "f54b6389ffa2750d4d3a4f5435660cb66b47e51a", features = ["nrf54lm20-app-s", "critical-section-impl"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-futures = "0.1.1"
 embassy-time = { version = "0.5.1" }
 embassy-nrf = { version = "0.11.0", features = ["nrf54lm20-app-s", "rt", "time-driver-grtc"] }
 cortex-m = { version = "0.7" }

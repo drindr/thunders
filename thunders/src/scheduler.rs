@@ -74,12 +74,18 @@ mod tests {
     }
 
     #[test]
-    fn default_sequence_is_fixed() {
-        // The default hop sequence is a single fixed channel while the two
-        // free-running nodes cannot stay phase-locked (see config.rs).
+    fn sequence_is_a_permutation() {
+        // The network ID seeds a permutation of the default sequence, so two
+        // networks hop in different orders over the same 25 channels.
         let a = Scheduler::new([1, 2, 3, 4]);
         let b = Scheduler::new([5, 6, 7, 8]);
-        assert_eq!(a.sequence, DEFAULT_HOP_SEQUENCE);
-        assert_eq!(b.sequence, DEFAULT_HOP_SEQUENCE);
+        let mut a_sorted = a.sequence;
+        let mut b_sorted = b.sequence;
+        a_sorted.sort_unstable();
+        b_sorted.sort_unstable();
+        let mut def = DEFAULT_HOP_SEQUENCE;
+        def.sort_unstable();
+        assert_eq!(a_sorted, def);
+        assert_eq!(b_sorted, def);
     }
 }

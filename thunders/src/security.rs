@@ -1,21 +1,49 @@
 //! Optional security layer for `thunders`.
 //!
 //! Enabled by the `secure` Cargo feature.  When enabled, `Data` packet
-//! payloads are encrypted and authenticated in-place with
-//! ChaCha20-Poly1305 using a pre-shared 256-bit key.
+//! payloads are encrypted and authenticated in-place. Two backends:
+//!
+//! - `CipherMode::ChaCha` (the default): the software ChaCha20-Poly1305
+//!   with a 256-bit key - the portable, no-phy-dependency option.
+//! - `CipherMode::Ccm`: the radio's hardware AES-CCM (the AEAD) with a
+//!   128-bit key (the first 16 bytes of the key) - the phy provides
+//!   `Phy::ccm_crypt`.
+
+/// The cipher backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CipherMode {
+    /// Software ChaCha20-Poly1305 (the 256-bit key).
+    ChaCha,
+    /// Hardware AES-CCM (the 128-bit key; the phy's `ccm_crypt`).
+    Ccm,
+}
 
 /// Pre-shared security material.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Security {
-    /// 256-bit pre-shared key.
+    /// 256-bit pre-shared key (the CCM uses the first 16 bytes).
     pub key: [u8; 32],
+    /// The cipher backend.
+    pub mode: CipherMode,
 }
 
 impl Security {
-    /// Create a new security context.
+    /// Create a new security context (the software ChaCha20-Poly1305).
     pub const fn new(key: [u8; 32]) -> Self {
-        Self { key }
+        Self {
+            key,
+            mode: CipherMode::ChaCha,
+        }
+    }
+
+    /// Create a security context using the hardware AES-CCM.
+    pub const fn with_ccm(key: [u8; 32]) -> Self {
+        Self {
+            key,
+            mode: CipherMode::Ccm,
+        }
     }
 }
 
@@ -43,24 +71,52 @@ pub fn make_nonce(epoch: u32, seq: u8, channel_index: u8, sender_is_central: boo
     n
 }
 
+/// Build a 13-byte AES-CCM nonce from the frame's seq + the direction.
+///
+/// The epoch/channel were dropped: they are local counters that drift between
+/// the free-running chains, so they broke the nonce match between the sender
+/// and the receiver (the MIC then failed). The seq is carried in the packet,
+/// so both sides derive the same nonce. The known limitation: the 8-bit seq
+/// wraps after 256 frames per direction, so the nonce repeats — the proper
+/// long-term fix is the phase-lock (a shared epoch), which is the deferred
+/// slot-phase work.
+pub fn make_nonce_13(_epoch: u32, seq: u8, _channel_index: u8, sender_is_central: bool) -> [u8; 13] {
+    // Layout (matched by `ccm_crypt`): [seq | 0*4 | channel(dropped) |
+    // direction | 0*6]. The seq is the packet counter; the direction goes
+    // in its own byte (nonce[6]), NOT inside the counter.
+    let mut n = [0u8; 13];
+    n[0] = seq;
+    n[6] = if sender_is_central { 0 } else { 1 };
+    n
+}
+
 #[cfg(feature = "secure")]
 mod secure_impl {
-    use super::{CryptoError, Security, MAX_PAYLOAD};
+    use crate::MAX_PAYLOAD;
+    use super::{CryptoError, Security};
     use aead::{AeadInOut, Buffer, KeyInit};
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
     use heapless::Vec as HeaplessVec;
 
-    /// In-place ChaCha20-Poly1305 wrapper.
-    pub struct Cipher(ChaCha20Poly1305);
+    /// The cipher (the mode + the backend state).
+    pub struct Cipher {
+        pub mode: super::CipherMode,
+        pub key: [u8; 32],
+        chacha: ChaCha20Poly1305,
+    }
 
     impl Cipher {
-        /// Create a cipher from a pre-shared key.
+        /// Create a cipher from a pre-shared key + the mode.
         pub fn new(sec: &Security) -> Self {
             let key = Key::from(sec.key);
-            Self(ChaCha20Poly1305::new(&key))
+            Self {
+                mode: sec.mode,
+                key: sec.key,
+                chacha: ChaCha20Poly1305::new(&key),
+            }
         }
 
-        /// Encrypt and authenticate `payload` in place.
+        /// Encrypt and authenticate `payload` in place with the ChaCha backend.
         pub fn encrypt(
             &self,
             payload: &mut HeaplessVec<u8, MAX_PAYLOAD>,
@@ -68,12 +124,12 @@ mod secure_impl {
         ) -> Result<(), CryptoError> {
             let nonce = Nonce::from(*nonce);
             let mut buf = CryptoBuf(payload);
-            self.0
+            self.chacha
                 .encrypt_in_place(&nonce, b"", &mut buf)
                 .map_err(|_| CryptoError::Encrypt)
         }
 
-        /// Decrypt and verify `payload` in place.
+        /// Decrypt and verify `payload` in place with the ChaCha backend.
         pub fn decrypt(
             &self,
             payload: &mut HeaplessVec<u8, MAX_PAYLOAD>,
@@ -81,7 +137,7 @@ mod secure_impl {
         ) -> Result<(), CryptoError> {
             let nonce = Nonce::from(*nonce);
             let mut buf = CryptoBuf(payload);
-            self.0
+            self.chacha
                 .decrypt_in_place(&nonce, b"", &mut buf)
                 .map_err(|_| CryptoError::Decrypt)
         }
@@ -133,6 +189,7 @@ impl Security {
 #[cfg(all(test, feature = "secure"))]
 mod tests {
     use super::*;
+    use crate::MAX_PAYLOAD;
     use heapless::Vec;
 
     #[test]

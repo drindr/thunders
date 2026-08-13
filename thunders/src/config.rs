@@ -15,10 +15,13 @@ pub const HOP_SEQUENCE_LEN: usize = 25;
 pub const FRAME_DURATION_US: u32 = 1000;
 
 /// Max time the central waits for a peripheral reply within a frame.
-pub const CENTRAL_REPLY_TIMEOUT_US: u64 = 400;
+// The slot model: the RX window is one slot. The reply is expected at the
+// aligned RX slot's start, so the poll only needs to cover the peer's
+// turnaround + the on-air frame, not the free-running drift.
+pub const CENTRAL_REPLY_TIMEOUT_US: u64 = 100;
 
 /// Max time the peripheral listens for the central beacon/data.
-pub const PERIPHERAL_LISTEN_TIMEOUT_US: u64 = 600;
+pub const PERIPHERAL_LISTEN_TIMEOUT_US: u64 = 100;
 
 /// Number of retransmissions before a frame is declared lost.
 pub const MAX_RETRIES: u8 = 3;
@@ -61,6 +64,10 @@ pub struct Config {
     pub initial_channel: u8,
     /// Optional pre-shared security context.
     pub security: Option<Security>,
+    /// TX:RX slot ratio - `tx` TX slots per `rx` RX slot. (8, 1) = the 8 kHz
+    /// one-way stream + a 1 kHz reverse channel; (1, 1) = the symmetric 4 kHz
+    /// round-trip. Both sides agree via this shared config (the roles mirror).
+    pub tx_rx_ratio: (u8, u8),
 }
 
 impl Config {
@@ -72,6 +79,7 @@ impl Config {
             role,
             initial_channel: 0,
             security: None,
+            tx_rx_ratio: (8, 1),
         }
     }
 
@@ -80,14 +88,25 @@ impl Config {
         self.security = Some(security);
         self
     }
+
+    /// Set the TX:RX slot ratio (both sides must be at least 1 - a zero
+    /// period would divide-by-zero the slot scheduler).
+    pub const fn with_tx_rx_ratio(mut self, tx: u8, rx: u8) -> Self {
+        self.tx_rx_ratio = (if tx == 0 { 1 } else { tx }, if rx == 0 { 1 } else { rx });
+        self
+    }
 }
 
 /// Default 2.4 GHz hop sequence (channel indices, not raw MHz).
 ///
 /// The actual frequency is `2400 MHz + channel MHz` for Nordic RADIO
 /// or the transceiver-specific channel number for external PHYs.
-// Benchmark: single fixed channel (25 = 2425 MHz) matching the validated
-// ESB configuration. The default multi-channel hop sequence requires the
-// two free-running nodes to stay phase-locked, which they do not at
-// different frame rates.
-pub const DEFAULT_HOP_SEQUENCE: [u8; HOP_SEQUENCE_LEN] = [25; 25];
+// The 25-channel hop sequence (channel indices, 2400 MHz + channel MHz),
+// spread over the 2.4 GHz band with 3 MHz spacing. Hopping is beacon-driven:
+// the central advances on the interference (the miss threshold), the
+// peripheral follows the beacon's channel_index - no free-running local hop,
+// so the two nodes stay on the same channel.
+pub const DEFAULT_HOP_SEQUENCE: [u8; HOP_SEQUENCE_LEN] = [
+    2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38,
+    41, 44, 47, 50, 53, 56, 59, 62, 65, 68, 71, 74,
+];

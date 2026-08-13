@@ -12,16 +12,14 @@
 
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
-use embassy_nrf::ipc::{Ipc, IpcChannel};
 use embassy_time::Instant;
 use {defmt_rtt as _, panic_probe as _};
 use defmt::info;
 
 static FRAME_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+use thunders::phy::Phy;
 use thunders::{Address, Config, Role};
-use thunders::ipc::mailbox;
-use thunders::MAX_PAYLOAD;
 use thunders_phy_nrf::{NrfRadioPhy, RadioIrqHandler, RadioMode};
 
 #[cfg(not(feature = "peripheral"))]
@@ -36,7 +34,6 @@ fn _defmt_timestamp() -> u64 {
 
 bind_interrupts!(struct Irqs {
     RADIO => RadioIrqHandler;
-    IPC => embassy_nrf::ipc::InterruptHandler<embassy_nrf::peripherals::IPC>;
 });
 
 #[embassy_executor::main]
@@ -55,28 +52,81 @@ async fn main(_spawner: Spawner) {
 
     info!("thunders link role={:?}", role);
 
-    // IPC to the app core (channel 1 = net -> app "RX ready"). The net core
-    // polls the shared mailbox for the app -> net direction, so no IPC wait.
-    let mut ipc = Ipc::new(p.IPC, Irqs);
-    ipc.event1.configure_trigger([IpcChannel::Channel1]);
-    // The shared mailbox lives in the APP core's RAM (0x2007F000), which the
-    // app core marks non-secure via the SPU so the net core can reach it.
-    mailbox().tx.valid = 0;
-    mailbox().rx.valid = 0;
+    #[cfg(feature = "one-way")]
+    {
+        // Standalone TX bench: the raw radio transmit, no link, no await
+        // hop - the pure radio TX rate (the transmit_blocking is sync).
+        let mut phy = NrfRadioPhy::new(p.RADIO, Irqs, RadioMode::Nrf2Mbit);
+        phy.set_address(&Address([0xE7, 0xE7, 0xE7, 0xE7, 0xE7])).await;
+        phy.set_channel(0).await;
+        info!("one-way TX ready");
+        // DWT cycle counter for the rate: the RTC/Instant time driver on the
+        // 52840 skews the elapsed; the CPU cycle counter does not.
+        unsafe {
+            (0xE000_EDFC as *mut u32).write_volatile(1); // DEMCR.TRCENA
+            (0xE000_1000 as *mut u32).write_volatile(1); // DWT.CTRL.CYCCNTENA
+            (0xE000_1004 as *mut u32).write_volatile(0); // DWT.CYCCNT = 0
+        }
+        let mut txc: u32 = 0;
+        let mut frames: u32 = 0;
+        // Burst TX: the ramp once, then the packets chain (the radio stays
+        // warm). The rate's measured over the host wall-clock (the run
+        // duration) - the DWT CYCCNT freezes during the radio IO.
+        let mut first = true;
+        loop {
+            let payload = [0x50, 0x49, 0x4E, 0x47, (txc & 0xFF) as u8, 0, 0, 0];
+            txc = txc.wrapping_add(1);
+            if first {
+                phy.transmit_burst_begin(&payload).unwrap();
+                first = false;
+            } else {
+                phy.transmit_burst_send(&payload).unwrap();
+            }
+            frames += 1;
+            if frames % 5000 == 0 {
+                let txp = thunders_phy_nrf::radio_phy::TX_POLL.load(core::sync::atomic::Ordering::Relaxed);
+                info!("BURST frames={} txp={}", frames, txp);
+                frames = 0;
+            }
+        }
+    }
+    #[cfg(not(feature = "one-way"))]
+    {
+        let mut phy = NrfRadioPhy::new(p.RADIO, Irqs, RadioMode::Nrf2Mbit);
+        let mut cfg = Config::new(
+            [0xAB, 0xCD, 0xEF, 0x01],
+            Address([0xE7, 0xE7, 0xE7, 0xE7, 0xE7]),
+            role,
+        );
+        let cfg = if cfg!(feature = "secure") {
+            cfg.with_security(thunders::Security::with_ccm([0xAB; 32]))
+        } else {
+            cfg
+        };
+        // The CCM loopback: the encrypt -> the decrypt -> the MIC, on one board
+        // (no radio) to isolate the AES-CCM hardware from the nonce/radio path.
+        #[cfg(feature = "secure")]
+        {
+            let mut data = [0x50u8, 0x49, 0x4E, 0x47, 0x00, 0x00, 0x00, 0x00];
+            let orig = data;
+            let mut mic = [0u8; 4];
+            let key = [0xABu8; 16];
+            let nonce = [0u8; 13];
+            match phy.ccm_crypt(&key, &nonce, &mut data, &mut mic, true) {
+                Ok(()) => {
+                    let mut dec = data;
+                    let mut m2 = mic;
+                    match phy.ccm_crypt(&key, &nonce, &mut dec, &mut m2, false) {
+                        Ok(()) => info!("CCM loopback OK: dec==orig {} mic=={}", dec == orig, m2 == mic),
+                        Err(e) => info!("CCM loopback decrypt err: {:?}", defmt::Debug2Format(&e)),
+                    }
+                }
+                Err(e) => info!("CCM loopback encrypt err: {:?}", defmt::Debug2Format(&e)),
+            }
+        }
 
-    let phy = NrfRadioPhy::new(p.RADIO, Irqs, RadioMode::Nrf2Mbit);
-    let cfg = Config::new(
-        [0xAB, 0xCD, 0xEF, 0x01],
-        Address([0xE7, 0xE7, 0xE7, 0xE7, 0xE7]),
-        role,
-    );
-    let cfg = if cfg!(feature = "secure") {
-        cfg.with_security(thunders::Security::with_ccm([0xAB; 32]))
-    } else {
-        cfg
-    };
-    let mut link = Link::new(phy, cfg).await.unwrap();
-    info!("link ready ({:?})", role);
+        let mut link = Link::new(phy, cfg).await.unwrap();
+        info!("link ready ({:?})", role);
 
     let mut rx_buf = [0u8; 32];
     let mut frames: u32 = 0;
@@ -91,12 +141,8 @@ async fn main(_spawner: Spawner) {
         // PING payload: [P,I,N,G,seq,0,0,0].
         #[cfg(not(feature = "peripheral"))]
         let payload = [0x50, 0x49, 0x4E, 0x47, (txc & 0xFF) as u8, 0, 0, 0];
-        // A queued app-core payload takes priority over the PING.
-        let mut ipc_tx = [0u8; MAX_PAYLOAD];
         #[cfg(not(feature = "peripheral"))]
-        let tx: Option<&[u8]> = if let Some(n) = mailbox().take_tx(&mut ipc_tx) {
-            Some(&ipc_tx[..n])
-        } else {
+        let tx: Option<&[u8]> = {
             txc += 1;
             Some(&payload)
         };
@@ -109,12 +155,15 @@ async fn main(_spawner: Spawner) {
 
         let t_loop = Instant::now();
         let t_frame = Instant::now();
+        #[cfg(feature = "one-way")]
+        match phy.transmit_blocking(payload.as_ref()) {
+            Ok(()) => {}
+            Err(e) => info!("tx err: {:?}", defmt::Debug2Format(&e)),
+        }
+        #[cfg(not(feature = "one-way"))]
         match link.frame(tx, &mut rx_buf).await {
             Ok(Some(n)) => {
                 ok += 1;
-                // Forward the received payload to the app core.
-                mailbox().put_rx(&rx_buf[..n]);
-                ipc.event1.trigger();
                 #[cfg(feature = "peripheral")]
                 {
                     // Echo the last received payload back on the next frame.
@@ -150,5 +199,6 @@ async fn main(_spawner: Spawner) {
             busy_total = 0;
             report_at = now;
         }
+    }
     }
 }

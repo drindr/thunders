@@ -9,6 +9,7 @@
 
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
+use embassy_nrf::ipc::{Ipc, IpcChannel};
 use embassy_time::Instant;
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, raw};
 use {defmt_rtt as _, panic_probe as _};
@@ -16,8 +17,9 @@ use defmt::info;
 use static_cell::StaticCell;
 
 use thunders::link::{Central, Peripheral};
-use thunders::{Address, Config, Role};
-use thunders_phy_nrf::mpsl::MpslRadioPhy;
+use thunders::ipc::mailbox;
+use thunders::{Address, Config, Role, MAX_PAYLOAD};
+use thunders_phy_nrf::mpsl::{MpslRadioPhy, MpslState};
 use thunders_phy_nrf::RadioMode;
 
 #[cfg(feature = "peripheral")]
@@ -36,11 +38,16 @@ bind_interrupts!(struct Irqs {
     RADIO => nrf_mpsl::HighPrioInterruptHandler;
     TIMER0 => nrf_mpsl::HighPrioInterruptHandler;
     RTC0 => nrf_mpsl::HighPrioInterruptHandler;
+    IPC => embassy_nrf::ipc::InterruptHandler<embassy_nrf::peripherals::IPC>;
 });
 
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
-    mpsl.run().await
+    let _ = mpsl;
+    loop {
+        unsafe { raw::mpsl_low_priority_process() };
+        embassy_futures::yield_now().await;
+    }
 }
 
 #[embassy_executor::main]
@@ -53,6 +60,13 @@ async fn main(spawner: Spawner) {
     // the thunders timing is free-running, so the RC is fine.
     config.lfclk_source = embassy_nrf::config::LfclkSource::InternalRC;
     let p = embassy_nrf::init(config);
+
+    // IPC to the app core (channel 1 = net -> app "RX ready"). The net core
+    // polls the shared mailbox for the app -> net direction, so no IPC wait.
+    let mut ipc = Ipc::new(p.IPC, Irqs);
+    ipc.event1.configure_trigger([IpcChannel::Channel1]);
+    mailbox().tx.valid = 0;
+    mailbox().rx.valid = 0;
 
     let mpsl_p = Peripherals::new(
         p.RTC0, p.TIMER0, p.TIMER1, p.TEMP,
@@ -77,8 +91,11 @@ async fn main(spawner: Spawner) {
 
     // The external phy opens its timeslot session and inserts the first
     // (EARLIEST) request BEFORE the mpsl_task starts processing.
-    let phy = MpslRadioPhy::new(RadioMode::Nrf2Mbit).await;
+    let radio = embassy_nrf::pac::RADIO_NS;
+    let mut state = MpslState::new(radio, cfg!(feature = "peripheral"));
+    let mut phy = MpslRadioPhy::<500, 400, 1400>::new(RadioMode::Nrf2Mbit, &mut state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
+    phy.wait_ready().await;
     info!("MPSL ready");
 
     let cfg = Config::new(
@@ -100,25 +117,24 @@ async fn main(spawner: Spawner) {
 
             loop {
                 let payload = [0x50, 0x49, 0x4E, 0x47, (txc & 0xFF) as u8, 0, 0, 0];
+                txc += 1;
                 let t_start = Instant::now();
                 match central.frame(Some(&payload), &mut rx_buf).await {
                     Ok(Some(n)) if n >= 4 && rx_buf[..4] == *b"PING" => {
                         rxc += 1;
-                        info!("central GOT reply {} bytes", n);
+                        mailbox().put_rx(&rx_buf[..n]);
+                        ipc.event1.trigger();
                     }
                     Ok(_) => {}
                     Err(e) => info!("frame err: {:?}", defmt::Debug2Format(&e)),
                 }
                 let busy = t_start.elapsed().as_micros() as u64;
-
-                txc += 1;
                 busy_total += busy;
                 frame_count += 1;
 
                 if frame_count >= 1000 {
                     let avg_busy = busy_total / frame_count as u64;
-                    let occ = avg_busy * 100 / 1000;
-                    info!("BENCH frames={} rx={} avg_busy={}us occ={}%", frame_count, rxc, avg_busy, occ);
+                    info!("BENCH frames={} rx={} avg_busy={}us", frame_count, rxc, avg_busy);
                     busy_total = 0;
                     frame_count = 0;
                     rxc = 0;
@@ -130,7 +146,8 @@ async fn main(spawner: Spawner) {
             info!("link ready (Peripheral)");
 
             let mut rx_buf = [0u8; 32];
-            let mut echo_buf = [0u8; 32];
+            let mut echo = [0u8; 32];
+            let mut echo_len = 0usize;
             let mut frames: u32 = 0;
             let mut rx_ok: u32 = 0;
             let mut bad_seq: u32 = 0;
@@ -140,22 +157,28 @@ async fn main(spawner: Spawner) {
 
             loop {
                 let t_frame = Instant::now();
-                match peripheral.frame(None, &mut rx_buf).await {
+                // The app core's payload takes priority, else the echo.
+                let mut ipc_tx = [0u8; MAX_PAYLOAD];
+                let tx: Option<&[u8]> = if let Some(m) = mailbox().take_tx(&mut ipc_tx) {
+                    Some(&ipc_tx[..m])
+                } else if echo_len > 0 {
+                    Some(&echo[..echo_len])
+                } else {
+                    None
+                };
+                match peripheral.frame(tx, &mut rx_buf).await {
                     Ok(Some(n)) => {
                         rx_ok += 1;
-                        // The PING payload is [P, I, N, G, seq, 0, 0, 0]; echo
-                        // it back (the link is full-duplex).
                         if n >= 5 && rx_buf[..4] == *b"PING" {
                             let seq = rx_buf[4];
                             if seq.wrapping_sub(last_seq) > 1 {
                                 bad_seq += 1;
                             }
                             last_seq = seq;
-                            info!("PING seq={} len={}", seq, n);
-                            let _ = peripheral.frame(Some(&rx_buf[..n]), &mut echo_buf).await;
-                            continue;
-                        } else {
-                            info!("RX {} bytes: {:02x}", n, &rx_buf[..n]);
+                            echo[..n].copy_from_slice(&rx_buf[..n]);
+                            echo_len = n;
+                            mailbox().put_rx(&rx_buf[..n]);
+                            ipc.event1.trigger();
                         }
                     }
                     Ok(None) => {}
@@ -166,9 +189,9 @@ async fn main(spawner: Spawner) {
                 let now = Instant::now();
                 if now - report_at >= embassy_time::Duration::from_secs(2) {
                     let elapsed = (now - report_at).as_micros() as u32;
-                    let rate = frames * 1_000_000 / elapsed.max(1);
+                    let rate = (frames as u64) * 1_000_000 / elapsed.max(1) as u64;
                     let avg_busy = busy_total / frames.max(1) as u64;
-                    info!("BENCH frames={} rx={} bad_seq={} rate={}/s avg_busy={}us", frames, rx_ok, bad_seq, rate, avg_busy);
+                    info!("BENCH frames={} rx={} bad_seq={} rate={}/s busy={}us", frames, rx_ok, bad_seq, rate, avg_busy);
                     frames = 0;
                     rx_ok = 0;
                     bad_seq = 0;

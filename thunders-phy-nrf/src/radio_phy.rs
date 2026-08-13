@@ -45,6 +45,8 @@ pub enum RadioMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RadioError {
+    /// Hardware CCM operation failed (the MIC mismatch or the timeout).
+    Crypto,
     /// Provided buffer exceeded the RADIO FIFO.
     BufferTooLong,
     /// CRC check failed on a received packet.
@@ -95,6 +97,23 @@ pub static TX_STATS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 pub static TX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Max RX poll iterations (diagnostics).
 pub static RX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Main-loop time outside the frame (the between-frame overhead; diagnostic).
+pub static LOOP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static RXOK_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// TX sub-phase cycle counters (the DWT CYCCNT deltas; diagnostic).
+pub static TX_PHASE_DIS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static TX_PHASE_SETUP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static TX_PHASE_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Read the ARM DWT cycle counter (the CPU cycles; the ground-truth timing).
+#[inline(always)]
+fn dwt_cycles() -> u32 {
+    unsafe { (0xE000_1004 as *mut u32).read_volatile() }
+}
+
+/// Cumulative RADIO STATE reads inside disable() (the disable latency proxy).
+pub static DISABLE_READS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static TX_T0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static RX_T0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 // bit0: phyend fired, bit1: crc ok, bit2: crc fail, bit3: timeout
 
 impl<'d> NrfRadioPhy<'d> {
@@ -322,19 +341,33 @@ impl<'d> NrfRadioPhy<'d> {
     }
 
     /// Move the RADIO to the Disabled state from any state.
-    fn disable(&self) {
+    /// Returns the number of STATE register reads (the disable latency
+    /// proxy - the 5340's time driver does not tick, so iteration counts
+    /// are the reliable timing here).
+    fn disable(&self) -> u32 {
         let r = self.r;
+        let mut reads = 0u32;
         loop {
+            reads += 1;
             match self.state() {
-                State::Disabled => return,
+                State::Disabled => {
+                    DISABLE_READS.fetch_add(reads, core::sync::atomic::Ordering::Relaxed);
+                    return reads;
+                }
                 State::RxRu | State::RxIdle | State::TxRu | State::TxIdle => {
                     r.tasks_disable().write_value(1);
-                    while self.state() != State::Disabled {}
-                    return;
+                    while self.state() != State::Disabled {
+                        reads += 1;
+                    }
+                    DISABLE_READS.fetch_add(reads, core::sync::atomic::Ordering::Relaxed);
+                    return reads;
                 }
                 State::RxDisable | State::TxDisable => {
-                    while self.state() != State::Disabled {}
-                    return;
+                    while self.state() != State::Disabled {
+                        reads += 1;
+                    }
+                    DISABLE_READS.fetch_add(reads, core::sync::atomic::Ordering::Relaxed);
+                    return reads;
                 }
                 State::Rx => {
                     r.tasks_stop().write_value(1);
@@ -347,8 +380,11 @@ impl<'d> NrfRadioPhy<'d> {
                 _ => {
                     // Unknown/substates: wait a bit and retry.
                     r.tasks_disable().write_value(1);
-                    while self.state() != State::Disabled {}
-                    return;
+                    while self.state() != State::Disabled {
+                        reads += 1;
+                    }
+                    DISABLE_READS.fetch_add(reads, core::sync::atomic::Ordering::Relaxed);
+                    return reads;
                 }
             }
         }
@@ -410,6 +446,180 @@ impl<'d> NrfRadioPhy<'d> {
         let prefix = addr.0[0].reverse_bits();
         self.r.prefix0().write(|w| w.set_ap0(prefix));
     }
+
+    /// Synchronous transmit - no await hop, no executor. Measures the raw
+    /// radio TX rate (the async wrapper alone costs the executor hop).
+    pub fn transmit_blocking(
+        &mut self,
+        pkt: &[u8],
+    ) -> Result<(), Error<RadioError>> {
+        if pkt.len() > 255 - 1 {
+            return Err(Error::Phy(RadioError::BufferTooLong));
+        }
+        let c0 = dwt_cycles();
+        self.disable();
+        let c1 = dwt_cycles();
+
+        // nRF54 requires PLL enable after the radio is disabled.
+        #[cfg(feature = "_nrf54")]
+        self.pll_enable();
+
+        // ESB format: [S0 = length][payload].
+        let tx_buf = unsafe { &mut TX_BUF };
+        tx_buf[0] = pkt.len() as u8;
+        tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
+
+        compiler_fence(Ordering::Release);
+        self.set_packet_ptr(tx_buf.as_ptr());
+        // nRF54: the TX DMA amount (TXD at 0xEE8) must match the PDU length.
+        // nRF52/53: the lflen drives the transfer - nothing to write.
+        // nRF54: the TX DMA amount (TXD.AMOUNT at 0xEE8) must match the PDU
+        // length or the radio transmits nothing.
+        #[cfg(feature = "_nrf54")]
+        unsafe {
+            ((self.r.as_ptr() as usize + 0xEE8) as *mut u32).write_volatile(1 + pkt.len() as u32);
+        }
+
+        // Shortcuts: ramp-up TX then start packet automatically; disable at END.
+        #[cfg(not(feature = "_nrf54"))]
+        self.r.shorts().write(|w| {
+            w.set_txready_start(true);
+            w.set_end_disable(true);
+        });
+
+        self.r.events_end().write_value(0);
+        let c2 = dwt_cycles();
+        self.r.tasks_txen().write_value(1);
+
+        // Poll for completion (interrupt-driven waits are unreliable here).
+        #[cfg(not(feature = "_nrf54"))]
+        {
+            // 2 Mbps short packet TX completes in ~60 us; bound the poll so a
+            // missed END (radio not ready) cannot stall the 1 kHz link.
+            let mut t = 0u32;
+            while self.r.events_end().read() == 0 {
+                t += 1;
+                if t > 40_000 {
+                    break;
+                }
+            }
+            if t < 40_000 {
+                TX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                TX_STATS.fetch_or(2, core::sync::atomic::Ordering::Relaxed);
+            }
+            TX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
+            self.r.events_end().write_value(0);
+        }
+        let c3 = dwt_cycles();
+        TX_PHASE_DIS.fetch_add(c1 - c0, core::sync::atomic::Ordering::Relaxed);
+        TX_PHASE_SETUP.fetch_add(c2 - c1, core::sync::atomic::Ordering::Relaxed);
+        TX_PHASE_POLL.fetch_add(c3 - c2, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "_nrf54")]
+        {
+            let mut t = 0u32;
+            while self.r.events_phyend().read() == 0 {
+                t += 1;
+                if t > 40_000 {
+                    break;
+                }
+            }
+            self.r.events_phyend().write_value(0);
+        }
+        compiler_fence(Ordering::Acquire);
+        // The END_DISABLE short already ramps the radio down; skip the
+        // explicit disable() wait here (the next op's disable() is
+        // state-aware and returns instantly when Disabled).
+        Ok(())
+    }
+
+    /// Begin a TX burst: ramp the radio once and leave it on across packets
+    /// (no END_DISABLE). The ramp is amortized - the subsequent
+    /// [`transmit_burst_send`] packets skip the TXEN ramp entirely.
+    ///
+    /// The nRF54L burst is not implemented (its SHORTS auto-disable and the
+    /// per-packet PLL/TXD.AMOUNT differ) - return Unsupported so the link
+    /// falls back to the plain per-packet transmit.
+    pub fn transmit_burst_begin(
+        &mut self,
+        pkt: &[u8],
+    ) -> Result<(), Error<RadioError>> {
+        #[cfg(feature = "_nrf54")]
+        return Err(Error::Unsupported);
+        if pkt.len() > 255 - 1 {
+            return Err(Error::Phy(RadioError::BufferTooLong));
+        }
+        self.disable();
+        let tx_buf = unsafe { &mut TX_BUF };
+        tx_buf[0] = pkt.len() as u8;
+        tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
+        compiler_fence(Ordering::Release);
+        self.set_packet_ptr(tx_buf.as_ptr());
+        #[cfg(not(feature = "_nrf54"))]
+        self.r.shorts().write(|w| {
+            w.set_txready_start(true);
+            // No end_disable: the radio stays warm (TXIDLE) after the END.
+        });
+        self.r.events_end().write_value(0);
+        self.r.tasks_txen().write_value(1);
+        self.poll_tx_end();
+        Ok(())
+    }
+
+    /// Send the next packet in a burst: the radio is already ramped, so only
+    /// the packetptr + the START - no TXEN, no ramp (the ~on-air time).
+    pub fn transmit_burst_send(
+        &mut self,
+        pkt: &[u8],
+    ) -> Result<(), Error<RadioError>> {
+        #[cfg(feature = "_nrf54")]
+        return Err(Error::Unsupported);
+        if pkt.len() > 255 - 1 {
+            return Err(Error::Phy(RadioError::BufferTooLong));
+        }
+        let tx_buf = unsafe { &mut TX_BUF };
+        tx_buf[0] = pkt.len() as u8;
+        tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
+        compiler_fence(Ordering::Release);
+        self.set_packet_ptr(tx_buf.as_ptr());
+        self.r.events_end().write_value(0);
+        self.r.tasks_start().write_value(1);
+        self.poll_tx_end();
+        Ok(())
+    }
+
+    /// Poll the TX END event (the packet's on-air completion).
+    #[inline(always)]
+    fn poll_tx_end(&mut self) {
+        #[cfg(not(feature = "_nrf54"))]
+        {
+            let mut t = 0u32;
+            while self.r.events_end().read() == 0 {
+                t += 1;
+                if t > 40_000 {
+                    break;
+                }
+            }
+            if t < 40_000 {
+                TX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                TX_STATS.fetch_or(2, core::sync::atomic::Ordering::Relaxed);
+            }
+            TX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
+            self.r.events_end().write_value(0);
+        }
+        #[cfg(feature = "_nrf54")]
+        {
+            let mut t = 0u32;
+            while self.r.events_phyend().read() == 0 {
+                t += 1;
+                if t > 40_000 {
+                    break;
+                }
+            }
+            self.r.events_phyend().write_value(0);
+        }
+    }
 }
 
 impl<'d> Phy for NrfRadioPhy<'d> {
@@ -437,81 +647,9 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         &mut self,
         pkt: &[u8],
     ) -> Result<(), Error<RadioError>> {
-        if pkt.len() > 255 - 1 {
-            return Err(Error::Phy(RadioError::BufferTooLong));
-        }
-
-        self.disable();
-
-        // nRF54 requires PLL enable after the radio is disabled.
-        #[cfg(feature = "_nrf54")]
-        self.pll_enable();
-
-        // ESB format: [S0 = length][payload].
-        let tx_buf = unsafe { &mut TX_BUF };
-        tx_buf[0] = pkt.len() as u8;
-        tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
-
-        compiler_fence(Ordering::Release);
-        self.set_packet_ptr(tx_buf.as_ptr());
-        // nRF54: the TX DMA amount (TXD at 0xEE8) must match the PDU length.
-        // nRF52/53: the lflen drives the transfer - nothing to write.
-        #[cfg(feature = "_nrf54")]
-        unsafe {
-            let base = self.r.as_ptr() as usize;
-            ((base + 0xEE8) as *mut u32).write_volatile(1 + pkt.len() as u32);
-        }
-        // nRF54: the TX DMA amount (TXD.AMOUNT at 0xEE8) must match the PDU
-        // length or the radio transmits nothing.
-        #[cfg(feature = "_nrf54")]
-        unsafe {
-            ((self.r.as_ptr() as usize + 0xEE8) as *mut u32).write_volatile(1 + pkt.len() as u32);
-        }
-
-        // Shortcuts: ramp-up TX then start packet automatically; disable at END.
-        #[cfg(not(feature = "_nrf54"))]
-        self.r.shorts().write(|w| {
-            w.set_txready_start(true);
-            w.set_end_disable(true);
-        });
-
-        self.r.events_end().write_value(0);
-        self.r.tasks_txen().write_value(1);
-
-        // Poll for completion (interrupt-driven waits are unreliable here).
-        #[cfg(not(feature = "_nrf54"))]
-        {
-            // 2 Mbps short packet TX completes in ~60 us; bound the poll so a
-            // missed END (radio not ready) cannot stall the 1 kHz link.
-            let mut t = 0u32;
-            while self.r.events_end().read() == 0 {
-                t += 1;
-                if t > 40_000 {
-                    break;
-                }
-            }
-            if t < 40_000 {
-                TX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
-            } else {
-                TX_STATS.fetch_or(2, core::sync::atomic::Ordering::Relaxed);
-            }
-            TX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
-            self.r.events_end().write_value(0);
-        }
-        #[cfg(feature = "_nrf54")]
-        {
-            let mut t = 0u32;
-            while self.r.events_phyend().read() == 0 {
-                t += 1;
-                if t > 40_000 {
-                    break;
-                }
-            }
-            self.r.events_phyend().write_value(0);
-        }
-        compiler_fence(Ordering::Acquire);
-        self.disable();
-        Ok(())
+        // The body is fully synchronous (busy-polls, no awaits) - route
+        // through the blocking twin so both paths share one implementation.
+        self.transmit_blocking(pkt)
     }
 
     async fn receive(
@@ -558,6 +696,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
                     break;
                 }
             }
+            RX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
             if t < limit {
                 self.r.events_end().write_value(0);
                 RX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
@@ -579,6 +718,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
                     break;
                 }
             }
+            RX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
             if t < limit {
                 self.r.events_phyend().write_value(0);
                 RX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
@@ -614,7 +754,9 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         let payload_len = unsafe { RX_BUF[0] } as usize;
         let rx_buf = unsafe { &RX_BUF };
         #[cfg(feature = "defmt")]
-        defmt::info!("RXOK lenbyte={} buf={:02x}", payload_len, &rx_buf[..16]);
+        if RXOK_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 1000 == 0 {
+            defmt::info!("RXOK lenbyte={} buf={:02x}", payload_len, &rx_buf[..16]);
+        }
         if payload_len == 0 || payload_len > buf.len() {
             self.disable();
             return Err(Error::BufferTooSmall);
@@ -636,9 +778,150 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         #[cfg(feature = "_nrf54")]
         self.pll_enable();
     }
+
+    fn transmit_burst_begin(&mut self, pkt: &[u8]) -> Result<(), Error<Self::Error>> {
+        NrfRadioPhy::transmit_burst_begin(self, pkt)
+    }
+
+    fn transmit_burst_send(&mut self, pkt: &[u8]) -> Result<(), Error<Self::Error>> {
+        NrfRadioPhy::transmit_burst_send(self, pkt)
+    }
+
+    #[cfg(any(feature = "nrf52840", feature = "nrf5340-net", feature = "nrf52833"))]
+    fn ccm_crypt(
+        &mut self,
+        key: &[u8; 16],
+        nonce: &[u8; 13],
+        payload: &mut [u8],
+        mic: &mut [u8; 4],
+        encrypt: bool,
+    ) -> Result<(), Error<Self::Error>> {
+        NrfRadioPhy::ccm_crypt(key, nonce, payload, mic, encrypt)
+            .map_err(|_| Error::Phy(RadioError::Crypto))
+    }
 }
 
 impl<'d> NrfRadioPhy<'d> {
+    /// Hardware AES-CCM over the EasyDMA: the config [key(16) | nonce(13) |
+    /// iv(8)] at CNFPTR, the payload at INPTR/OUTPTR, the CBC-MAC scratch at
+    /// SCRATCHPTR. KSGEN (the key schedule) then CRYPT (the AEAD); MICSTATUS
+    /// gates the decrypt. The MIC (4 bytes) is appended after the payload.
+    #[cfg(any(feature = "nrf52840", feature = "nrf5340-net", feature = "nrf52833"))]
+    fn ccm_crypt(
+        key: &[u8; 16],
+        nonce: &[u8; 13],
+        payload: &mut [u8],
+        mic: &mut [u8; 4],
+        encrypt: bool,
+    ) -> Result<(), ()> {
+        // The nrfx nrf_ccm_cnf_t: key[16] | pktctr[9] | iv[8] (33 packed bytes).
+        #[repr(C, packed)]
+        struct CcmCnf {
+            key: [u8; 16],
+            pktctr: [u8; 9],
+            iv: [u8; 8],
+        }
+        // The scratch must hold (16 + MAXPACKETSIZE) bytes when MODE.LENGTH
+        // is Extended (the keystream + the AES state); MAXPACKETSIZE resets
+        // to 251.
+        static mut CCM_CNF: CcmCnf =
+            CcmCnf { key: [0; 16], pktctr: [0; 9], iv: [0; 8] };
+        static mut CCM_SCRATCH: [u8; 267] = [0; 267];
+        // The EasyDMA packet: [HEADER(S0) | LENGTH | RFU | payload | MIC].
+        static mut CCM_BUF: [u8; 3 + 40] = [0; 3 + 40];
+        // Separate output buffer (the in-place INPTR==OUTPTR read-back
+        // hazards the MAC for the streaming EasyDMA).
+        static mut CCM_OUT: [u8; 3 + 40 + 4] = [0; 3 + 40 + 4];
+
+        // The nonce -> the CNF mapping (PS Table 56): the pktctr field is
+        // the 5-byte packet counter + 3 reserved bytes + the direction byte;
+        // the IV carries the channel. make_nonce_13 = [seq | 0*4 | channel
+        // | direction | 0*6]; the channel is dropped so the IV is zeroed.
+        let cnf = unsafe { &mut CCM_CNF };
+        cnf.key.copy_from_slice(key);
+        cnf.pktctr[..5].copy_from_slice(&nonce[..5]);
+        cnf.pktctr[5..8].fill(0);
+        cnf.pktctr[8] = nonce[6]; // the direction bit
+        cnf.iv[0] = nonce[5]; // the channel
+        cnf.iv[1..].fill(0);
+
+        let buf = unsafe { &mut CCM_BUF };
+        let len = payload.len();
+        buf[0] = 0; // the S0 header
+        // The LENGTH byte is the packet length the CCM processes: the
+        // plaintext alone on encrypt (the hardware appends the 4-byte MIC),
+        // the ciphertext + MIC on decrypt (the hardware strips the MIC).
+        buf[1] = if encrypt { len } else { len + 4 } as u8;
+        buf[2] = 0; // the RFU
+        buf[3..3 + len].copy_from_slice(payload);
+        // On decrypt, the received MIC is the input after the ciphertext.
+        if !encrypt {
+            buf[3 + len..3 + len + 4].copy_from_slice(mic);
+        }
+
+        // The 5-bit (Default) LENGTH field tops out at 31. Match nrf-hal: the
+        // encrypt's plaintext must fit so the +4 MIC output stays <= 31, the
+        // decrypt's ciphertext+MIC is the read value. Larger packets switch
+        // to the 8-bit (Extended) field and need MAXPACKETSIZE set.
+        let extended = if encrypt { len > 27 } else { len + 4 > 31 };
+
+        #[cfg(feature = "nrf52840")]
+        let ccm = unsafe { &nrf_pac::CCM };
+        #[cfg(feature = "nrf52833")]
+        let ccm = unsafe { &nrf_pac::CCM };
+        #[cfg(feature = "nrf5340-net")]
+        let ccm = unsafe { &nrf_pac::CCM_NS };
+        // The MODE register (the datarate) must be written while DISABLED;
+        // write the whole thing before enabling.
+        ccm.enable().write_value(nrf_pac::ccm::regs::Enable(0));
+        if extended {
+            ccm.maxpacketsize()
+                .write_value(nrf_pac::ccm::regs::Maxpacketsize(buf[1] as u32));
+        }
+        // MODE: bit0 = encrypt(0)/decrypt(1), bits 16-17 = the datarate
+        // (2 Mbit = 1), bit 24 = LENGTH (0 = 5-bit Default, 1 = 8-bit Extended).
+        ccm.mode().write_value(nrf_pac::ccm::regs::Mode(
+            ((extended as u32) << 24) | (1u32 << 16) | (if encrypt { 0 } else { 1 }),
+        ));
+        ccm.enable().write_value(nrf_pac::ccm::regs::Enable(2));
+        ccm.cnfptr().write_value(cnf as *const _ as u32);
+        ccm.inptr().write_value(buf.as_ptr() as u32);
+        let out = unsafe { &mut CCM_OUT };
+        ccm.outptr().write_value(out.as_ptr() as u32);
+        ccm.scratchptr().write_value(unsafe { CCM_SCRATCH.as_ptr() } as u32);
+
+        ccm.events_endksgen().write_value(0);
+        ccm.tasks_ksgen().write_value(1);
+        let mut t = 0u32;
+        while ccm.events_endksgen().read() == 0 {
+            t += 1;
+            if t > 1_000_000 {
+                return Err(());
+            }
+        }
+        ccm.events_endcrypt().write_value(0);
+        ccm.tasks_crypt().write_value(1);
+        t = 0;
+        while ccm.events_endcrypt().read() == 0 {
+            t += 1;
+            if t > 1_000_000 {
+                return Err(());
+            }
+        }
+        if encrypt {
+            payload.copy_from_slice(&out[3..3 + len]);
+            mic.copy_from_slice(&out[3 + len..3 + len + 4]);
+            Ok(())
+        } else {
+            // MICSTATUS bit 0: 0 = CheckFailed, 1 = CheckPassed.
+            if ccm.micstatus().read().0 & 0x1 == 0 {
+                return Err(());
+            }
+            payload.copy_from_slice(&out[3..3 + len]);
+            Ok(())
+        }
+    }
+
     /// Enable the RADIO PLL (nRF54 only). On nRF52/53 the PLL
     /// auto-enables on TXEN/RXEN, but RADIO3 requires an explicit
     /// TASKS_PLLEN and waits for EVENTS_PLLREADY before it can
