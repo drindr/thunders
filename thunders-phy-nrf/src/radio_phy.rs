@@ -8,6 +8,29 @@ use core::task::Poll;
 
 use embassy_nrf::{peripherals, Peri};
 use embassy_nrf::interrupt::typelevel::{self, Binding, Handler, Interrupt};
+
+/// nRF54L HFXO load-cap trim (call once at boot). The 32 MHz crystal's
+/// internal capacitors come from FICR.XOSC32MTRIM + the DK's 15 pF target;
+/// untrimmed (INTCAP=0) the carrier sits off-frequency and old-IP receivers
+/// (nRF52/53) barely decode it, while the 54L's own CFO-tracking RX copes -
+/// a deaf-TX/marginal-link pattern. Zephyr does this in soc.c; nobody does
+/// it for us.
+#[cfg(feature = "_nrf54")]
+pub fn hfxo_cap_trim() {
+    unsafe {
+        let trim = (0x00FF_C620 as *const u32).read_volatile(); // FICR.XOSC32MTRIM
+        let slope_field = trim & 0x1FF;
+        let slope = (slope_field ^ 0x100) as i32 - 0x100; // 9-bit two's complement
+        let offset = ((trim >> 16) & 0x3FF) as i32;
+        let cap_ff = 15000i32; // the DK's internal load capacitance (15 pF)
+        let mid = (((cap_ff - 5500) * (slope + 791)) + ((offset << 2) * 1000)) >> 8;
+        let mut cap = mid / 1000;
+        if mid % 1000 >= 500 {
+            cap += 1;
+        }
+        (0x5012_071C as *mut u32).write_volatile(cap as u32); // OSCILLATORS.XO32M.CONFIG.INTCAP
+    }
+}
 #[cfg(feature = "_nrf54")]
 use nrf_pac::radio::vals::{
     Crcinc, Crcstatus, Endian, Len, Mode, Plen, Skipaddr, State, Txpower,
@@ -223,6 +246,9 @@ impl<'d> NrfRadioPhy<'d> {
 
         // nRF54 RADIO does not have a power register; the peripheral
         // is always powered when the system is on.
+
+        // NOTE: hfxo_cap_trim() must run BEFORE embassy_nrf::init() starts the
+        // HFXO; the examples call it at the top of main().
 
         // nRF54L errata workarounds required for correct radio operation
         // (mirrors Nordic's ESB driver, esb_glue.c):

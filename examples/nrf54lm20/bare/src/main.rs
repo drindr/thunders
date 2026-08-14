@@ -37,6 +37,7 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
+    thunders_phy_nrf::hfxo_cap_trim(); // before the HFXO starts
     let mut config = embassy_nrf::config::Config::default();
     config.flpr_reset = embassy_nrf::config::FlprReset::Leave;
     config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;

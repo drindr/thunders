@@ -49,6 +49,7 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    thunders_phy_nrf::hfxo_cap_trim(); // before the HFXO starts
     info!("thunders MPSL (nRF54LM20 app core, {:?})", defmt::Debug2Format(&ROLE));
 
     let mut config = embassy_nrf::config::Config::default();
