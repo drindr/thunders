@@ -19,9 +19,13 @@ panic-probe = { version = "0.3", features = ["print-defmt"] }
 static_cell = "1.2"
 
 [features]
-default = ["central"]
+default = ["central", "host"]
 central = []
 peripheral = []
+# The app-core mailbox integration (the host/controller split). Disable for
+# the standalone radio bench: without the host's SPU config the mailbox RAM
+# is secure and the net core faults on it.
+host = []
 secure = ["thunders/secure"]
 
 [[bin]]

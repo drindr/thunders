@@ -126,22 +126,68 @@ and the periodic `BENCH` summary.
 
 ## Benchmarks
 
-The full matrix (the ratio `(8, 1)`, the central's slot rate):
+Every example's bench loop reports **latency, bandwidth and packet loss**
+per 5 s window (the `BENCH` lines, first window dropped as the
+connection-forming warmup):
 
-| pair | backend | central | peripheral catches |
-|---|---|---|---|
-| 52840 ↔ 5340 | bare | 1799/s (txp 432 — the burst) | — |
-| 52840 ↔ LM20 | bare | 1800/s | 3600 ✓ |
-| 5340 ↔ LM20 | bare | 1933/s | 3674 ✓ |
-| 52840 ↔ 5340 | mpsl | ~2 kHz (occ 49%) | ~98/s |
-| 52840 ↔ LM20 | mpsl | ~2 kHz | ~98/s |
-| 5340 ↔ LM20 | mpsl | ~2 kHz | ~98/s |
+| metric | who | how |
+|---|---|---|
+| **RTT** (latency) | central | PING TX slot → echo RX slot (`rtt_avg/min/max`). The peripheral echoes the last PING of each 8-slot TX run, so RTT ≈ 1 slot period (500 µs mpsl / 125 µs bare) + processing. |
+| **bandwidth** | central | `bw` = payload bytes/s both ways (8 B per PING + 8 B per echo). `rate` = the slot rate. |
+| **forward loss** | peripheral | `floss` = seq gaps / expected — the central→peripheral leg. The PING seq is a per-PING counter, so structural gaps (beacons, ratio skips) are excluded; gaps ≥ 1 M seqs are peer restarts, not loss. |
+| **reverse loss** | central | `rloss` = RX slots with no echo — the peripheral→central leg. |
+| **busy** | both | the app's per-slot processing time. |
 
-The ceilings: the bare path runs the TX burst (the ramp amortized — the
-`txp=432` is ~36 µs of on-air); the MPSL is flat at its ~2 kHz grant-floor
-slot (the 500 µs, `occ=49%`). The MPSL recv rate is governed by the
-peripheral's phase-lock (the hopping doc §6): the chained slot distance is
-nudged until the RX window slides to and centres on the central's TX.
+The bench loop is identical across the six examples (52840/5340/LM20 ×
+bare/mpsl), so the runs are comparable. The MPSL `PLL` lines carry the
+phase-lock diagnostics, the bare `RADIO` lines the radio counters.
+
+### Running the matrix
+
+All **six directed pairs** × both backends = 12 runs, one command:
+
+```sh
+scripts/bench.sh build     # build all 12 ELFs into bench/bin (per role)
+scripts/bench.sh run 30    # the full matrix, 30 s per run -> bench/logs/
+scripts/bench_parse.py     # the summary table (fwd/rev loss, RTT, bw, rate)
+```
+
+`run-pair 52840 lm20 mpsl 30` runs a single directed pair. A run flashes the
+peripheral first (its slot session must be open before the central boots),
+then the central; both RTT streams are captured per role. The 5340 examples
+build a `host` feature for the app-core mailbox integration (default ON);
+the bench builds it OFF (`--no-default-features --features <role>`), so the
+net core runs standalone — without the host's SPU config the mailbox RAM is
+secure and any access faults. (The 5340 net core is debug-locked, so every
+flash needs `--allow-erase-all`, which also wipes the app core — irrelevant
+for the standalone bench.)
+
+### Results (2025-08-14, `docs/bench-results.md`)
+
+Only two of the twelve combos form a healthy link today: **mpsl with the
+LM20 as the peripheral** — 52840→LM20 and 5340→LM20 both deliver ~86-87 %
+each way, RTT ≈ 633-644 µs, bandwidth ≈ 15.7 kB/s payload.
+
+| run | fwd | rev | rtt avg | bw |
+|---|---|---|---|---|
+| 52840 → LM20 | mpsl | 14% | 13% | 633 µs | 15.7 kB/s |
+| 5340 → LM20 | mpsl | 13% | 13% | 644 µs | 15.7 kB/s |
+
+Everything else is 97-100 % loss:
+- **bare, all pairs** — the two free-running slot loops run at different
+  rates per chip (6.5 kHz vs 2.5 kHz) and the bare path has no cadence
+  lock; the beacon phase-mirror only corrects phase, and is itself missed
+  while misaligned.
+- **mpsl, 5340/52840 as peripheral** — the 5340 net core receives the
+  frames (thousands of ADDRESS events) but decodes only ~10 % (CRC
+  failures); the LM20 decodes ~84 %.
+- **mpsl, LM20 as central** — the LM20's TX never reaches the peers
+  (addr = 0) and its RX gets nothing back; the 5340 peripheral also hangs
+  (starved executor) in one run.
+
+The old table (pre-ratio architecture, measured before the slot-alignment
+work) is history — the current firmware's matrix is above; the per-window
+detail and the raw logs live in `docs/bench-results.md` and `bench/logs/`.
 
 ## nRF54L field notes (things the SVD won't tell you)
 

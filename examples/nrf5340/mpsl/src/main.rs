@@ -6,10 +6,14 @@
 //!   cargo build --release                          # central
 //!   cargo build --release --no-default-features --features peripheral
 //! Any thunders node can be either role; the link is full-duplex.
+//!
+//! The bench measures (5 s windows, the `BENCH` lines):
+//!   central  — the reverse-link loss (RX slots with no echo), the payload
+//!              bandwidth, the app-level RTT (PING TX slot -> echo RX).
+//!   peripheral — the forward-link loss (seq gaps), the slot rate.
 
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
-use embassy_nrf::ipc::{Ipc, IpcChannel};
 use embassy_time::Instant;
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, raw};
 use {defmt_rtt as _, panic_probe as _};
@@ -17,8 +21,13 @@ use defmt::info;
 use static_cell::StaticCell;
 
 use thunders::link::{Central, Peripheral};
+use thunders::{Address, Config, Role};
+#[cfg(feature = "host")]
 use thunders::ipc::mailbox;
-use thunders::{Address, Config, Role, MAX_PAYLOAD};
+#[cfg(all(feature = "host", feature = "peripheral"))]
+use thunders::MAX_PAYLOAD;
+#[cfg(feature = "host")]
+use embassy_nrf::ipc::{Ipc, IpcChannel};
 use thunders_phy_nrf::mpsl::{MpslRadioPhy, MpslState};
 use thunders_phy_nrf::RadioMode;
 
@@ -47,6 +56,8 @@ bind_interrupts!(struct Irqs {
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
     // Wake-driven: the low-prio IRQ wakes this task when there is work.
+    // (The polling loop was tried to fix the 5340's app latency but made
+    // it worse - busy ~1000 us vs ~680 us - so the wake-driven stays.)
     mpsl.run().await
 }
 
@@ -63,10 +74,16 @@ async fn main(spawner: Spawner) {
 
     // IPC to the app core (channel 1 = net -> app "RX ready"). The net core
     // polls the shared mailbox for the app -> net direction, so no IPC wait.
-    let mut ipc = Ipc::new(p.IPC, Irqs);
-    ipc.event1.configure_trigger([IpcChannel::Channel1]);
-    mailbox().tx.valid = 0;
-    mailbox().rx.valid = 0;
+    // Without the host (the standalone bench) the mailbox region is secure
+    // and any access faults, so this is host-only.
+    #[cfg(feature = "host")]
+    {
+        let mut ipc = Ipc::new(p.IPC, Irqs);
+        ipc.event1.configure_trigger([IpcChannel::Channel1]);
+        mailbox().tx.valid = 0;
+        mailbox().rx.valid = 0;
+        let _ = ipc;
+    }
 
     let mpsl_p = Peripherals::new(
         p.RTC0, p.TIMER0, p.TIMER1, p.TEMP,
@@ -95,8 +112,7 @@ async fn main(spawner: Spawner) {
     // 'static: the phy hands this pointer to the MPSL callback (ISR).
     static STATE: StaticCell<MpslState> = StaticCell::new();
     let state = STATE.init(MpslState::new(radio, cfg!(feature = "peripheral")));
-    // ponytail: 400/300 experiment (gap=100us) - restore <500,400,1400> after
-    let mut phy = MpslRadioPhy::<400, 300, 1400>::new(RadioMode::Nrf2Mbit, state);
+    let mut phy = MpslRadioPhy::<500, 400, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
     info!("MPSL ready");
@@ -106,47 +122,102 @@ async fn main(spawner: Spawner) {
         Address([0xE7, 0xE7, 0xE7, 0xE7, 0xE7]),
         ROLE,
     );
+    let (tx_n, rx_n) = cfg.tx_rx_ratio;
 
     match ROLE {
         Role::Central => {
+            let period = tx_n as u64 + rx_n as u64;
             let mut central = Central::new(phy, cfg).await.unwrap();
             info!("link ready (Central)");
 
             let mut rx_buf = [0u8; 32];
-            let mut txc: u32 = 0;
-            let mut rxc: u32 = 0;
+            let mut frames: u64 = 0;
+            let mut ping_tx: u64 = 0;
+            let mut echo_rx: u64 = 0;
+            let mut rtt_sum: u64 = 0;
+            let mut rtt_min: u32 = u32::MAX;
+            let mut rtt_max: u32 = 0;
             let mut busy_total: u64 = 0;
-            let mut frame_count: u32 = 0;
+            let mut t_ping_tx = Instant::now();
+            let mut report_at = Instant::now();
+            info!("BENCH READY role=C ratio={},{}", tx_n, rx_n);
 
             loop {
-                let payload = [0x50, 0x49, 0x4E, 0x47, (txc & 0xFF) as u8, 0, 0, 0];
-                txc += 1;
+                // TX slots carry a fresh PING (seq per PING, beacons skipped),
+                // RX slots listen.
+                let mut p = [0x50u8, 0x49, 0x4E, 0x47, 0, 0, 0, 0];
+                let tx: Option<&[u8]> = if (frames % period) < tx_n as u64 && frames % 64 != 0 {
+                    ping_tx += 1;
+                    t_ping_tx = Instant::now();
+                    p[4..].copy_from_slice(&(ping_tx as u32).to_le_bytes());
+                    Some(&p)
+                } else {
+                    None
+                };
                 let t_start = Instant::now();
-                match central.frame(Some(&payload), &mut rx_buf).await {
-                    Ok(Some(n)) if n >= 4 && rx_buf[..4] == *b"PING" => {
-                        rxc += 1;
-                        mailbox().put_rx(&rx_buf[..n]);
-                        ipc.event1.trigger();
+                match central.frame(tx, &mut rx_buf).await {
+                    Ok(Some(n)) => {
+                        // Forward the received payload to the app core (host only).
+                        #[cfg(feature = "host")]
+                        {
+                            mailbox().put_rx(&rx_buf[..n]);
+                            ipc.event1.trigger();
+                        }
+                        if n >= 8 && rx_buf[..4] == *b"PING" {
+                            // The echo of the last PING arrived on an RX slot:
+                            // the RTT is measured from that PING's TX slot.
+                            echo_rx += 1;
+                            let rtt = t_ping_tx.elapsed().as_micros() as u32;
+                            rtt_sum += rtt as u64;
+                            if rtt < rtt_min {
+                                rtt_min = rtt;
+                            }
+                            if rtt > rtt_max {
+                                rtt_max = rtt;
+                            }
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => info!("frame err: {:?}", defmt::Debug2Format(&e)),
                 }
                 let busy = t_start.elapsed().as_micros() as u64;
                 busy_total += busy;
-                frame_count += 1;
+                frames += 1;
                 FRAME_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if frame_count % 5000 == 0 {
-                    info!("HB f={}", frame_count);
+                if frames % 5000 == 0 {
+                    info!("HB f={}", frames);
                 }
 
-                if frame_count >= 10000 {
-                    let avg_busy = busy_total / frame_count as u64;
-                    info!("BENCH frames={} rx={} avg_busy={}us", frame_count, rxc, avg_busy);
-                    let (d, ci, w, pw, ae, hdr, ai, txc, d8, mis) = thunders_phy_nrf::mpsl::mpsl_pll();
-                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, hdr);
+                let now = Instant::now();
+                if now - report_at >= embassy_time::Duration::from_secs(5) {
+                    let elapsed = (now - report_at).as_micros() as u64;
+                    let rate = frames * 1_000_000 / elapsed.max(1);
+                    let avg_busy = busy_total / frames.max(1);
+                    // The reverse-link loss: RX slots that caught no echo.
+                    let rx_slots = frames - ping_tx;
+                    let rloss = if rx_slots > 0 {
+                        rx_slots.saturating_sub(echo_rx) * 100 / rx_slots
+                    } else {
+                        0
+                    };
+                    // Payload throughput: 8 B per PING + 8 B per echo.
+                    let bw = (ping_tx + echo_rx) * 8 * 1_000_000 / elapsed.max(1);
+                    let (ra, rmin, rmax) = if echo_rx > 0 {
+                        (rtt_sum / echo_rx, rtt_min, rtt_max)
+                    } else {
+                        (0, 0, 0)
+                    };
+                    info!("BENCH C slots={} tx={} rx={} rloss={}% rate={}/s bw={}B/s rtt_avg={}us rtt_min={}us rtt_max={}us busy={}us", frames, ping_tx, echo_rx, rloss, rate, bw, ra, rmin, rmax, avg_busy);
+                    let (d, ci, w, pw, ae, hdr, ai, txc, d8, mis, co, cb) = thunders_phy_nrf::mpsl::mpsl_pll();
+                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, co, cb, hdr);
+                    frames = 0;
+                    ping_tx = 0;
+                    echo_rx = 0;
+                    rtt_sum = 0;
+                    rtt_min = u32::MAX;
+                    rtt_max = 0;
                     busy_total = 0;
-                    frame_count = 0;
-                    rxc = 0;
+                    report_at = now;
                 }
             }
         }
@@ -157,37 +228,59 @@ async fn main(spawner: Spawner) {
             let mut rx_buf = [0u8; 32];
             let mut echo = [0u8; 32];
             let mut echo_len = 0usize;
-            let mut frames: u32 = 0;
-            let mut rx_ok: u32 = 0;
-            let mut bad_seq: u32 = 0;
-            let mut last_seq: u8 = 0;
+            let mut frames: u64 = 0;
+            let mut rx_ok: u64 = 0;
+            let mut fwd_lost: u64 = 0;
+            let mut last_seq: u32 = 0;
             let mut busy_total: u64 = 0;
             let mut report_at = Instant::now();
+            info!("BENCH READY role=P ratio={},{}", tx_n, rx_n);
 
             loop {
                 let t_frame = Instant::now();
-                // The app core's payload takes priority, else the echo.
-                let mut ipc_tx = [0u8; MAX_PAYLOAD];
-                let tx: Option<&[u8]> = if let Some(m) = mailbox().take_tx(&mut ipc_tx) {
-                    Some(&ipc_tx[..m])
-                } else if echo_len > 0 {
+                // The app core's payload takes priority, else the echo
+                // (host only).
+                #[cfg(feature = "host")]
+                let tx: Option<&[u8]> = {
+                    let mut ipc_tx = [0u8; MAX_PAYLOAD];
+                    if let Some(m) = mailbox().take_tx(&mut ipc_tx) {
+                        Some(&ipc_tx[..m])
+                    } else if echo_len > 0 {
+                        Some(&echo[..echo_len])
+                    } else {
+                        None
+                    }
+                };
+                #[cfg(not(feature = "host"))]
+                let tx: Option<&[u8]> = if echo_len > 0 {
                     Some(&echo[..echo_len])
                 } else {
                     None
                 };
                 match peripheral.frame(tx, &mut rx_buf).await {
                     Ok(Some(n)) => {
-                        rx_ok += 1;
-                        if n >= 5 && rx_buf[..4] == *b"PING" {
-                            let seq = rx_buf[4];
-                            if seq.wrapping_sub(last_seq) > 1 {
-                                bad_seq += 1;
-                            }
-                            last_seq = seq;
-                            echo[..n].copy_from_slice(&rx_buf[..n]);
-                            echo_len = n;
+                        // Forward the received payload to the app core (host only).
+                        #[cfg(feature = "host")]
+                        {
                             mailbox().put_rx(&rx_buf[..n]);
                             ipc.event1.trigger();
+                        }
+                        if n >= 8 && rx_buf[..4] == *b"PING" {
+                            let seq =
+                                u32::from_le_bytes([rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7]]);
+                            if rx_ok > 1 {
+                                let gap = seq.wrapping_sub(last_seq);
+                                // A gap beyond ~1 M seqs is a peer restart,
+                                // not a loss burst (a 5 s window holds at
+                                // most ~35 k).
+                                if gap > 1 && gap < 1_000_000 {
+                                    fwd_lost += (gap - 1) as u64;
+                                }
+                            }
+                            last_seq = seq;
+                            rx_ok += 1;
+                            echo[..n].copy_from_slice(&rx_buf[..n]);
+                            echo_len = n;
                         }
                     }
                     Ok(None) => {}
@@ -195,17 +288,23 @@ async fn main(spawner: Spawner) {
                 }
                 frames += 1;
                 busy_total += t_frame.elapsed().as_micros() as u64;
+                FRAME_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let now = Instant::now();
                 if now - report_at >= embassy_time::Duration::from_secs(5) {
-                    let elapsed = (now - report_at).as_micros() as u32;
-                    let rate = (frames as u64) * 1_000_000 / elapsed.max(1) as u64;
-                    let avg_busy = busy_total / frames.max(1) as u64;
-                    info!("BENCH frames={} rx={} bad_seq={} rate={}/s busy={}us", frames, rx_ok, bad_seq, rate, avg_busy);
-                    let (d, ci, w, pw, ae, hdr, ai, txc, d8, mis) = thunders_phy_nrf::mpsl::mpsl_pll();
-                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, hdr);
+                    let elapsed = (now - report_at).as_micros() as u64;
+                    let rate = frames * 1_000_000 / elapsed.max(1);
+                    let avg_busy = busy_total / frames.max(1);
+                    let floss = if rx_ok + fwd_lost > 0 {
+                        fwd_lost * 100 / (rx_ok + fwd_lost)
+                    } else {
+                        0
+                    };
+                    info!("BENCH P slots={} rx={} lost={} floss={}% rate={}/s busy={}us", frames, rx_ok, fwd_lost, floss, rate, avg_busy);
+                    let (d, ci, w, pw, ae, hdr, ai, txc, d8, mis, co, cb) = thunders_phy_nrf::mpsl::mpsl_pll();
+                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, co, cb, hdr);
                     frames = 0;
                     rx_ok = 0;
-                    bad_seq = 0;
+                    fwd_lost = 0;
                     busy_total = 0;
                     report_at = now;
                 }

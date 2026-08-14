@@ -10,3 +10,8 @@ Cargo.lock.orig
 .vscode/
 .idea/
 .pi-subagents/
+
+# Bench artifacts (built ELFs, RTT logs, staging target dirs)
+bench/bin/
+bench/logs/
+bench-target/

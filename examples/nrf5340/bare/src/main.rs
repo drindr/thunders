@@ -9,18 +9,22 @@
 //!
 //! Build with `--features central` (default) or `--features peripheral`.
 //! Run two boards, one per role, on the same channel.
+//!
+//! The bench measures (5 s windows, the `BENCH` lines):
+//!   central  — the reverse-link loss (RX slots with no echo), the payload
+//!              bandwidth, the app-level RTT (PING TX slot -> echo RX).
+//!   peripheral — the forward-link loss (seq gaps), the slot rate.
 
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
-use embassy_nrf::ipc::{Ipc, IpcChannel};
 use embassy_time::Instant;
 use {defmt_rtt as _, panic_probe as _};
 use defmt::info;
 
-static FRAME_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
 use thunders::{Address, Config, Role};
+#[cfg(feature = "host")]
 use thunders::ipc::mailbox;
+#[cfg(all(feature = "host", not(feature = "peripheral")))]
 use thunders::MAX_PAYLOAD;
 use thunders_phy_nrf::{NrfRadioPhy, RadioIrqHandler, RadioMode};
 
@@ -28,6 +32,9 @@ use thunders_phy_nrf::{NrfRadioPhy, RadioIrqHandler, RadioMode};
 use thunders::link::Central as Link;
 #[cfg(feature = "peripheral")]
 use thunders::link::Peripheral as Link;
+
+#[cfg(feature = "host")]
+use embassy_nrf::ipc::{Ipc, IpcChannel};
 
 #[unsafe(no_mangle)]
 fn _defmt_timestamp() -> u64 {
@@ -57,12 +64,18 @@ async fn main(_spawner: Spawner) {
 
     // IPC to the app core (channel 1 = net -> app "RX ready"). The net core
     // polls the shared mailbox for the app -> net direction, so no IPC wait.
-    let mut ipc = Ipc::new(p.IPC, Irqs);
-    ipc.event1.configure_trigger([IpcChannel::Channel1]);
-    // The shared mailbox lives in the APP core's RAM (0x2007F000), which the
-    // app core marks non-secure via the SPU so the net core can reach it.
-    mailbox().tx.valid = 0;
-    mailbox().rx.valid = 0;
+    #[cfg(feature = "host")]
+    {
+        let mut ipc = Ipc::new(p.IPC, Irqs);
+        ipc.event1.configure_trigger([IpcChannel::Channel1]);
+        // The shared mailbox lives in the APP core's RAM (0x2007F000), which
+        // the app core marks non-secure via the SPU so the net core can reach
+        // it. Without the host (the standalone bench) the region is secure
+        // and any access faults, so the mailbox code is host-only.
+        mailbox().tx.valid = 0;
+        mailbox().rx.valid = 0;
+        let _ = ipc;
+    }
 
     let phy = NrfRadioPhy::new(p.RADIO, Irqs, RadioMode::Nrf2Mbit);
     let cfg = Config::new(
@@ -75,30 +88,65 @@ async fn main(_spawner: Spawner) {
     } else {
         cfg
     };
+    let (tx_n, rx_n) = cfg.tx_rx_ratio;
+    #[cfg(not(feature = "peripheral"))]
+    let period = tx_n as u64 + rx_n as u64;
     let mut link = Link::new(phy, cfg).await.unwrap();
     info!("link ready ({:?})", role);
 
     let mut rx_buf = [0u8; 32];
-    let mut frames: u32 = 0;
-    let mut ok: u32 = 0;
-    let mut txc: u32 = 0;
-    let mut echo = [0u8; 32];
-    let mut echo_len = 0usize;
+    // The bench accounting (5 s windows): the central measures the
+    // reverse-link loss + the app-level RTT, the peripheral the
+    // forward-link loss.
+    let mut frames: u64 = 0;
     let mut busy_total: u64 = 0;
     let mut report_at = Instant::now();
+    #[cfg(not(feature = "peripheral"))]
+    let (mut ping_tx, mut echo_rx, mut rtt_sum, mut rtt_min, mut rtt_max, mut t_ping_tx) =
+        (0u64, 0u64, 0u64, u32::MAX, 0u32, Instant::now());
+    #[cfg(feature = "peripheral")]
+    let (mut rx_ok, mut fwd_lost, mut last_seq) = (0u64, 0u64, 0u32);
+    #[cfg(feature = "peripheral")]
+    let mut echo = [0u8; 32];
+    #[cfg(feature = "peripheral")]
+    let mut echo_len = 0usize;
+    info!("BENCH READY role={} ratio={},{}", if cfg!(feature = "peripheral") { "P" } else { "C" }, tx_n, rx_n);
 
     loop {
-        // PING payload: [P,I,N,G,seq,0,0,0].
-        #[cfg(not(feature = "peripheral"))]
-        let payload = [0x50, 0x49, 0x4E, 0x47, (txc & 0xFF) as u8, 0, 0, 0];
-        // A queued app-core payload takes priority over the PING.
+        // The TX:RX ratio decides the slot: TX slots carry a fresh PING
+        // (seq = a per-PING counter, so no structural gaps - the every-
+        // 64th-slot beacon is skipped), RX slots just listen. A queued
+        // app-core payload takes priority over the PING (host only).
+        #[cfg(all(not(feature = "peripheral"), feature = "host"))]
         let mut ipc_tx = [0u8; MAX_PAYLOAD];
         #[cfg(not(feature = "peripheral"))]
-        let tx: Option<&[u8]> = if let Some(n) = mailbox().take_tx(&mut ipc_tx) {
-            Some(&ipc_tx[..n])
-        } else {
-            txc += 1;
-            Some(&payload)
+        let mut p = [0x50u8, 0x49, 0x4E, 0x47, 0, 0, 0, 0];
+        #[cfg(not(feature = "peripheral"))]
+        let tx: Option<&[u8]> = {
+            #[cfg(feature = "host")]
+            {
+                if let Some(n) = mailbox().take_tx(&mut ipc_tx) {
+                    Some(&ipc_tx[..n])
+                } else if (frames % period) < tx_n as u64 && frames % 64 != 0 {
+                    ping_tx += 1;
+                    t_ping_tx = Instant::now();
+                    p[4..].copy_from_slice(&(ping_tx as u32).to_le_bytes());
+                    Some(&p)
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(feature = "host"))]
+            {
+                if (frames % period) < tx_n as u64 && frames % 64 != 0 {
+                    ping_tx += 1;
+                    t_ping_tx = Instant::now();
+                    p[4..].copy_from_slice(&(ping_tx as u32).to_le_bytes());
+                    Some(&p)
+                } else {
+                    None
+                }
+            }
         };
         #[cfg(feature = "peripheral")]
         let tx: Option<&[u8]> = if echo_len > 0 {
@@ -111,19 +159,48 @@ async fn main(_spawner: Spawner) {
         let t_frame = Instant::now();
         match link.frame(tx, &mut rx_buf).await {
             Ok(Some(n)) => {
-                ok += 1;
-                // Forward the received payload to the app core.
-                mailbox().put_rx(&rx_buf[..n]);
-                ipc.event1.trigger();
+                // Forward the received payload to the app core (host only).
+                #[cfg(feature = "host")]
+                {
+                    mailbox().put_rx(&rx_buf[..n]);
+                    ipc.event1.trigger();
+                }
                 #[cfg(feature = "peripheral")]
                 {
                     // Echo the last received payload back on the next frame.
                     echo[..n].copy_from_slice(&rx_buf[..n]);
                     echo_len = n;
                 }
-                // Throttled: the per-frame RTT log is the hot-path cost.
-                if FRAME_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 1000 == 0 {
-                    info!("RX {} bytes: {:02x}", n, &rx_buf[..n]);
+                if n >= 8 && rx_buf[..4] == *b"PING" {
+                    #[cfg(not(feature = "peripheral"))]
+                    {
+                        // The echo of the last PING arrived on an RX slot:
+                        // the RTT is measured from that PING's TX slot.
+                        echo_rx += 1;
+                        let rtt = t_ping_tx.elapsed().as_micros() as u32;
+                        rtt_sum += rtt as u64;
+                        if rtt < rtt_min {
+                            rtt_min = rtt;
+                        }
+                        if rtt > rtt_max {
+                            rtt_max = rtt;
+                        }
+                    }
+                    #[cfg(feature = "peripheral")]
+                    {
+                        let seq =
+                            u32::from_le_bytes([rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7]]);
+                        if rx_ok > 1 {
+                            let gap = seq.wrapping_sub(last_seq);
+                            // A gap beyond ~1 M seqs is a peer restart, not a
+                            // loss burst (a 5 s window holds at most ~35 k).
+                            if gap > 1 && gap < 1_000_000 {
+                                fwd_lost += (gap - 1) as u64;
+                            }
+                        }
+                        last_seq = seq;
+                        rx_ok += 1;
+                    }
                 }
             }
             Ok(None) => {}
@@ -133,10 +210,37 @@ async fn main(_spawner: Spawner) {
         frames += 1;
         busy_total += t_frame.elapsed().as_micros() as u64;
         let now = Instant::now();
-        if now - report_at >= embassy_time::Duration::from_secs(2) {
-            let elapsed = (now - report_at).as_micros() as u32;
-            let rate = (frames as u64) * 1_000_000 / elapsed.max(1) as u64;
-            let avg_busy = busy_total / frames.max(1) as u64;
+        if now - report_at >= embassy_time::Duration::from_secs(5) {
+            let elapsed = (now - report_at).as_micros() as u64;
+            let rate = frames * 1_000_000 / elapsed.max(1);
+            let avg_busy = busy_total / frames.max(1);
+            #[cfg(not(feature = "peripheral"))]
+            {
+                // The reverse-link loss: RX slots that caught no echo.
+                let rx_slots = frames - ping_tx;
+                let rloss = if rx_slots > 0 {
+                    rx_slots.saturating_sub(echo_rx) * 100 / rx_slots
+                } else {
+                    0
+                };
+                // Payload throughput: 8 B per PING + 8 B per echo.
+                let bw = (ping_tx + echo_rx) * 8 * 1_000_000 / elapsed.max(1);
+                let (ra, rmin, rmax) = if echo_rx > 0 {
+                    (rtt_sum / echo_rx, rtt_min, rtt_max)
+                } else {
+                    (0, 0, 0)
+                };
+                info!("BENCH C slots={} tx={} rx={} rloss={}% rate={}/s bw={}B/s rtt_avg={}us rtt_min={}us rtt_max={}us busy={}us", frames, ping_tx, echo_rx, rloss, rate, bw, ra, rmin, rmax, avg_busy);
+            }
+            #[cfg(feature = "peripheral")]
+            {
+                let floss = if rx_ok + fwd_lost > 0 {
+                    fwd_lost * 100 / (rx_ok + fwd_lost)
+                } else {
+                    0
+                };
+                info!("BENCH P slots={} rx={} lost={} floss={}% rate={}/s busy={}us", frames, rx_ok, fwd_lost, floss, rate, avg_busy);
+            }
             let rxst =
                 thunders_phy_nrf::radio_phy::RX_STATS.load(core::sync::atomic::Ordering::Relaxed);
             let rxp = thunders_phy_nrf::radio_phy::RX_POLL.load(core::sync::atomic::Ordering::Relaxed);
@@ -144,11 +248,23 @@ async fn main(_spawner: Spawner) {
             let txs = thunders_phy_nrf::radio_phy::TX_STATS.load(core::sync::atomic::Ordering::Relaxed);
             let lup = thunders_phy_nrf::radio_phy::LOOP_US.swap(0, core::sync::atomic::Ordering::Relaxed);
             let dreads = thunders_phy_nrf::radio_phy::DISABLE_READS.swap(0, core::sync::atomic::Ordering::Relaxed);
-            info!("BENCH frames={} ok={} rate={}/s avg_busy={}us rxst={:#x} rxp={} txp={} txs={:#x} loop={}us dis={}", frames, ok, rate, avg_busy, rxst, rxp, txp, txs, lup, dreads);
+            info!("RADIO rxst={:#x} rxp={} txp={} txs={:#x} loop={}us dis={}", rxst, rxp, txp, txs, lup, dreads);
             frames = 0;
-            ok = 0;
             busy_total = 0;
             report_at = now;
+            #[cfg(not(feature = "peripheral"))]
+            {
+                ping_tx = 0;
+                echo_rx = 0;
+                rtt_sum = 0;
+                rtt_min = u32::MAX;
+                rtt_max = 0;
+            }
+            #[cfg(feature = "peripheral")]
+            {
+                rx_ok = 0;
+                fwd_lost = 0;
+            }
         }
     }
 }
