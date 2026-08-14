@@ -9,6 +9,11 @@ const HOP_MISS_THRESHOLD: u8 = 4;
 /// so a recovered link can re-align.
 const LINK_LOSS_THRESHOLD: u8 = 16;
 
+/// Consecutive successful frames before the link is called Connected (one
+/// lucky catch on a marginal link must not enable the hop: the peer may
+/// still be pinned to the initial channel, and hopping away deafens it).
+const CONNECT_STREAK_THRESHOLD: u8 = 8;
+
 /// The link's connection status.
 ///
 /// The status gates channel hopping: while [`LinkStatus::Disconnected`] the
@@ -37,9 +42,7 @@ use embassy_time::Duration;
 use heapless::Vec;
 
 use crate::{
-    config::{
-        Config, CENTRAL_REPLY_TIMEOUT_US, MAX_PAYLOAD, PERIPHERAL_LISTEN_TIMEOUT_US,
-    },
+    config::{CENTRAL_REPLY_TIMEOUT_US, Config, MAX_PAYLOAD, PERIPHERAL_LISTEN_TIMEOUT_US, Role},
     error::Error,
     packet::Packet,
     phy::Phy,
@@ -65,6 +68,12 @@ struct LinkState {
     slot_step: u8,
     /// The connection status (the hop gate).
     status: LinkStatus,
+    /// Consecutive catches while Disconnected (the form-up streak).
+    connect_streak: u8,
+    /// The peripheral never advances the hop locally: the beacon's channel
+    /// index is the hop authority (it can't hop away without losing the
+    /// central); it just follows.
+    central: bool,
     /// The channel index both nodes hold while disconnected.
     initial_channel: u8,
     #[cfg(feature = "secure")]
@@ -83,6 +92,8 @@ impl LinkState {
             tx_rx_ratio: cfg.tx_rx_ratio,
             slot_step: 0,
             status: LinkStatus::Disconnected,
+            connect_streak: 0,
+            central: matches!(cfg.role, Role::Central),
             initial_channel: cfg.initial_channel,
             #[cfg(feature = "secure")]
             cipher: cfg.security.as_ref().map(Security::cipher),
@@ -95,6 +106,7 @@ impl LinkState {
     /// back to the initial channel so a recovered link can re-align.
     fn on_miss(&mut self, streak: &mut u8) {
         *streak = streak.saturating_add(1);
+        self.connect_streak = 0;
         if self.status != LinkStatus::Connected {
             return;
         }
@@ -102,16 +114,21 @@ impl LinkState {
             self.status = LinkStatus::Disconnected;
             self.scheduler.sync(self.initial_channel);
             *streak = 0;
-        } else if *streak >= HOP_MISS_THRESHOLD {
+        } else if self.central && *streak >= HOP_MISS_THRESHOLD {
+            // Only the central drives the hop; the peripheral follows via
+            // the beacon's channel index.
             self.scheduler.advance();
             *streak = 0;
         }
     }
 
-    /// A successful RX slot: form the connection (enabling the hop) and reset
-    /// the miss streak.
+    /// A successful RX slot: the form-up streak forms the connection
+    /// (enabling the hop) only after the link proves it can sustain.
     fn on_rx(&mut self, streak: &mut u8) {
-        self.status = LinkStatus::Connected;
+        self.connect_streak = self.connect_streak.saturating_add(1);
+        if self.connect_streak >= CONNECT_STREAK_THRESHOLD {
+            self.status = LinkStatus::Connected;
+        }
         *streak = 0;
     }
 
@@ -271,12 +288,15 @@ impl<P: Phy> Central<P> {
         // The slot decision from the TX:RX ratio.
         let (tx_n, rx_n) = self.state.tx_rx_ratio;
         let period = tx_n as u16 + rx_n as u16;
-        let is_tx = (self.state.slot_step as u16 % period) < tx_n as u16;
-        self.state.slot_step = self.state.slot_step.wrapping_add(1);
+        let step = self.state.slot_step;
+        let is_tx = (step as u16 % period) < tx_n as u16;
+        self.state.slot_step = step.wrapping_add(1);
 
         if is_tx {
             // ---- the TX slot: the burst (or the plain transmit fallback) ----
-            let outbound = if let Some(data) = tx_payload {
+            // Every 64th TX slot is a Beacon even under load: it carries the
+            // RX-window advertisement the follower aligns to.
+            let outbound = if let Some(data) = tx_payload.filter(|_| self.state.epoch % 64 != 0) {
                 let mut payload = Vec::<u8, MAX_PAYLOAD>::new();
                 if data.len() > payload.capacity() {
                     return Err(Error::BufferTooSmall);
@@ -291,10 +311,12 @@ impl<P: Phy> Central<P> {
                 Packet::Beacon {
                     epoch: self.state.epoch,
                     channel_index: self.state.scheduler.index(),
-                    flags: 0,
+                    flags: (self.phy.rx_window_us() / 16).min(255) as u8,
+                    slot_us: self.phy.slot_period_us(),
+                    slot_phase: (step as u16 % period) as u8,
                 }
             };
-            let sent_data = tx_payload.is_some();
+            let sent_data = tx_payload.is_some() && !matches!(outbound, Packet::Beacon { .. });
             let n = outbound
                 .to_bytes(&mut self.tx_buf)
                 .map_err(Error::<P::Error>::from)?;
@@ -503,9 +525,23 @@ impl<P: Phy> Peripheral<P> {
                         self.state.rx_seq = seq;
                     }
                 }
-                Packet::Beacon { channel_index, .. } => {
-                    // The beacon is the hop authority.
+                Packet::Beacon { channel_index, flags, slot_us, slot_phase, .. } => {
+                    // The beacon is the hop authority; it also carries the
+                    // central's cadence and RX window: align to them at
+                    // runtime (to the poorer side's timing).
                     self.state.scheduler.sync(channel_index);
+                    if flags > 0 {
+                        self.phy.set_peer_rx_window(flags as u16 * 16);
+                    }
+                    if slot_us > 0 {
+                        self.phy.align_slot_period(slot_us);
+                    }
+                    // The slot phase: our next slot mirrors the central's
+                    // next (its TX/RX ratio decision), so our lone TX slot
+                    // lands on its lone RX slot.
+                    let period =
+                        self.state.tx_rx_ratio.0 as u16 + self.state.tx_rx_ratio.1 as u16;
+                    self.state.slot_step = ((slot_phase as u16 + 1) % period) as u8;
                 }
                 _ => {}
             }

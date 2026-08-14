@@ -1,7 +1,7 @@
 //! The MPSL radio's runtime state, provided by the caller during init.
 
 use core::mem::MaybeUninit;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
@@ -39,8 +39,22 @@ pub struct MpslState {
 
     // The phase-lock.
     pub(crate) slot_distance: u32,
-    pub(crate) rx_catch_iter: u32,
+    /// END-of-catch stamp, us from poll start (DWT-exact). Debug/diag.
+    pub(crate) catch_poll_us: u32,
+    /// Address-match stamp, us from poll start (DWT-exact): the phase
+    /// anchor - a fixed 28 us after the frame's on-air start.
+    pub(crate) addr_poll_us: u32,
     pub(crate) rx_misses: u32,
+    /// Our measured RX listen window (us, post-ramp), advertised in the beacon.
+    pub(crate) rx_window_us: u32,
+    /// The follower's TX delay (us from slot start to TXEN): places the echo
+    /// in the middle of the peer's advertised RX window. Recomputed on each
+    /// catch; 0 = transmit at slot start.
+    pub(crate) tx_delay_us: u32,
+    /// Completed TX ops (the echo-flow diagnostic).
+    pub(crate) tx_count: u32,
+    /// The peer's advertised RX listen window (us); 0 = unknown.
+    pub(crate) peer_rx_window_us: u32,
 
     // The current RX target (the caller's slice; the radio writes into it).
     pub(crate) rx_buf: [u8; 64],
@@ -51,6 +65,9 @@ pub struct MpslState {
 
     // The TX DMA buffer (filled by `Phy::transmit`).
     pub(crate) tx_buf: [u8; 64],
+    /// TX DMA source override: when non-null the radio reads here instead
+    /// of `tx_buf` (RAM-region diagnostic).
+    pub tx_ptr: *const u8,
     pub(crate) op_kind: u8,
 
     // The MPSL session.
@@ -59,7 +76,19 @@ pub struct MpslState {
     pub(crate) next_req: MaybeUninit<nrf_mpsl::raw::mpsl_timeslot_request_t>,
     /// Signaled by the callback on the first granted slot (the ready gate).
     pub(crate) done_signal: Signal<CriticalSectionRawMutex, ()>,
-    pub(crate) slot_work_max: u32,
+    pub slot_work_max: u32,
+    /// Diagnostics: START signals, completed works (atomic: the app
+    /// spin-waits on it; a plain load could be hoisted out of the loop),
+    /// other (BLOCKED/...) signals.
+    pub slot_count: u32,
+    pub done_count: AtomicU32,
+    pub other_signals: u32,
+    /// ADDRESS events seen in RX polls: a packet with our address arrived
+    /// (regardless of CRC). Diagnostic for deaf-RX questions.
+    pub addr_events: u32,
+    /// First 8 bytes ([len | payload...]) of the last address-matched
+    /// packet — shows what the peer's TX actually put on the air.
+    pub last_rx_hdr: [u8; 14],
 
     // The radio config (the channel + the address).
     pub(crate) cur_channel: u8,
@@ -77,20 +106,31 @@ impl MpslState {
             slot_len: 0,
             rx_poll: 0,
             slot_distance: 0,
-            rx_catch_iter: 0,
+            catch_poll_us: 0,
+            addr_poll_us: 0,
             rx_misses: 0,
+            rx_window_us: 0,
+            tx_delay_us: 0,
+            tx_count: 0,
+            peer_rx_window_us: 0,
             rx_buf: [0u8; 64],
             rx_ptr: core::ptr::null_mut(),
             rx_cap: 0,
             rx_result: 0,
             rx_ok: false,
             tx_buf: [0u8; 64],
+            tx_ptr: core::ptr::null(),
             op_kind: OpKind::Idle as u8,
             session_id: 0,
             first_request: true,
             next_req: MaybeUninit::uninit(),
             done_signal: Signal::new(),
             slot_work_max: 0,
+            slot_count: 0,
+            done_count: AtomicU32::new(0),
+            other_signals: 0,
+            addr_events: 0,
+            last_rx_hdr: [0; 14],
             cur_channel: 25,
             cur_base0: 0xE7E7E7E7,
             cur_prefix: 0xE7,

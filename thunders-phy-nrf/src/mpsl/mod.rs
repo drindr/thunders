@@ -21,8 +21,38 @@ use crate::radio_phy::RadioMode;
 // The phase-lock (the proportional controller on the peripheral).
 pub(crate) const PLL_SWEEP_US: u32 = 2;
 pub(crate) const PLL_SWEEP_MISSES: u32 = 8;
-pub(crate) const PLL_GAIN_NUM: i32 = 21;
-pub(crate) const PLL_GAIN_DEN: i32 = 1000;
+// The phase error is in exact us (DWT); gain 1/4 converges in a few catches.
+pub(crate) const PLL_GAIN_NUM: i32 = 1;
+pub(crate) const PLL_GAIN_DEN: i32 = 4;
+
+/// Snapshot the diagnostic counters: (slots granted, works done, other
+/// signals, max in-slot work us). Valid after [`MpslRadioPhy::new`].
+pub fn mpsl_stats() -> (u32, u32, u32, u32) {
+    unsafe {
+        let s = &*(STATE as *const MpslState);
+        (s.slot_count, s.done_count.load(core::sync::atomic::Ordering::Relaxed), s.other_signals, s.slot_work_max)
+    }
+}
+
+/// Snapshot the phase-lock state: (chain distance, last catch iter, our RX
+/// window us, the peer's advertised RX window us).
+pub fn mpsl_pll() -> (u32, u32, u32, u32, u32, [u8; 14], u32, u32, u32, u32) {
+    unsafe {
+        let s = &*(STATE as *const MpslState);
+        (
+            s.slot_distance,
+            s.catch_poll_us,
+            s.rx_window_us,
+            s.peer_rx_window_us,
+            s.addr_events,
+            s.last_rx_hdr,
+            s.addr_poll_us,
+            s.tx_count,
+            s.tx_delay_us,
+            s.rx_misses,
+        )
+    }
+}
 
 // --- the callback's context (the only global the C callback needs) ---
 pub(crate) static mut STATE: *mut () = core::ptr::null_mut();
@@ -42,6 +72,15 @@ impl<'d, const SLOT_US: u32, const SLOT_LEN_US: u32, const RX_POLL: u32>
     ///
     /// MPSL must already be initialized; `state` must outlive the phy.
     pub fn new(_radio_mode: RadioMode, state: &'d mut MpslState) -> Self {
+        // hfxo_cap_trim(): called by the example before embassy_nrf::init.
+        // The DWT cycle counter (the follower's echo TX delay; embassy's
+        // 30 us tick is too coarse for echo placement).
+        unsafe {
+            let demcr = 0xE000_EDFC as *mut u32;
+            demcr.write_volatile(demcr.read_volatile() | 1 << 24); // TRCENA
+            let dwt_ctrl = 0xE000_1000 as *mut u32;
+            dwt_ctrl.write_volatile(dwt_ctrl.read_volatile() | 1); // CYCCNTENA
+        }
         // Fill the runtime slot constants from the const generics.
         state.slot_nominal = SLOT_US;
         state.slot_len = SLOT_LEN_US;
@@ -148,14 +187,21 @@ impl<'d, const SLOT_US: u32, const SLOT_LEN_US: u32, const RX_POLL: u32> Phy
         // The on-air frame is [length byte | payload].
         self.state.tx_buf[0] = pkt.len() as u8;
         self.state.tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
+        self.state.tx_ptr = core::ptr::null();
+        // Snapshot BEFORE publishing the op: done_count is written only by
+        // the callback, so waiting for a change cannot miss a completion
+        // (the old done-flag clear-after-submit raced the callback and
+        // erased it).
+        let done_at = self.state.done_count.load(core::sync::atomic::Ordering::Acquire);
         self.state.op_kind = state::OpKind::Tx as u8;
-        // Await this slot's completion (the callback sets the done flag).
-        self.state.done.store(false, core::sync::atomic::Ordering::Release);
-        for _ in 0..400 {
-            if self.state.done.load(core::sync::atomic::Ordering::Acquire) {
+        // Await this slot's completion on the done signal (the callback
+        // signals every slot). Bounded as a dead-man if the chain dies.
+        // ponytail: a yield-spin costs ~15us/iter in mpsl_low_priority_process
+        for _ in 0..10_000 {
+            if self.state.done_count.load(core::sync::atomic::Ordering::Acquire) != done_at {
                 break;
             }
-            embassy_futures::yield_now().await;
+            self.state.done_signal.wait().await;
         }
         Ok(())
     }
@@ -167,18 +213,19 @@ impl<'d, const SLOT_US: u32, const SLOT_LEN_US: u32, const RX_POLL: u32> Phy
     ) -> Result<Option<usize>, Error<Self::Error>> {
         self.state.rx_ptr = buf.as_mut_ptr();
         self.state.rx_cap = buf.len();
+        let done_at = self.state.done_count.load(core::sync::atomic::Ordering::Acquire);
         self.state.op_kind = state::OpKind::Rx as u8;
-        self.state.done.store(false, core::sync::atomic::Ordering::Release);
-        for _ in 0..400 {
-            if self.state.done.load(core::sync::atomic::Ordering::Acquire) {
+        for _ in 0..10_000 {
+            if self.state.done_count.load(core::sync::atomic::Ordering::Acquire) != done_at {
                 break;
             }
-            embassy_futures::yield_now().await;
+            self.state.done_signal.wait().await;
         }
         if self.state.rx_ok {
             // The radio left `[len, payload..]`; the Phy contract is the
-            // payload only, so shift it.
-            let n = self.state.rx_result;
+            // payload only, so shift it. rx_ok already guarantees the
+            // frame fits the buffer (len + 1 <= cap).
+            let n = self.state.rx_result.min(buf.len() - 1);
             buf.copy_within(1..1 + n, 0);
             Ok(Some(n))
         } else {
@@ -187,4 +234,21 @@ impl<'d, const SLOT_US: u32, const SLOT_LEN_US: u32, const RX_POLL: u32> Phy
     }
 
     async fn flush(&mut self) {}
+
+    fn rx_window_us(&self) -> u16 {
+        self.state.rx_window_us as u16
+    }
+
+    fn set_peer_rx_window(&mut self, us: u16) {
+        self.state.peer_rx_window_us = us as u32;
+    }
+
+    fn slot_period_us(&self) -> u16 {
+        self.state.slot_nominal as u16
+    }
+
+    fn align_slot_period(&mut self, us: u16) {
+        self.state.slot_nominal = us as u32;
+        self.state.slot_distance = us as u32;
+    }
 }

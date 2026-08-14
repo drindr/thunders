@@ -497,14 +497,7 @@ impl<'d> NrfRadioPhy<'d> {
 
         compiler_fence(Ordering::Release);
         self.set_packet_ptr(tx_buf.as_ptr());
-        // nRF54: the TX DMA amount (TXD at 0xEE8) must match the PDU length.
-        // nRF52/53: the lflen drives the transfer - nothing to write.
-        // nRF54: the TX DMA amount (TXD.AMOUNT at 0xEE8) must match the PDU
-        // length or the radio transmits nothing.
-        #[cfg(feature = "_nrf54")]
-        unsafe {
-            ((self.r.as_ptr() as usize + 0xEE8) as *mut u32).write_volatile(1 + pkt.len() as u32);
-        }
+
 
         // Shortcuts: ramp-up TX then start packet automatically; disable at END.
         #[cfg(not(feature = "_nrf54"))]

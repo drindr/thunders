@@ -38,6 +38,26 @@ pub trait Phy {
         timeout: Duration,
     ) -> Result<Option<usize>, Error<Self::Error>>;
 
+    /// The receiver's listen window inside a slot, in microseconds
+    /// (0 = unknown). Advertised in the beacon so the peer can align its
+    /// transmissions to this (possibly poorer) window.
+    fn rx_window_us(&self) -> u16 {
+        0
+    }
+
+    /// The peer's advertised RX window (see [`rx_window_us`](Self::rx_window_us)).
+    fn set_peer_rx_window(&mut self, _us: u16) {}
+
+    /// The sender's slot cadence in us, advertised in the beacon
+    /// (0 = unknown).
+    fn slot_period_us(&self) -> u16 {
+        0
+    }
+
+    /// Adopt the master's advertised cadence at runtime (the align
+    /// mechanism): no compile-time cadence matching needed.
+    fn align_slot_period(&mut self, _us: u16) {}
+
     /// Flush any stale RX/TX state.
     async fn flush(&mut self);
 

@@ -23,6 +23,44 @@ fn end_ev_clear(r: Radio) {
     r.events_phyend().write_value(0);
 }
 
+#[cfg(feature = "nrf5340-net")]
+const CPU_MHZ: u32 = 64;
+#[cfg(feature = "nrf52840")]
+const CPU_MHZ: u32 = 64;
+#[cfg(feature = "_nrf54")]
+const CPU_MHZ: u32 = 128;
+
+/// Cycle-accurate busy wait on the DWT cycle counter (embassy_time's tick
+/// is 30 us - far too coarse for echo placement). Enabled once by the phy.
+#[inline(always)]
+fn cyc() -> u32 {
+    unsafe { (0xE000_1004 as *const u32).read_volatile() }
+}
+
+fn delay_us(us: u32) {
+    let start = cyc();
+    let cycles = us * CPU_MHZ;
+    while cyc().wrapping_sub(start) < cycles {}
+}
+
+/// Errata 20 (54L): preamble transmits but the payload does not when the
+/// MCU power domain sleeps around the radio start. Force constant latency
+/// before RXEN/TXEN.
+#[cfg(feature = "_nrf54")]
+fn power_constlat() {
+    unsafe { (0x5010_E030 as *mut u32).write_volatile(1) }; // POWER.TASKS_CONSTLAT
+}
+
+/// Bounded wait for the radio to finish disabling. ponytail: ~2000 reads
+/// is tens of us; raise only if a chip's disable path proves slower.
+fn disable_wait(r: Radio) {
+    let mut d = 0;
+    while r.events_disabled().read() == 0 && d < 2000 {
+        d += 1;
+    }
+    r.events_disabled().write_value(0);
+}
+
 /// The RX shortcuts: the radio auto-starts once ramped (READY->START) and
 /// auto-disables at the frame end (END/PHYEND->DISABLE).
 fn shorts_rx() -> regs::Shorts {
@@ -57,7 +95,8 @@ fn shorts_tx() -> regs::Shorts {
 }
 
 /// Mark the timeslot operation complete (called from the callback).
-pub unsafe fn signal_done(state: &MpslState) {
+pub unsafe fn signal_done(state: &mut MpslState) {
+    state.done_count.fetch_add(1, core::sync::atomic::Ordering::Release);
     state.done.store(true, core::sync::atomic::Ordering::Release);
     state.done_signal.signal(());
 }
@@ -67,6 +106,11 @@ pub unsafe fn signal_done(state: &MpslState) {
 /// the verified-working config on this 5340 (the MPSL format was deaf in RX).
 unsafe fn radio_configure(state: &MpslState) {
     let r = state.radio;
+
+    // Errata 20/49 (54L): latch constant-latency for the whole session —
+    // the MCU domain must never sleep around a radio start.
+    #[cfg(feature = "_nrf54")]
+    power_constlat();
 
     // MODECNF0.RU = Fast: the radio ramp drops from 129 us (Legacy) to 40 us.
     #[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
@@ -110,8 +154,12 @@ unsafe fn radio_configure(state: &MpslState) {
 
     r.frequency().write_value(regs::Frequency(state.cur_channel as u32));
 
-    // 0 dBm (the two families encode the PA level differently).
+    // 0 dBm; the 54L runs +8: its reverse link into the 52/53 is marginal
+    // at 0 dBm (address matches but CRC fails) even on-frequency.
     let mut txpower = regs::Txpower(0);
+    #[cfg(feature = "_nrf54")]
+    txpower.set_txpower(vals::Txpower::Pos8dBm);
+    #[cfg(not(feature = "_nrf54"))]
     txpower.set_txpower(vals::Txpower::_0dBm);
     r.txpower().write_value(txpower);
 
@@ -145,17 +193,25 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState) {
     match state.op_kind {
         x if x == OpKind::Tx as u8 => {
             // The pending TX buffer: [0] = len, [1..=len] = payload.
-            let buf = &mut state.tx_buf;
+            let buf: &mut [u8] = if state.tx_ptr.is_null() {
+                &mut state.tx_buf
+            } else {
+                core::slice::from_raw_parts_mut(state.tx_ptr as *mut u8, 64)
+            };
             r.packetptr().write_value(buf.as_ptr() as u32);
-            pll_enable(r);
-            #[cfg(feature = "_nrf54")]
-            unsafe {
-                let len = buf[0] as usize;
-                (r.as_ptr() as *mut u32).add(0xEE8 / 4).write_volatile(1 + len as u32);
+            // The follower's echo placement: TXEN delayed into the slot so
+            // the echo lands mid-window at the peer (see callback.rs).
+            if state.tx_delay_us > 0 {
+                delay_us(state.tx_delay_us);
             }
+            state.tx_count += 1;
+            pll_enable(r);
+
             r.shorts().write_value(shorts_tx());
             r.events_phyend().write_value(0);
             r.events_end().write_value(0);
+            #[cfg(feature = "_nrf54")]
+            power_constlat();
             r.tasks_txen().write_value(1);
             let mut i = 0;
             while !end_ev_set(r) {
@@ -167,6 +223,7 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState) {
             end_ev_clear(r);
             r.events_phyend().write_value(0);
             r.tasks_disable().write_value(1);
+            disable_wait(r);
         }
         x if x == OpKind::Rx as u8 => {
             // The caller's RX slice (the radio writes into it in place).
@@ -184,25 +241,70 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState) {
             r.events_phyend().write_value(0);
             #[cfg(feature = "nrf5340-net")]
             r.tasks_disable().write_value(1);
+            #[cfg(feature = "_nrf54")]
+            power_constlat();
+            let t_rx = cyc();
             r.tasks_rxen().write_value(1);
+            // The poll MUST end inside the grant: an overrun leaves the
+            // callback perpetually a slot behind, the granted chain goes
+            // contiguous, mpsl_low_priority_process() never returns and the
+            // executor starves (the app freezes on its first RX slot).
+            // Cap by time, not just count: iteration cost is chip-dependent.
+            // Cycle-exact (DWT) - the embassy tick (30 us) would quantize
+            // every alignment measurement past usefulness.
+            let budget_cyc = state.slot_len.saturating_sub(100) * CPU_MHZ;
+            // In-flight frames run past the listen budget (up to the grant's
+            // own edge): breaking mid-packet truncates the END/CRC and the
+            // catch is lost even though the radio is decoding fine.
+            let hard_cyc = state.slot_len.saturating_sub(40) * CPU_MHZ;
             let mut i = 0;
+            let mut in_flight = false;
             while !end_ev_set(r) {
                 i += 1;
-                if i > state.rx_poll {
+                if !in_flight && r.events_address().read() != 0 {
+                    in_flight = true;
+                    // The phase anchor: the address event is a fixed 28 us
+                    // after the frame's on-air start (16-bit preamble +
+                    // 5-byte address at 2 Mbit).
+                    state.addr_poll_us = (cyc() - t_rx) / CPU_MHZ;
+                }
+                if !in_flight && i > state.rx_poll {
                     break;
+                }
+                if i & 15 == 0 {
+                    let el = cyc() - t_rx;
+                    if el > if in_flight { hard_cyc } else { budget_cyc } {
+                        break;
+                    }
                 }
             }
             end_ev_clear(r);
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+            if r.events_address().read() != 0 {
+                state.addr_events += 1;
+                state.last_rx_hdr.copy_from_slice(&buf[..14.min(state.rx_cap)]);
+            }
             let crc = r.crcstatus().read().0;
             r.tasks_disable().write_value(1);
-            r.tasks_disable().write_value(1);
+            // Quiesce before slot end: an unfinished disable leaks a live
+            // receiver into the next slot (its END/CRC land in that slot's
+            // poll setup -> instant exits, torn cross-boundary catches).
+            disable_wait(r);
             if crc & 0x1 == 0x1 {
                 let len = buf[0] as usize;
-                state.rx_ok = len <= 63;
+                // Valid only if the phy frame [len | payload] fits the
+                // caller's buffer (receive() shifts left by one).
+                state.rx_ok = len > 0 && len + 1 <= state.rx_cap;
                 state.rx_result = len.min(63);
-                state.rx_catch_iter = i; // the poll count at the catch
+                state.catch_poll_us = (cyc() - t_rx) / CPU_MHZ; // END stamp
             } else {
+                // No catch: the poll ran to a bound, so its duration is
+                // the listen window (advertised in the beacon). Only an
+                // idle poll measures it (an in-flight frame that failed
+                // CRC ran past the window on the in-flight extension).
+                if r.events_address().read() == 0 {
+                    state.rx_window_us = ((cyc() - t_rx) / CPU_MHZ).saturating_sub(40);
+                }
                 state.rx_ok = false;
                 state.rx_result = 0;
             }

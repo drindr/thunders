@@ -27,7 +27,7 @@ chip-specific lives behind `Phy`.
 
 ```rust
 pub enum Packet {
-    Beacon  { epoch, channel_index, flags },
+    Beacon  { epoch, channel_index, flags, slot_us },   // slot_us = the cadence (runtime align)
     Data    { seq, payload: Vec<u8, MAX_PAYLOAD> },
     PairingRequest  { id },
     PairingResponse { id, key: [u8; 16] },
@@ -110,6 +110,10 @@ pub trait Phy {
     async fn transmit_receive(...) -> ...;      // the TX+RX in one await (the default)
     async fn flush(&mut self);
     async fn adjust_period(&mut self, corr: i32) {}   // the sync PLL hook
+    fn rx_window_us(&self) -> u16 { 0 }               // the measured listen window (the beacon advertises it)
+    fn set_peer_rx_window(&mut self, us: u16) {}      // the peer's window (the echo aligns to it)
+    fn slot_period_us(&self) -> u16 { 0 }             // the cadence (the beacon advertises it)
+    fn align_slot_period(&mut self, us: u16) {}       // adopt the master's cadence (the runtime align)
     fn transmit_burst_begin(&mut self, pkt) -> ...;   // the burst (the default Unsupported)
     fn transmit_burst_send(&mut self, pkt) -> ...;
     fn ccm_crypt(&mut self, key, nonce, payload, mic, encrypt) -> ...;  // the AES-CCM (the default Unsupported)
@@ -137,7 +141,8 @@ Two backends:
   burst and the CCM return `Unsupported`). It **also** exposes a raw
   zero-copy surface (`tx_send(closure)` / `rx_receive(buf)`) for direct use
   without the link layer — but the `Phy` impl is what keeps it usable from
-  `thunders`.
+  `thunders`. The slot chain, the sync PLL and the runtime alignment live in
+  `docs/timesync-slot-alignment.md`.
 
 ## The data flow
 

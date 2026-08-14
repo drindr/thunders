@@ -21,8 +21,17 @@ pub enum Packet {
         /// Receivers can reset their local scheduler to this index; both
         /// sides then advance one step at the end of the 1 ms frame.
         channel_index: u8,
-        /// Flags (reserved for future use).
+        /// The sender's RX listen window, in 16 us units (0 = unknown).
+        /// Advertised pre-connection so the peer can align its
+        /// transmissions to this (possibly poorer) window.
         flags: u8,
+        /// The sender's slot cadence in us (0 = unknown). The follower
+        /// adopts it at runtime: no compile-time matching needed.
+        slot_us: u16,
+        /// The sender's slot phase (slot_step % ratio period). The follower
+        /// mirrors it so its TX slots land on the sender's RX slots; without
+        /// it the mirrored (8,1) ratio aligns by luck, 1-in-9 per boot.
+        slot_phase: u8,
     },
     /// Data packet carrying a payload.
     ///
@@ -84,6 +93,8 @@ mod tests {
             epoch: 0x1234_5678,
             channel_index: 17,
             flags: 0xAA,
+            slot_us: 0xBEEF,
+            slot_phase: 7,
         };
         let mut buf = [0u8; 64];
         let n = pkt.to_bytes(&mut buf).unwrap();

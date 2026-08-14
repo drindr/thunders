@@ -4,6 +4,11 @@ use super::radio;
 use super::state::{MpslState, OpKind};
 use super::{PLL_GAIN_DEN, PLL_GAIN_NUM, PLL_SWEEP_MISSES, PLL_SWEEP_US, STATE};
 
+/// Last-chained request params + counters, for post-mortem assert
+/// diagnosis: DIAG = dist; DIAG2 = len | misses<<16 | nominal<<24.
+pub static DIAG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static DIAG2: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// MPSL timeslot callback: on START, run the pending TX/RX (the `Phy` trait's
 /// `transmit`/`receive` set the op), then chain the next NORMAL timeslot.
 pub unsafe extern "C" fn timeslot_cb(
@@ -15,6 +20,10 @@ pub unsafe extern "C" fn timeslot_cb(
     if signal == nrf_mpsl::raw::MPSL_TIMESLOT_SIGNAL_START as u32 {
         let t0 = embassy_time::Instant::now();
         let state = unsafe { &mut *(STATE as *mut MpslState) };
+        state.slot_count += 1;
+        // No defmt here: this runs in MPSL timer-IRQ context and defmt is
+        // not reentrant (the STATS print from here corrupted the stream
+        // and HardFaulted). Counters stay; read them via mpsl_stats().
 
         radio::timeslot_do_work(state);
 
@@ -26,21 +35,64 @@ pub unsafe extern "C" fn timeslot_cb(
         // The follower's phase-lock (the RX catch iter -> the chain distance).
         if state.op_kind == OpKind::Rx as u8 {
             if state.rx_ok {
+                state.rx_misses = 0;
+                // The runtime align, length side: size the slot to the
+                // caught packet (airtime + 140 us of overhead/jitter
+                // margin), capped to keep the MPSL inter-slot gap >= 150 us
+                // (tighter gaps trip the MPSL scheduler's assert).
+                // Runtime align, length side: size the slot to the caught
+                // packet + 100 us of poll floor + 40 us ramp + 60 us of
+                // phase slack (air+140 was exactly READY+air: zero margin,
+                // any jitter missed). Capped to keep the inter-slot gap.
+                let air = 28 + 4 * (state.rx_result as u32 + 3);
+                state.slot_len = (air + 200).min(state.slot_nominal.saturating_sub(100));
                 if state.follower {
-                    let mid = state.rx_poll as i32 / 2;
-                    let err = state.rx_catch_iter as i32 - mid;
+                    // The phase-lock, in exact us: aim the address match at
+                    // 60 us into the poll (READY ~40 + margin). The address
+                    // event is a fixed 28 us after the frame's on-air
+                    // start, so no airtime term is needed here.
+                    let err = state.addr_poll_us as i32 - 60;
                     let corr = err * PLL_GAIN_NUM / PLL_GAIN_DEN;
                     let nominal = state.slot_nominal as i32;
-                    let new_dist = (nominal + corr).clamp(nominal - 20, nominal + 20) as u32;
+                    let new_dist =
+                        (nominal + corr).clamp(nominal - 20, nominal + 20) as u32;
                     if new_dist != state.slot_distance {
                         state.slot_distance = new_dist;
                     }
-                    state.rx_misses = 0;
+
+                    // The echo timing: with mirrored same-period grids the
+                    // next-slot echo lands C us BEFORE the peer's receiver
+                    // is ready (C = the catch position) - structurally
+                    // outside the peer's window. So the echo is delayed
+                    // into its slot instead: delta = S - 50 + (W-air)/2
+                    // lands it mid-window, where S is the caught frame's
+                    // on-air start from our slot start. All DWT-exact us.
+                    if state.peer_rx_window_us > 0 {
+                        let air = 28 + 4 * (state.rx_result as i32 + 3);
+                        // S = RXEN offset (~10 us) + address stamp - 28.
+                        let s = 10 + state.addr_poll_us as i32 - 28;
+                        let w = state.peer_rx_window_us as i32;
+                        let delay = s - 50 + (w - air) / 2;
+                        // The frame must still fit the slot after the delay.
+                        let max_delay = (state.slot_len as i32) - (50 + air + 40);
+                        state.tx_delay_us = delay.clamp(0, max_delay.max(0)) as u32;
+                    }
                 }
-            } else if state.follower {
+            } else {
                 state.rx_misses = state.rx_misses.saturating_add(1);
                 if state.rx_misses >= PLL_SWEEP_MISSES {
-                    if state.slot_distance != state.slot_nominal + PLL_SWEEP_US {
+                    // Disconnected: widen the budget, keeping the MPSL
+                    // inter-slot gap >= 100 us (validated on both cores).
+                    state.slot_len = state.slot_nominal.saturating_sub(100);
+                    // The +2us/slot sweep is for acquisition: before the
+                    // first beacon, and again when the phase is truly lost
+                    // (500 straight misses). Between those, hold nominal:
+                    // a persistent dist!=nominal is a FREQUENCY offset
+                    // that walks the grid off the peer's window.
+                    if state.follower
+                        && (state.peer_rx_window_us == 0 || state.rx_misses >= 500)
+                        && state.slot_distance != state.slot_nominal + PLL_SWEEP_US
+                    {
                         state.slot_distance = state.slot_nominal + PLL_SWEEP_US;
                     }
                 }
@@ -48,6 +100,15 @@ pub unsafe extern "C" fn timeslot_cb(
         }
 
         // Chain the next timeslot (the distance is the phase-lock's knob).
+        // DIAG: last-chained dist/len + counters, for post-mortem assert
+        // diagnosis.
+        DIAG.store(state.slot_distance, core::sync::atomic::Ordering::Relaxed);
+        DIAG2.store(
+            state.slot_len.min(0xFFFF)
+                | ((state.rx_misses as u32) << 16)
+                | ((state.slot_nominal.min(255)) << 24),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         let req = state.next_req.assume_init_mut();
         *req = nrf_mpsl::raw::mpsl_timeslot_request_t {
             request_type: nrf_mpsl::raw::MPSL_TIMESLOT_REQ_TYPE_NORMAL as u8,
@@ -62,11 +123,20 @@ pub unsafe extern "C" fn timeslot_cb(
         };
         RET.callback_action = nrf_mpsl::raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
         RET.params.request.p_next = req;
+        // The PLL's corrected distance is a ONE-SLOT phase step: re-base to
+        // nominal immediately or it persists as a frequency offset and the
+        // grid walks away between catches. (The acquisition sweep is the
+        // exception: it MEANS to walk.)
+        if state.slot_distance != state.slot_nominal + PLL_SWEEP_US {
+            state.slot_distance = state.slot_nominal;
+        }
         &mut RET as *mut _
     } else if signal == nrf_mpsl::raw::MPSL_TIMESLOT_SIGNAL_RADIO as u32 {
         RET.callback_action = nrf_mpsl::raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
         &mut RET as *mut _
     } else {
+        let state = unsafe { &mut *(STATE as *mut MpslState) };
+        state.other_signals += 1;
         core::ptr::null_mut()
     }
 }
