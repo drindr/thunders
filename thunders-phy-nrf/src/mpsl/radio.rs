@@ -243,6 +243,7 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState) {
             r.tasks_disable().write_value(1);
             #[cfg(feature = "_nrf54")]
             power_constlat();
+            state.addr_seen = false;
             let t_rx = cyc();
             r.tasks_rxen().write_value(1);
             // The poll MUST end inside the grant: an overrun leaves the
@@ -259,10 +260,16 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState) {
             let hard_cyc = state.slot_len.saturating_sub(40) * CPU_MHZ;
             let mut i = 0;
             let mut in_flight = false;
-            while !end_ev_set(r) {
+            let mut got_end = false;
+            loop {
+                if end_ev_set(r) {
+                    got_end = true;
+                    break;
+                }
                 i += 1;
                 if !in_flight && r.events_address().read() != 0 {
                     in_flight = true;
+                    state.addr_seen = true;
                     // The phase anchor: the address event is a fixed 28 us
                     // after the frame's on-air start (16-bit preamble +
                     // 5-byte address at 2 Mbit).
@@ -290,7 +297,12 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState) {
             // receiver into the next slot (its END/CRC land in that slot's
             // poll setup -> instant exits, torn cross-boundary catches).
             disable_wait(r);
-            if crc & 0x1 == 0x1 {
+            // A frame is real only if the END event fired (a completed
+            // frame) AND the CRC passed. The CRCSTATUS alone is not
+            // trustworthy on the 5340: it reads 1 (stale) on nearly every
+            // poll, so gate on END - a miss or a cap-break has no END.
+            if got_end && crc & 0x1 == 0x1 {
+                state.crc_ok += 1;
                 let len = buf[0] as usize;
                 // Valid only if the phy frame [len | payload] fits the
                 // caller's buffer (receive() shifts left by one).
@@ -298,6 +310,7 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState) {
                 state.rx_result = len.min(63);
                 state.catch_poll_us = (cyc() - t_rx) / CPU_MHZ; // END stamp
             } else {
+                state.crc_bad += 1;
                 // No catch: the poll ran to a bound, so its duration is
                 // the listen window (advertised in the beacon). Only an
                 // idle poll measures it (an in-flight frame that failed

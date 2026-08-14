@@ -47,19 +47,6 @@ pub unsafe extern "C" fn timeslot_cb(
                 let air = 28 + 4 * (state.rx_result as u32 + 3);
                 state.slot_len = (air + 200).min(state.slot_nominal.saturating_sub(100));
                 if state.follower {
-                    // The phase-lock, in exact us: aim the address match at
-                    // 60 us into the poll (READY ~40 + margin). The address
-                    // event is a fixed 28 us after the frame's on-air
-                    // start, so no airtime term is needed here.
-                    let err = state.addr_poll_us as i32 - 60;
-                    let corr = err * PLL_GAIN_NUM / PLL_GAIN_DEN;
-                    let nominal = state.slot_nominal as i32;
-                    let new_dist =
-                        (nominal + corr).clamp(nominal - 20, nominal + 20) as u32;
-                    if new_dist != state.slot_distance {
-                        state.slot_distance = new_dist;
-                    }
-
                     // The echo timing: with mirrored same-period grids the
                     // next-slot echo lands C us BEFORE the peer's receiver
                     // is ready (C = the catch position) - structurally
@@ -95,6 +82,26 @@ pub unsafe extern "C" fn timeslot_cb(
                     {
                         state.slot_distance = state.slot_nominal + PLL_SWEEP_US;
                     }
+                }
+            }
+            // The phase-lock runs on ANY address anchor, not just a
+            // successful decode: a misaligned poll truncates the frame and
+            // fails the CRC, and gating the correction on rx_ok makes that
+            // failure prevent the correction - the phase error feeds back
+            // and never converges (the 5340 peripheral sat at ~90% CRC
+            // misses with thousands of address events). The address event
+            // is a fixed 28 us after the frame's on-air start, so it is a
+            // valid anchor regardless of the decode outcome. (A/B verified:
+            // disabling it drops the working pairs from ~12% to 67-95%
+            // loss - the tighter lock helps every pair.)
+            if state.follower && state.addr_seen {
+                state.rx_misses = 0;
+                let err = state.addr_poll_us as i32 - 60;
+                let corr = err * PLL_GAIN_NUM / PLL_GAIN_DEN;
+                let nominal = state.slot_nominal as i32;
+                let new_dist = (nominal + corr).clamp(nominal - 20, nominal + 20) as u32;
+                if new_dist != state.slot_distance {
+                    state.slot_distance = new_dist;
                 }
             }
         }

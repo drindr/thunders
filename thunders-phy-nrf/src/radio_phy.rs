@@ -418,12 +418,12 @@ impl<'d> NrfRadioPhy<'d> {
 
     /// Set the RAM pointer for DMA.
     fn set_packet_ptr(&mut self, ptr: *const u8) {
-        let base = self.r.as_ptr() as usize;
         self.r.packetptr().write_value(ptr as u32);
         // nRF54: the RXD.MAXCNT (0xED4) must match the buffer capacity or
         // the RX transfers nothing.
         #[cfg(feature = "_nrf54")]
         unsafe {
+            let base = self.r.as_ptr() as usize;
             ((base + 0xED4) as *mut u32).write_volatile(64);
         }
     }

@@ -44,6 +44,9 @@ pub struct MpslState {
     /// Address-match stamp, us from poll start (DWT-exact): the phase
     /// anchor - a fixed 28 us after the frame's on-air start.
     pub(crate) addr_poll_us: u32,
+    /// Whether an ADDRESS event fired in the last RX poll (the phase-lock
+    /// corrects on this even when the frame's CRC failed).
+    pub(crate) addr_seen: bool,
     pub(crate) rx_misses: u32,
     /// Our measured RX listen window (us, post-ramp), advertised in the beacon.
     pub(crate) rx_window_us: u32,
@@ -62,6 +65,10 @@ pub struct MpslState {
     pub(crate) rx_cap: usize,
     pub(crate) rx_result: usize,
     pub(crate) rx_ok: bool,
+    /// CRC diagnostics: packets with a good/bad CRCSTATUS (the 5340 net core
+    /// decodes ~5% of address-matched frames - these count it).
+    pub(crate) crc_ok: u32,
+    pub(crate) crc_bad: u32,
 
     // The TX DMA buffer (filled by `Phy::transmit`).
     pub(crate) tx_buf: [u8; 64],
@@ -108,6 +115,7 @@ impl MpslState {
             slot_distance: 0,
             catch_poll_us: 0,
             addr_poll_us: 0,
+            addr_seen: false,
             rx_misses: 0,
             rx_window_us: 0,
             tx_delay_us: 0,
@@ -118,6 +126,8 @@ impl MpslState {
             rx_cap: 0,
             rx_result: 0,
             rx_ok: false,
+            crc_ok: 0,
+            crc_bad: 0,
             tx_buf: [0u8; 64],
             tx_ptr: core::ptr::null(),
             op_kind: OpKind::Idle as u8,
