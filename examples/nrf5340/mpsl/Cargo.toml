@@ -30,3 +30,6 @@ peripheral = []
 name = "thunders-mpsl"
 path = "src/main.rs"
 
+
+[profile.release]
+debug = 2

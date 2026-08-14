@@ -80,8 +80,10 @@ async fn main(spawner: Spawner) {
     // The external phy opens its timeslot session and inserts the first
     // (EARLIEST) request BEFORE the mpsl_task starts processing.
     let radio = embassy_nrf::pac::RADIO;
-    let mut state = MpslState::new(radio, cfg!(feature = "peripheral"));
-    let mut phy = MpslRadioPhy::<500, 400, 1400>::new(RadioMode::Nrf2Mbit, &mut state);
+    // 'static: the phy hands this pointer to the MPSL callback (ISR).
+    static STATE: StaticCell<MpslState> = StaticCell::new();
+    let state = STATE.init(MpslState::new(radio, cfg!(feature = "peripheral")));
+    let mut phy = MpslRadioPhy::<500, 400, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
     info!("MPSL ready");

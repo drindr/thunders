@@ -27,6 +27,9 @@ const ROLE: Role = Role::Peripheral;
 #[cfg(not(feature = "peripheral"))]
 const ROLE: Role = Role::Central;
 
+/// Frame counter readable from the debugger (RTT-independent health check).
+static FRAME_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 #[unsafe(no_mangle)]
 fn _defmt_timestamp() -> u64 {
     0
@@ -43,11 +46,8 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
-    let _ = mpsl;
-    loop {
-        unsafe { raw::mpsl_low_priority_process() };
-        embassy_futures::yield_now().await;
-    }
+    // Wake-driven: the low-prio IRQ wakes this task when there is work.
+    mpsl.run().await
 }
 
 #[embassy_executor::main]
@@ -92,8 +92,11 @@ async fn main(spawner: Spawner) {
     // The external phy opens its timeslot session and inserts the first
     // (EARLIEST) request BEFORE the mpsl_task starts processing.
     let radio = embassy_nrf::pac::RADIO_NS;
-    let mut state = MpslState::new(radio, cfg!(feature = "peripheral"));
-    let mut phy = MpslRadioPhy::<500, 400, 1400>::new(RadioMode::Nrf2Mbit, &mut state);
+    // 'static: the phy hands this pointer to the MPSL callback (ISR).
+    static STATE: StaticCell<MpslState> = StaticCell::new();
+    let state = STATE.init(MpslState::new(radio, cfg!(feature = "peripheral")));
+    // ponytail: 400/300 experiment (gap=100us) - restore <500,400,1400> after
+    let mut phy = MpslRadioPhy::<400, 300, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
     info!("MPSL ready");
@@ -131,10 +134,16 @@ async fn main(spawner: Spawner) {
                 let busy = t_start.elapsed().as_micros() as u64;
                 busy_total += busy;
                 frame_count += 1;
+                FRAME_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if frame_count % 5000 == 0 {
+                    info!("HB f={}", frame_count);
+                }
 
-                if frame_count >= 1000 {
+                if frame_count >= 10000 {
                     let avg_busy = busy_total / frame_count as u64;
                     info!("BENCH frames={} rx={} avg_busy={}us", frame_count, rxc, avg_busy);
+                    let (d, ci, w, pw, ae, hdr, ai, txc, d8, mis) = thunders_phy_nrf::mpsl::mpsl_pll();
+                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, hdr);
                     busy_total = 0;
                     frame_count = 0;
                     rxc = 0;
@@ -187,11 +196,13 @@ async fn main(spawner: Spawner) {
                 frames += 1;
                 busy_total += t_frame.elapsed().as_micros() as u64;
                 let now = Instant::now();
-                if now - report_at >= embassy_time::Duration::from_secs(2) {
+                if now - report_at >= embassy_time::Duration::from_secs(5) {
                     let elapsed = (now - report_at).as_micros() as u32;
                     let rate = (frames as u64) * 1_000_000 / elapsed.max(1) as u64;
                     let avg_busy = busy_total / frames.max(1) as u64;
                     info!("BENCH frames={} rx={} bad_seq={} rate={}/s busy={}us", frames, rx_ok, bad_seq, rate, avg_busy);
+                    let (d, ci, w, pw, ae, hdr, ai, txc, d8, mis) = thunders_phy_nrf::mpsl::mpsl_pll();
+                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, hdr);
                     frames = 0;
                     rx_ok = 0;
                     bad_seq = 0;

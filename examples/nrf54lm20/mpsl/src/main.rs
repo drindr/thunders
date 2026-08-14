@@ -84,8 +84,10 @@ async fn main(spawner: Spawner) {
     // The external phy opens its timeslot session and inserts the first
     // (EARLIEST) request BEFORE the mpsl_task starts processing.
     let radio = embassy_nrf::pac::RADIO_S;
-    let mut state = MpslState::new(radio, cfg!(feature = "peripheral"));
-    let mut phy = MpslRadioPhy::<300, 250, 1200>::new(RadioMode::Nrf2Mbit, &mut state);
+    // 'static: the phy hands this pointer to the MPSL callback (ISR).
+    static STATE: StaticCell<MpslState> = StaticCell::new();
+    let state = STATE.init(MpslState::new(radio, cfg!(feature = "peripheral")));
+    let mut phy = MpslRadioPhy::<300, 250, 1200>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
     info!("MPSL ready");
@@ -167,16 +169,18 @@ async fn main(spawner: Spawner) {
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => info!("frame err: {:?}", defmt::Debug2Format(&e)),
+                    Err(e) => info!("frame err: {:?} bytes={:?}", defmt::Debug2Format(&e), &rx_buf[..8.min(rx_buf.len())]),
                 }
                 frames += 1;
                 busy_total += t_frame.elapsed().as_micros() as u64;
                 let now = Instant::now();
-                if now - report_at >= embassy_time::Duration::from_secs(2) {
+                if now - report_at >= embassy_time::Duration::from_secs(5) {
                     let elapsed = (now - report_at).as_micros() as u32;
                     let rate = (frames as u64) * 1_000_000 / elapsed.max(1) as u64;
                     let avg_busy = busy_total / frames.max(1) as u64;
                     info!("BENCH frames={} rx={} bad_seq={} rate={}/s avg_busy={}us", frames, rx_ok, bad_seq, rate, avg_busy);
+                    let (d, ci, w, pw, ae, hdr, ai, txc, d8, mis) = thunders_phy_nrf::mpsl::mpsl_pll();
+                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, hdr);
                     frames = 0;
                     rx_ok = 0;
                     bad_seq = 0;
