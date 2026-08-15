@@ -245,6 +245,9 @@ impl LinkState {
 pub struct Central<P: Phy> {
     phy: P,
     state: LinkState,
+    /// True after the first SlotRequest: cadence is negotiated once, then
+    /// the central keeps that period and the peripheral follows it.
+    cadence_negotiated: bool,
     /// Last channel written to the phy (the phy is only re-tuned on change).
     last_channel: Option<u8>,
     /// Consecutive missed replies (the adaptive-hop trigger).
@@ -263,6 +266,7 @@ impl<P: Phy> Central<P> {
         Ok(Self {
             phy,
             state: LinkState::new(&cfg),
+            cadence_negotiated: false,
             last_channel: None,
             consecutive_misses: 0,
             in_burst: false,
@@ -390,17 +394,20 @@ impl<P: Phy> Central<P> {
                     }
                 }
                 Packet::SlotRequest { min_slot_us } => {
-                    // Negotiate the slowest board's cadence. Both sides
-                    // start at the fallback period, so the central can also
-                    // speed up to max(central_min, peripheral_min) once the
-                    // peer's minimum is known.
-                    let negotiated = self
-                        .phy
-                        .min_slot_period_us()
-                        .max(min_slot_us)
-                        .max(1);
-                    if negotiated != self.phy.slot_period_us() {
-                        self.phy.align_slot_period(negotiated);
+                    // Cadence negotiation happens exactly once. Both sides
+                    // start at the fallback period; the central picks
+                    // max(central_min, peripheral_min) and then the
+                    // peripheral follows that advertised cadence.
+                    if !self.cadence_negotiated {
+                        self.cadence_negotiated = true;
+                        let negotiated = self
+                            .phy
+                            .min_slot_period_us()
+                            .max(min_slot_us)
+                            .max(1);
+                        if negotiated != self.phy.slot_period_us() {
+                            self.phy.align_slot_period(negotiated);
+                        }
                     }
                 }
                 _ => {}
