@@ -291,3 +291,28 @@ Full 30 s matrix:
 | LM20 → 5340 | mpsl | 91.9% | 70.7% | 635 | 14 583 |
 
 † LM20 boot HardFault again in this run.
+
+### Eighth pass (dynamic MPSL address-target calibration, 2025-08-15)
+
+The MPSL follower PLL now learns its address target from the first locked
+catches instead of using a hardcoded 60/70 us value.
+
+Full 30 s matrix:
+
+| run | fwd loss | rev loss | rtt avg | bw B/s |
+|---|---|---|---|---|
+| 52840 → 5340 | bare | 12.7% | 12.8% | 512 | 19 683 |
+| 52840 → LM20 | bare | 28.0% | 64.5% | 482 | 18 388 |
+| 5340 → 52840 | bare | 12.5% | 13.3% | 519 | 19 667 |
+| 5340 → LM20 | bare | 13.1% | 25.0% | 488 | 19 375 |
+| LM20 → 52840 | bare | 12.0% | 12.6% | 508 | 19 685 |
+| LM20 → 5340 | bare | 12.1% | 12.7% | 510 | 19 684 |
+| 52840 → 5340 | mpsl | 13.0% | 13.2% | 608 | 15 733 |
+| 52840 → LM20 | mpsl | 12.6% | 48.4% | 578 | 15 030 |
+| 5340 → 52840 | mpsl | 12.5% | 13.1% | 598 | 15 734 |
+| 5340 → LM20 | mpsl | 12.5% | 41.5% | 593 | 15 166 |
+| LM20 → 52840 | mpsl | 12.1% | 12.7% | 601 | 15 744 |
+| LM20 → 5340 | mpsl | 11.9% | 12.6% | 599 | 15 745 |
+
+All six MPSL pairs now carry data. The LM20 boot crash was retried
+automatically by the bench script and recovered.

@@ -181,16 +181,12 @@ peripheral**, now on both backends:
 | LM20 → 52840 | bare | 12 % | 13 % | 508 µs | 19.7 kB/s |
 | LM20 → 5340 | bare | 12 % | 13 % | 510 µs | 19.7 kB/s |
 
-The bare path is no longer dead: the software slot scheduler, Fast ramp,
-TX on-air alignment, empty-slot pacing, per-board follower target and echo
-phase compensation give all six bare directed pairs a working bidirectional
-link. The slot cadence is still central-mastered, but the peripheral now
-advertises its minimum slot period (`Packet::SlotRequest`) and the central
-adopts `max(current, peripheral_min)`; the peripheral clamps the beacon
-cadence to its own minimum, so a fast central cannot starve it. The MPSL
-LM20-as-central rows were fixed by this negotiation plus the 500 us safe
-default. The remaining MPSL weakness is the intermittent LM20 boot
-HardFault and the residual loss on the 52840/5340 peripheral pairs.
+All six bare and all six MPSL directed pairs now carry data
+bidirectionally. The key enablers are the bare software slot scheduler,
+per-board follower targets with echo phase compensation, fallback-rate
+cadence negotiation (`Packet::SlotRequest`), and dynamic MPSL address-target
+calibration. The remaining weakness is the intermittent LM20 boot
+HardFault, now retried automatically by the bench script.
 
 Bare diagnostics are in the `RADIO` and `BARE PLL` bench lines; MPSL RSSI
 is in the `PLL` line. `scripts/bench_parse.py --rssi` prints the raw RSSI
