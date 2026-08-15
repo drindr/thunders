@@ -568,6 +568,7 @@ impl<'d> NrfRadioPhy<'d> {
     }
 
     /// Consuming builder form of [`set_paced_role`](Self::set_paced_role).
+    #[must_use]
     pub fn with_slot_pacing(mut self, role: Role) -> Self {
         self.set_paced_role(role);
         self

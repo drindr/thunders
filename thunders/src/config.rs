@@ -85,6 +85,7 @@ impl Config {
     }
 
     /// Attach a pre-shared security context.
+    #[must_use]
     pub const fn with_security(mut self, security: Security) -> Self {
         self.security = Some(security);
         self
@@ -92,6 +93,7 @@ impl Config {
 
     /// Set the TX:RX slot ratio (both sides must be at least 1 - a zero
     /// period would divide-by-zero the slot scheduler).
+    #[must_use]
     pub const fn with_tx_rx_ratio(mut self, tx: u8, rx: u8) -> Self {
         self.tx_rx_ratio = (if tx == 0 { 1 } else { tx }, if rx == 0 { 1 } else { rx });
         self

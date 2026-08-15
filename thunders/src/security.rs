@@ -39,6 +39,7 @@ impl Security {
     }
 
     /// Create a security context using the hardware AES-CCM.
+    #[must_use]
     pub const fn with_ccm(key: [u8; 32]) -> Self {
         Self {
             key,
