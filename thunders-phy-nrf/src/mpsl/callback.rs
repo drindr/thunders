@@ -102,7 +102,15 @@ pub unsafe extern "C" fn timeslot_cb(
             // loss - the tighter lock helps every pair.)
             if state.follower && state.addr_seen {
                 state.rx_misses = 0;
-                let err = state.addr_poll_us as i32 - 60;
+                // Per-board address target: the nRF52/53 peripheral catch
+                // position sits a little later in the window than the nRF54L.
+                // Letting each board correct around its own natural anchor
+                // reduces the steady-state phase error.
+                #[cfg(feature = "_nrf54")]
+                let target = 60i32;
+                #[cfg(not(feature = "_nrf54"))]
+                let target = 70i32;
+                let err = state.addr_poll_us as i32 - target;
                 // A one-shot phase step (the chain re-bases to nominal after
                 // the request): stable for the matched-cadence pairs. An
                 // integrating version was tried to compensate the 5340's
