@@ -87,6 +87,9 @@ pub unsafe extern "C" fn timeslot_cb(
                         && state.slot_distance != state.slot_nominal + PLL_SWEEP_US
                     {
                         state.slot_distance = state.slot_nominal + PLL_SWEEP_US;
+                        // Re-calibrate from scratch after a real phase loss.
+                        state.addr_target_us = 60;
+                        state.calib_count = 0;
                     }
                 }
             }
@@ -101,16 +104,22 @@ pub unsafe extern "C" fn timeslot_cb(
             // disabling it drops the working pairs from ~12% to 67-95%
             // loss - the tighter lock helps every pair.)
             if state.follower && state.addr_seen {
+                // Calibrate the address target from locked catches. The
+                // first catches after a sweep can be near the window edge,
+                // so only catches while already locked count.
+                let locked = state.rx_misses <= 8;
                 state.rx_misses = 0;
-                // Per-board address target: the nRF52/53 peripheral catch
-                // position sits a little later in the window than the nRF54L.
-                // Letting each board correct around its own natural anchor
-                // reduces the steady-state phase error.
-                #[cfg(feature = "_nrf54")]
-                let target = 60i32;
-                #[cfg(not(feature = "_nrf54"))]
-                let target = 70i32;
-                let err = state.addr_poll_us as i32 - target;
+                if locked
+                    && state.calib_count < 32
+                    && (50..=180).contains(&state.addr_poll_us)
+                {
+                    state.addr_target_us = (state.addr_target_us * state.calib_count
+                        + state.addr_poll_us)
+                        / (state.calib_count + 1);
+                    state.calib_count += 1;
+                }
+                state.addr_target_us = state.addr_target_us.clamp(50, 180);
+                let err = state.addr_poll_us as i32 - state.addr_target_us as i32;
                 // A one-shot phase step (the chain re-bases to nominal after
                 // the request): stable for the matched-cadence pairs. An
                 // integrating version was tried to compensate the 5340's

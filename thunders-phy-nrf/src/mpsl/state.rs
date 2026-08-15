@@ -93,6 +93,11 @@ pub struct MpslState {
     /// ADDRESS events seen in RX polls: a packet with our address arrived
     /// (regardless of CRC). Diagnostic for deaf-RX questions.
     pub addr_events: u32,
+    /// Learned follower PLL address target (us from RXEN). Starts at the
+    /// legacy default and is calibrated from the first locked catches.
+    pub addr_target_us: u32,
+    /// Number of locked catches used for the address-target calibration.
+    pub calib_count: u32,
     /// Last RSSI sample (the RADIO RSSISAMPLE register, read before disable).
     /// Diagnostic for the RF-level marginality questions (the 5340 RX path).
     pub rssi_last: u32,
@@ -143,6 +148,8 @@ impl MpslState {
             done_count: AtomicU32::new(0),
             other_signals: 0,
             addr_events: 0,
+            addr_target_us: 60,
+            calib_count: 0,
             rssi_last: 0,
             last_rx_hdr: [0; 14],
             cur_channel: 25,

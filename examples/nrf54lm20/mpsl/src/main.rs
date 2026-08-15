@@ -178,7 +178,7 @@ async fn main(spawner: Spawner) {
                     info!("BENCH C slots={} tx={} rx={} rloss={}% rate={}/s bw={}B/s rtt_avg={}us rtt_min={}us rtt_max={}us busy={}us", frames, ping_tx, echo_rx, rloss, rate, bw, ra, rmin, rmax, avg_busy);
                     let pll = thunders_phy_nrf::mpsl::mpsl_pll_snapshot();
                     let rssi = thunders_phy_nrf::mpsl::mpsl_rssi();
-                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} rssi={} hdr={:?}", pll.distance_us, pll.catch_poll_us, pll.rx_window_us, pll.peer_rx_window_us, pll.addr_events, pll.addr_poll_us, pll.tx_count, pll.tx_delay_us, pll.rx_misses, pll.crc_ok, pll.crc_bad, rssi, pll.last_rx_hdr);
+                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} target={} calib={} rssi={} hdr={:?}", pll.distance_us, pll.catch_poll_us, pll.rx_window_us, pll.peer_rx_window_us, pll.addr_events, pll.addr_poll_us, pll.tx_count, pll.tx_delay_us, pll.rx_misses, pll.crc_ok, pll.crc_bad, pll.addr_target_us, pll.calib_count, rssi, pll.last_rx_hdr);
                     frames = 0;
                     ping_tx = 0;
                     echo_rx = 0;
@@ -246,7 +246,7 @@ async fn main(spawner: Spawner) {
                     info!("BENCH P slots={} rx={} lost={} floss={}% rate={}/s busy={}us", frames, rx_ok, fwd_lost, floss, rate, avg_busy);
                     let pll = thunders_phy_nrf::mpsl::mpsl_pll_snapshot();
                     let rssi = thunders_phy_nrf::mpsl::mpsl_rssi();
-                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} rssi={} hdr={:?}", pll.distance_us, pll.catch_poll_us, pll.rx_window_us, pll.peer_rx_window_us, pll.addr_events, pll.addr_poll_us, pll.tx_count, pll.tx_delay_us, pll.rx_misses, pll.crc_ok, pll.crc_bad, rssi, pll.last_rx_hdr);
+                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} target={} calib={} rssi={} hdr={:?}", pll.distance_us, pll.catch_poll_us, pll.rx_window_us, pll.peer_rx_window_us, pll.addr_events, pll.addr_poll_us, pll.tx_count, pll.tx_delay_us, pll.rx_misses, pll.crc_ok, pll.crc_bad, pll.addr_target_us, pll.calib_count, rssi, pll.last_rx_hdr);
                     frames = 0;
                     rx_ok = 0;
                     fwd_lost = 0;

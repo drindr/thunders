@@ -75,6 +75,10 @@ pub struct MpslPllSnapshot {
     pub crc_ok: u32,
     /// RX polls that ended without CRC ok.
     pub crc_bad: u32,
+    /// Learned follower PLL address target (us from RXEN).
+    pub addr_target_us: u32,
+    /// Locked catches used for the target calibration.
+    pub calib_count: u32,
 }
 
 /// Snapshot the phase-lock state as a named struct.
@@ -94,6 +98,8 @@ pub fn mpsl_pll_snapshot() -> MpslPllSnapshot {
             rx_misses: s.rx_misses,
             crc_ok: s.crc_ok,
             crc_bad: s.crc_bad,
+            addr_target_us: s.addr_target_us,
+            calib_count: s.calib_count,
         }
     }
 }
