@@ -171,3 +171,28 @@ Takeaways:
   cannot fix them.
 - Bare diagnostics are now in the `RADIO`/`BARE PLL` lines and MPSL RSSI
   is in the `PLL` line. `scripts/bench_parse.py --rssi` prints raw RSSI.
+
+### Addendum after seq re-sync fix
+
+The peripheral's `accept_seq` now re-syncs on ANY seq while `Disconnected`.
+Before this, a bad RF patch would advance the seq gap beyond the window and
+then reject every subsequent valid packet forever, making the measured
+`rx` much lower than the actual CRC-ok count.
+
+Re-ran the 30 s matrix. Highlights:
+
+| run | fwd loss | rev loss | rtt avg | notes |
+|---|---|---|---|---|
+| 52840 → LM20 | bare | 12.1% | 95.7% | still the best bare pair |
+| 5340 → LM20 | bare | 16.5% | 45.3% | still healthy forward |
+| LM20 → 52840 | bare | 0.0%* | 12.7% | reverse now works; forward still old-IP RX deaf to LM20 TX |
+| 52840 → 5340 | mpsl | 97.5% | 99.6% | PLL still sweeping; addr=128 crcok=128 when it catches |
+| 5340 → LM20 | mpsl | 12.6% | 47.0% | healthy forward, reverse degraded this run |
+
+\* Peripheral rx count still ~0; `floss` not meaningful.
+
+RSSI now works on the 52840/5340 paths: 52840→5340 shows rssi 57-66, so
+the old-IP peripheral can see a strong signal. In the MPSL case every
+address event also passes CRC (`crcok == addr`); the 5340 peripheral's
+problem there is that the PLL stays in sweep and only catches ~1% of the
+PINGs, not a decode failure.
