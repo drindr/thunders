@@ -104,7 +104,17 @@ pub const BARE_RX_OFFSET_US: u32 = 30;
 /// address stamp is [`BARE_RX_ON_AIR_TARGET_US`] + 28.
 pub const BARE_RX_ON_AIR_TARGET_US: u32 = 50;
 /// The corresponding address-event target (on-air + 28 us).
+// The address-event target is board-dependent in practice:
+// - nRF54L (LM20) peripheral: the original on-air+28 target (78 us) works
+//   for both 52840 and 5340 centrals.
+// - nRF52/53 (52840/5340) peripheral: the catch position naturally sits
+//   much deeper in the RX window; targeting 78 us makes the PLL fight the
+//   natural phase and reduces catches. 156 us is the centre of the RX
+//   window's useful range.
+#[cfg(feature = "_nrf54")]
 pub const BARE_RX_ADDR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US + 28;
+#[cfg(not(feature = "_nrf54"))]
+pub const BARE_RX_ADDR_TARGET_US: u32 = 156;
 
 /// The TX ramp after TXEN (the Fast ramp; MODECNF0.RU is set in `new`).
 /// Used by the follower's echo placement to convert the desired on-air time
