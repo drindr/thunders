@@ -103,6 +103,7 @@ pub const BARE_RX_OFFSET_US: u32 = 30;
 /// on-air start at 2 Mbps (16-bit preamble + 4-byte address), so the target
 /// address stamp is [`BARE_RX_ON_AIR_TARGET_US`] + 28.
 pub const BARE_RX_ON_AIR_TARGET_US: u32 = 50;
+/// The corresponding address-event target (on-air + 28 us).
 pub const BARE_RX_ADDR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US + 28;
 
 /// The TX ramp after TXEN (the Fast ramp; MODECNF0.RU is set in `new`).
@@ -114,12 +115,15 @@ pub const BARE_TX_RAMP_US: u32 = 40;
 /// initial sweep starts immediately; after the first catch the follower
 /// re-enables it only after this many consecutive misses.
 pub const BARE_SLOT_RESWEEP_MISSES: u32 = 500;
+/// The sweep offset added to the slot period while sweeping.
 pub const BARE_SLOT_SWEEP_US: u32 = 2;
 
 /// The follower's phase-lock gain and clamp (a one-shot phase step, the
 /// software twin of the MPSL PLL).
 pub const BARE_SLOT_GAIN_NUM: i32 = 1;
+/// The PLL gain denominator (correction = err * NUM / DEN).
 pub const BARE_SLOT_GAIN_DEN: i32 = 4;
+/// The one-shot phase step clamp (±us).
 pub const BARE_SLOT_CORR_CLAMP_US: i32 = 20;
 
 /// Interrupt handler for the custom RADIO driver.
