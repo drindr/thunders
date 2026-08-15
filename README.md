@@ -174,17 +174,18 @@ peripheral**, now on both backends:
 |---|---|---|---|---|---|
 | 52840 → LM20 | mpsl | 12-14 % | 13 % | 633 µs | 15.7 kB/s |
 | 5340 → LM20 | mpsl | 13 % | 13 % | 644 µs | 15.7 kB/s |
-| 52840 → LM20 | bare | 13 % (best windows) | 13-68 % | 480 µs | 18.3 kB/s |
-| 5340 → LM20 | bare | 24 % (best windows) | 17-49 % | 484 µs | 18.8 kB/s |
-| LM20 → 52840 | bare | forward still deaf | 13 % | 480 µs | 19.7 kB/s |
+| 52840 → 5340 | bare | 12 % | 13 % | 512 µs | 19.7 kB/s |
+| 52840 → LM20 | bare | 28 % | 56 % | 505 µs | 18.6 kB/s |
+| 5340 → 52840 | bare | 12 % | 13 % | 518 µs | 19.7 kB/s |
+| 5340 → LM20 | bare | 20 % | 30 % | 489 µs | 19.3 kB/s |
+| LM20 → 52840 | bare | 12 % | 13 % | 508 µs | 19.7 kB/s |
+| LM20 → 5340 | bare | 12 % | 13 % | 510 µs | 19.7 kB/s |
 
 The bare path is no longer dead: the software slot scheduler, Fast ramp,
-TX on-air alignment and empty-slot pacing give it a real link with the
-LM20 peripheral. The remaining 97-100 %-loss rows are the same
-pre-existing RF-level issues as the MPSL matrix — the 5340 peripheral RX
-and the 52840/5340 central RX into those peripherals. RSSI is now
-available on all paths and confirms strong signal on the bad pairs, so the
-old-IP peripheral failures are not a range problem.
+TX on-air alignment, empty-slot pacing, per-board follower target and echo
+phase compensation give all six bare directed pairs a working bidirectional
+link. The remaining MPSL problem rows are the LM20-as-central TX to
+old-IP RX direction, plus the intermittent LM20 boot HardFault.
 
 Bare diagnostics are in the `RADIO` and `BARE PLL` bench lines; MPSL RSSI
 is in the `PLL` line. `scripts/bench_parse.py --rssi` prints the raw RSSI

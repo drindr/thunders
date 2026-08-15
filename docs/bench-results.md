@@ -218,3 +218,34 @@ Single-pair 30 s, 52840 -> 5340 mpsl, peripheral rx/window:
 peripheral rx 210-268/window (was 91-126), central echo rx 222-444/window.
 The remaining loss is the RF-level miss rate, no longer a channel-desync
 lockout.
+
+### Fifth pass (bare follower target + echo phase compensation, 2025-08-15)
+
+Two bare-PHY fixes after the previous matrix:
+
+1. **Per-board follower address target.** The single 78 us target made the
+   PLL fight the natural catch position on nRF52/53 peripherals. The nRF52/53
+   follower now targets 156 us (the centre of the useful RX window) while the
+   nRF54L follower keeps 78 us.
+2. **Echo TX phase compensation.** The echo delay now folds in the last
+   forward-catch phase (`addr_from_slot - 28`), like the MPSL path, instead
+   of assuming the forward PLL held phase zero.
+
+Also lowered the bare re-sweep threshold from 20000 to 5000 misses so a
+lost lock re-acquires within ~2.5 s.
+
+Final 30 s matrix (parser output; `fwd`/`rev` are loss percentages):
+
+| run | fwd loss | rev loss | rtt avg | bw B/s |
+|---|---|---|---|---|
+| 52840 → 5340 | bare | 12.4% | 12.7% | 512 | 19 686 |
+| 52840 → LM20 | bare | 27.9% | 56.2% | 505 | 18 596 |
+| 5340 → 52840 | bare | 12.4% | 12.8% | 518 | 19 682 |
+| 5340 → LM20 | bare | 19.8% | 29.8% | 489 | 19 254 |
+| LM20 → 52840 | bare | 12.1% | 12.7% | 508 | 19 683 |
+| LM20 → 5340 | bare | 12.1% | 12.6% | 510 | 19 685 |
+
+**All six bare directed pairs now carry data in both directions.** The MPSL
+LM20-peripheral pairs remain healthy; the MPSL LM20-as-central pairs still
+do not reach the old-IP peripherals, and the 52840 → LM20 mpsl run again
+hit the intermittent LM20 boot HardFault.
