@@ -130,7 +130,7 @@ pub const BARE_TX_ON_AIR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US;
 /// The follower's acquisition sweep walks the grid by +2 us per slot. The
 /// initial sweep starts immediately; after the first catch the follower
 /// re-enables it only after this many consecutive misses.
-pub const BARE_SLOT_RESWEEP_MISSES: u32 = 20_000;
+pub const BARE_SLOT_RESWEEP_MISSES: u32 = 5_000;
 /// The sweep offset added to the slot period while sweeping.
 pub const BARE_SLOT_SWEEP_US: u32 = 2;
 
