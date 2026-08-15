@@ -116,3 +116,23 @@ polling loop made no difference (the polling was worse); the net core's
 per-slot overhead itself needs work (clock config, or the mpsl library's
 net-core path). This is the next debugging target, separate from the bench
 tooling.
+
+### Third pass (the 5340's app latency)
+
+3. **The MPSL inter-slot gap must be >= 150 us, not 100.** The slot-length
+   caps in the callback used `nominal - 100`, which for a 500 us slot leaves
+   a 100 us gap — below the MPSL scheduler's own minimum, so the chain
+   degraded and the app fell a slot behind. On the 5340 peripheral the
+   symptom was half-rate RX polls (rate 1468/s, busy 680-990 us). With
+   `nominal - 150` the app keeps up (rate ~2000/s, busy ~450-500 us).
+   - Verified: `mpsl_low_priority_process` costs only 19-53 us/call (not
+     the culprit); the wake-driven vs polling mpsl_task made no difference.
+
+4. **Integrating PLL (tried, reverted).** An integrator (`pll_acc`) was
+   tried so the phase correction could compensate the 5340's cadence drift.
+   Its dist swings (up to +40 us) destabilized the healthy LM20 pairs
+   (rx 1000+/window -> single digits), so it is reverted to the one-shot
+   step. The 5340's residual ~2-5% RX catch (polls aligned, frames mostly
+   not reaching its address match) is an RF-level marginality of the 5340
+   net-core mpsl RX — the README's original mpsl table showed the same
+   (~98/s) before any of this work.

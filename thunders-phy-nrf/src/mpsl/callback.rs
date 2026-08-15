@@ -45,7 +45,10 @@ pub unsafe extern "C" fn timeslot_cb(
                 // phase slack (air+140 was exactly READY+air: zero margin,
                 // any jitter missed). Capped to keep the inter-slot gap.
                 let air = 28 + 4 * (state.rx_result as u32 + 3);
-                state.slot_len = (air + 200).min(state.slot_nominal.saturating_sub(100));
+                // The cap keeps the MPSL inter-slot gap >= 150 us (the
+                // scheduler's own minimum; tighter gaps trip its assert).
+                state.slot_len =
+                    (air + 200).min(state.slot_nominal.saturating_sub(150));
                 if state.follower {
                     // The echo timing: with mirrored same-period grids the
                     // next-slot echo lands C us BEFORE the peer's receiver
@@ -69,8 +72,11 @@ pub unsafe extern "C" fn timeslot_cb(
                 state.rx_misses = state.rx_misses.saturating_add(1);
                 if state.rx_misses >= PLL_SWEEP_MISSES {
                     // Disconnected: widen the budget, keeping the MPSL
-                    // inter-slot gap >= 100 us (validated on both cores).
-                    state.slot_len = state.slot_nominal.saturating_sub(100);
+                    // inter-slot gap >= 150 us (the scheduler's minimum;
+                    // a 100 us gap (nominal-100) lets the chain degrade and
+                    // the app fall a slot behind - the 5340's half-rate
+                    // RX polls).
+                    state.slot_len = state.slot_nominal.saturating_sub(150);
                     // The +2us/slot sweep is for acquisition: before the
                     // first beacon, and again when the phase is truly lost
                     // (500 straight misses). Between those, hold nominal:
@@ -97,6 +103,11 @@ pub unsafe extern "C" fn timeslot_cb(
             if state.follower && state.addr_seen {
                 state.rx_misses = 0;
                 let err = state.addr_poll_us as i32 - 60;
+                // A one-shot phase step (the chain re-bases to nominal after
+                // the request): stable for the matched-cadence pairs. An
+                // integrating version was tried to compensate the 5340's
+                // cadence drift but its dist swings destabilized the LM20
+                // pairs (rx 1000+/window -> single digits), so it's reverted.
                 let corr = err * PLL_GAIN_NUM / PLL_GAIN_DEN;
                 let nominal = state.slot_nominal as i32;
                 let new_dist = (nominal + corr).clamp(nominal - 20, nominal + 20) as u32;

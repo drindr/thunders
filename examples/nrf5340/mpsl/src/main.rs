@@ -56,8 +56,8 @@ bind_interrupts!(struct Irqs {
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
     // Wake-driven: the low-prio IRQ wakes this task when there is work.
-    // (The polling loop was tried to fix the 5340's app latency but made
-    // it worse - busy ~1000 us vs ~680 us - so the wake-driven stays.)
+    // (Measured: mpsl_low_priority_process costs ~19-53 us/call - not the
+    // app-latency culprit; the polling loop was also tried and no better.)
     mpsl.run().await
 }
 
