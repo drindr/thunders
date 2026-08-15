@@ -93,6 +93,9 @@ pub struct MpslState {
     /// ADDRESS events seen in RX polls: a packet with our address arrived
     /// (regardless of CRC). Diagnostic for deaf-RX questions.
     pub addr_events: u32,
+    /// Last RSSI sample (the RADIO RSSISAMPLE register, read before disable).
+    /// Diagnostic for the RF-level marginality questions (the 5340 RX path).
+    pub rssi_last: u32,
     /// First 8 bytes ([len | payload...]) of the last address-matched
     /// packet — shows what the peer's TX actually put on the air.
     pub last_rx_hdr: [u8; 14],
@@ -140,6 +143,7 @@ impl MpslState {
             done_count: AtomicU32::new(0),
             other_signals: 0,
             addr_events: 0,
+            rssi_last: 0,
             last_rx_hdr: [0; 14],
             cur_channel: 25,
             cur_base0: 0xE7E7E7E7,

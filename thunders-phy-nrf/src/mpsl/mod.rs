@@ -34,6 +34,14 @@ pub fn mpsl_stats() -> (u32, u32, u32, u32) {
     }
 }
 
+/// Snapshot the last RSSI sample (the RADIO RSSISAMPLE register).
+pub fn mpsl_rssi() -> u32 {
+    unsafe {
+        let s = &*(STATE as *const MpslState);
+        s.rssi_last
+    }
+}
+
 /// Snapshot the phase-lock state: (chain distance, last catch iter, our RX
 /// window us, the peer's advertised RX window us).
 pub fn mpsl_pll() -> (u32, u32, u32, u32, u32, [u8; 14], u32, u32, u32, u32, u32, u32) {

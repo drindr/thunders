@@ -209,7 +209,8 @@ async fn main(spawner: Spawner) {
                     };
                     info!("BENCH C slots={} tx={} rx={} rloss={}% rate={}/s bw={}B/s rtt_avg={}us rtt_min={}us rtt_max={}us busy={}us", frames, ping_tx, echo_rx, rloss, rate, bw, ra, rmin, rmax, avg_busy);
                     let (d, ci, w, pw, ae, hdr, ai, txc, d8, mis, co, cb) = thunders_phy_nrf::mpsl::mpsl_pll();
-                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, co, cb, hdr);
+                    let rssi = thunders_phy_nrf::mpsl::mpsl_rssi();
+                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} rssi={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, co, cb, rssi, hdr);
                     frames = 0;
                     ping_tx = 0;
                     echo_rx = 0;
@@ -301,7 +302,8 @@ async fn main(spawner: Spawner) {
                     };
                     info!("BENCH P slots={} rx={} lost={} floss={}% rate={}/s busy={}us", frames, rx_ok, fwd_lost, floss, rate, avg_busy);
                     let (d, ci, w, pw, ae, hdr, ai, txc, d8, mis, co, cb) = thunders_phy_nrf::mpsl::mpsl_pll();
-                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, co, cb, hdr);
+                    let rssi = thunders_phy_nrf::mpsl::mpsl_rssi();
+                    info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} rssi={} hdr={:?}", d, ci, w, pw, ae, ai, txc, d8, mis, co, cb, rssi, hdr);
                     frames = 0;
                     rx_ok = 0;
                     fwd_lost = 0;

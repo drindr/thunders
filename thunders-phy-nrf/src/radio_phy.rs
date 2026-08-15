@@ -187,6 +187,8 @@ pub static TX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 pub static RX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Last RX poll duration in us (the DWT-capped listen window).
 pub static RX_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Last RSSI sample from the RADIO RSSISAMPLE register (RX diag).
+pub static RX_RSSI: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Main-loop time outside the frame (the between-frame overhead; diagnostic).
 pub static LOOP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static RXOK_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -969,6 +971,11 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         self.rx_end_clear();
 
         compiler_fence(Ordering::Acquire);
+
+        RX_RSSI.store(
+            self.r.rssisample().read().rssisample() as u32,
+            core::sync::atomic::Ordering::Relaxed,
+        );
 
         // The follower's software PLL: correct on the address anchor (a
         // fixed 28 us after the on-air start) regardless of the decode

@@ -251,11 +251,12 @@ async fn main(_spawner: Spawner) {
                     thunders_phy_nrf::radio_phy::RX_STATS.load(core::sync::atomic::Ordering::Relaxed);
                 let rxp = thunders_phy_nrf::radio_phy::RX_POLL.load(core::sync::atomic::Ordering::Relaxed);
                 let rxp_us = thunders_phy_nrf::radio_phy::RX_POLL_US.load(core::sync::atomic::Ordering::Relaxed);
+                let rssi = thunders_phy_nrf::radio_phy::RX_RSSI.load(core::sync::atomic::Ordering::Relaxed);
                 let txp = thunders_phy_nrf::radio_phy::TX_POLL.load(core::sync::atomic::Ordering::Relaxed);
                 let txs = thunders_phy_nrf::radio_phy::TX_STATS.load(core::sync::atomic::Ordering::Relaxed);
                 let lup = thunders_phy_nrf::radio_phy::LOOP_US.swap(0, core::sync::atomic::Ordering::Relaxed);
                 let dreads = thunders_phy_nrf::radio_phy::DISABLE_READS.swap(0, core::sync::atomic::Ordering::Relaxed);
-                info!("RADIO rxst={:#x} rxp={} rxp_us={} txp={} txs={:#x} loop={}us dis={}", rxst, rxp, rxp_us, txp, txs, lup, dreads);
+                info!("RADIO rxst={:#x} rxp={} rxp_us={} rssi={} txp={} txs={:#x} loop={}us dis={}", rxst, rxp, rxp_us, rssi, txp, txs, lup, dreads);
                 frames = 0;
                 busy_total = 0;
                 report_at = now;

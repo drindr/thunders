@@ -292,6 +292,7 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState) {
                 state.last_rx_hdr.copy_from_slice(&buf[..14.min(state.rx_cap)]);
             }
             let crc = r.crcstatus().read().0;
+            state.rssi_last = r.rssisample().read().rssisample() as u32;
             r.tasks_disable().write_value(1);
             // Quiesce before slot end: an unfinished disable leaks a live
             // receiver into the next slot (its END/CRC land in that slot's
