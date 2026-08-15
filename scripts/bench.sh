@@ -72,26 +72,45 @@ run_pair() {
   [ -f "$celf" ] || { echo "missing $celf - run 'scripts/bench.sh build'"; exit 1; }
   [ -f "$pelf" ] || { echo "missing $pelf"; exit 1; }
 
-  echo "== run $run (${secs}s, ${backend}) =="
-  # The 5340 net core is debug-locked: every flash needs the erase-all
-  # permission (which also wipes the app core). The bench firmware is
-  # standalone (no host mailbox), so nothing else needs deploying - the
-  # role-correct ELF is flashed directly by the run below.
+  for attempt in 1 2; do
+    echo "== run $run (${secs}s, ${backend}, attempt $attempt) =="
+    # The 5340 net core is debug-locked: every flash needs the erase-all
+    # permission (which also wipes the app core). The bench firmware is
+    # standalone (no host mailbox), so nothing else needs deploying - the
+    # role-correct ELF is flashed directly by the run below.
 
-  # The peripheral boots first and holds its slot session open; the central
-  # starts after it, so the link forms from the first slot. setsid: the
-  # peripheral probe-rs runs in its own process group so it can be reaped
-  # cleanly when the central finishes.
-  setsid timeout -s INT $((secs + 20)) probe-rs run --chip "${CHIP[$p]}" --probe "${PROBE[$p]}" \
-    ${EXTRA[$p]:-} --scan-region "${SCAN[$p]}" "$pelf" > "$LOGS/$run.peripheral.log" 2>&1 &
-  local ppid=$!
-  sleep 4
-  timeout -s INT "$secs" probe-rs run --chip "${CHIP[$c]}" --probe "${PROBE[$c]}" \
-    ${EXTRA[$c]:-} --scan-region "${SCAN[$c]}" "$celf" > "$LOGS/$run.central.log" 2>&1 || true
-  kill -- -"$ppid" 2>/dev/null || true
-  wait "$ppid" 2>/dev/null || true
-  echo "captured $LOGS/$run.central.log + $LOGS/$run.peripheral.log"
-  sleep 2
+    # The peripheral boots first and holds its slot session open; the central
+    # starts after it, so the link forms from the first slot. setsid: the
+    # peripheral probe-rs runs in its own process group so it can be reaped
+    # cleanly when the central finishes.
+    setsid timeout -s INT $((secs + 20)) probe-rs run --chip "${CHIP[$p]}" --probe "${PROBE[$p]}" \
+      ${EXTRA[$p]:-} --scan-region "${SCAN[$p]}" "$pelf" > "$LOGS/$run.peripheral.log" 2>&1 &
+    local ppid=$!
+    sleep 4
+    timeout -s INT "$secs" probe-rs run --chip "${CHIP[$c]}" --probe "${PROBE[$c]}" \
+      ${EXTRA[$c]:-} --scan-region "${SCAN[$c]}" "$celf" > "$LOGS/$run.central.log" 2>&1 || true
+    kill -- -"$ppid" 2>/dev/null || true
+    wait "$ppid" 2>/dev/null || true
+    echo "captured $LOGS/$run.central.log + $LOGS/$run.peripheral.log"
+
+    # The LM20 boot is intermittent (RtcDriver::init HardFault / Firmware
+    # exited unexpectedly). Retry once when either side did not produce a
+    # single BENCH line.
+    if grep -q "Firmware exited unexpectedly" "$LOGS/$run.peripheral.log" "$LOGS/$run.central.log" 2>/dev/null; then
+      echo "detected firmware crash, retrying"
+      sleep 2
+      continue
+    fi
+    if ! grep -q "BENCH READY" "$LOGS/$run.peripheral.log" 2>/dev/null || \
+       ! grep -q "BENCH READY" "$LOGS/$run.central.log" 2>/dev/null; then
+      echo "detected missing BENCH READY, retrying"
+      sleep 2
+      continue
+    fi
+    return 0
+  done
+  echo "run $run failed twice" >&2
+  return 1
 }
 
 run_all() {
