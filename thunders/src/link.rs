@@ -390,11 +390,17 @@ impl<P: Phy> Central<P> {
                     }
                 }
                 Packet::SlotRequest { min_slot_us } => {
-                    // Adopt the slowest board's minimum cadence. The central
-                    // is the time master, but the master must not run faster
-                    // than a peripheral can physically follow.
-                    if min_slot_us > self.phy.slot_period_us() {
-                        self.phy.align_slot_period(min_slot_us);
+                    // Negotiate the slowest board's cadence. Both sides
+                    // start at the fallback period, so the central can also
+                    // speed up to max(central_min, peripheral_min) once the
+                    // peer's minimum is known.
+                    let negotiated = self
+                        .phy
+                        .min_slot_period_us()
+                        .max(min_slot_us)
+                        .max(1);
+                    if negotiated != self.phy.slot_period_us() {
+                        self.phy.align_slot_period(negotiated);
                     }
                 }
                 _ => {}

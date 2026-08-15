@@ -1282,6 +1282,14 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         }
     }
 
+    fn fallback_slot_period_us(&self) -> u16 {
+        if self.paced {
+            BARE_SLOT_PERIOD_US as u16
+        } else {
+            0
+        }
+    }
+
     fn align_slot_period(&mut self, us: u16) {
         if self.paced && us > 0 {
             // Never adopt a cadence faster than the bare slot grid can

@@ -61,6 +61,14 @@ pub trait Phy {
         0
     }
 
+    /// The fallback slot period used before cadence negotiation completes.
+    /// This must be a period every board in the network can sustain; both
+    /// sides start here, exchange [`Packet::SlotRequest`], and then switch
+    /// to `max(central_min, peripheral_min)`.
+    fn fallback_slot_period_us(&self) -> u16 {
+        0
+    }
+
     /// Adopt the master's advertised cadence at runtime (the align
     /// mechanism): no compile-time cadence matching needed.
     fn align_slot_period(&mut self, _us: u16) {}

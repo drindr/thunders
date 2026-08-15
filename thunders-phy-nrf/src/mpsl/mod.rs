@@ -18,6 +18,11 @@ use thunders::phy::Phy;
 
 use crate::radio_phy::RadioMode;
 
+/// The fallback MPSL slot cadence used before negotiation completes.
+/// 500 us is the slowest board's physical minimum, so every board can start
+/// here and then renegotiate to `max(central_min, peripheral_min)`.
+pub const MPSL_FALLBACK_SLOT_US: u32 = 500;
+
 // The phase-lock (the proportional controller on the peripheral).
 pub(crate) const PLL_SWEEP_US: u32 = 2;
 pub(crate) const PLL_SWEEP_MISSES: u32 = 8;
@@ -140,11 +145,13 @@ impl<'d, const SLOT_US: u32, const SLOT_LEN_US: u32, const RX_POLL: u32>
             let dwt_ctrl = 0xE000_1000 as *mut u32;
             dwt_ctrl.write_volatile(dwt_ctrl.read_volatile() | 1); // CYCCNTENA
         }
-        // Fill the runtime slot constants from the const generics.
-        state.slot_nominal = SLOT_US;
-        state.slot_len = SLOT_LEN_US;
+        // Start at the fallback cadence every board can sustain. The
+        // const generics still describe this board's physical minimum
+        // (SLOT_US) and its RX poll iteration cap (RX_POLL).
+        state.slot_nominal = MPSL_FALLBACK_SLOT_US;
+        state.slot_len = MPSL_FALLBACK_SLOT_US.saturating_sub(150);
         state.rx_poll = RX_POLL;
-        state.slot_distance = SLOT_US;
+        state.slot_distance = MPSL_FALLBACK_SLOT_US;
 
         unsafe {
             STATE = state as *mut MpslState as *mut ();
@@ -308,6 +315,10 @@ impl<'d, const SLOT_US: u32, const SLOT_LEN_US: u32, const RX_POLL: u32> Phy
 
     fn min_slot_period_us(&self) -> u16 {
         SLOT_US as u16
+    }
+
+    fn fallback_slot_period_us(&self) -> u16 {
+        MPSL_FALLBACK_SLOT_US as u16
     }
 
     fn align_slot_period(&mut self, us: u16) {
