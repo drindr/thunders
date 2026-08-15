@@ -266,3 +266,28 @@ old-IP boards makes the peripheral able to keep up:
 | LM20 → 5340 mpsl | 689-769 | 63-79% |
 
 Still lossy, but the cadence mismatch is fixed.
+
+### Seventh pass (fallback-rate cadence negotiation, 2025-08-15)
+
+Cadence negotiation now starts both sides at a common fallback period
+(MPSL 500 us, bare 400 us) and renegotiates to
+`max(central_min, peripheral_min)` after the peripheral's SlotRequest.
+
+Full 30 s matrix:
+
+| run | fwd loss | rev loss | rtt avg | bw B/s |
+|---|---|---|---|---|
+| 52840 → 5340 | bare | 12.4% | 12.7% | 512 | 19 686 |
+| 52840 → LM20 | bare | 52.0% | 62.6% | 488 | 18 436 |
+| 5340 → 52840 | bare | 12.3% | 12.8% | 518 | 19 679 |
+| 5340 → LM20 | bare | 18.2% | 29.5% | 488 | 19 263 |
+| LM20 → 52840 | bare | 12.0% | 12.7% | 509 | 19 684 |
+| LM20 → 5340 | bare | 12.1% | 12.7% | 510 | 19 684 |
+| 52840 → 5340 | mpsl | 85.9% | 75.3% | 639 | 14 491 |
+| 52840 → LM20 | mpsl | —† | 100% | — | — |
+| 5340 → 52840 | mpsl | 96.6% | 79.6% | 652 | 14 404 |
+| 5340 → LM20 | mpsl | 12.6% | 41.3% | 594 | 15 172 |
+| LM20 → 52840 | mpsl | 95.5% | 77.4% | 608 | 14 450 |
+| LM20 → 5340 | mpsl | 91.9% | 70.7% | 635 | 14 583 |
+
+† LM20 boot HardFault again in this run.
