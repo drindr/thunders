@@ -136,3 +136,38 @@ tooling.
    not reaching its address match) is an RF-level marginality of the 5340
    net-core mpsl RX — the README's original mpsl table showed the same
    (~98/s) before any of this work.
+
+### Fourth pass (bare software slot scheduler, 2025-08-15)
+
+The bare path gained a software slot scheduler (`NrfRadioPhy::set_paced`),
+a DWT-capped RX poll, Fast ramp, TX on-air alignment, empty-slot pacing,
+and a follower PLL. Re-ran the full 30 s matrix. Summary:
+
+| run | fwd loss | rev loss | rtt avg | bw B/s | c-rate/s |
+|---|---|---|---|---|---|
+| 52840 → 5340 | bare | 99.8% | 97.9% | 456 | 17 554 | 2500 |
+| 52840 → LM20 | bare | 12.8% | 67.6% | 498 | 18 312 | 2500 |
+| 5340 → 52840 | bare | 12.5%* | 99.3% | 622 | 17 517 | 2500 |
+| 5340 → LM20 | bare | 23.7% | 49.4% | 484 | 18 765 | 2500 |
+| LM20 → 52840 | bare | 0.0%* | 100% | 0 | 17 499 | 2500 |
+| LM20 → 5340 | bare | 99.8% | 99.1% | 450 | 17 522 | 2500 |
+| 52840 → LM20 | mpsl | —† | 100% | 0 | 13 997 | 2000 |
+| 5340 → LM20 | mpsl | 12.8% | 46.2% | 578 | 15 074 | 2000 |
+
+\* The peripheral's rx count was near zero; the `floss` percentage is not
+meaningful when `rx + lost ≈ 0`. The only bare pairs with real forward
+catches are **52840 → LM20** and **5340 → LM20** (both with the LM20 as
+peripheral), matching the MPSL pattern.
+
+† The LM20 peripheral HardFaulted in `RtcDriver::init` before the link
+formed (the pre-existing intermittent LM20 boot crash).
+
+Takeaways:
+- The bare backend is no longer dead: with the LM20 as peripheral it
+  carries data in both directions (forward loss 10-51 % across windows,
+  reverse loss 13-89 % across windows, best windows ~13 % both ways).
+- The 5340-peripheral and 52840-central-RX failures remain exactly the
+  pre-existing RF-level marginalities from the MPSL matrix; the bare PHY
+  cannot fix them.
+- Bare diagnostics are now in the `RADIO`/`BARE PLL` lines and MPSL RSSI
+  is in the `PLL` line. `scripts/bench_parse.py --rssi` prints raw RSSI.

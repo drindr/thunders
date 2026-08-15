@@ -164,43 +164,32 @@ secure and any access faults. (The 5340 net core is debug-locked, so every
 flash needs `--allow-erase-all`, which also wipes the app core — irrelevant
 for the standalone bench.)
 
-### Results (2025-08-14, `docs/bench-results.md`)
+### Results (2025-08-15, `docs/bench-results.md`)
 
-Only two of the twelve combos form a healthy link today: **mpsl with the
-LM20 as the peripheral** — 52840→LM20 and 5340→LM20 both deliver ~86-87 %
-each way, RTT ≈ 633-644 µs, bandwidth ≈ 15.7 kB/s payload.
+The latest full 30 s matrix is in `docs/bench-results.md` (fourth pass).
+Summary: the working links are still the pairs with **LM20 as the
+peripheral**, now on both backends:
 
-| run | fwd | rev | rtt avg | bw |
-|---|---|---|---|---|
-| 52840 → LM20 | mpsl | 14% | 13% | 633 µs | 15.7 kB/s |
-| 5340 → LM20 | mpsl | 13% | 13% | 644 µs | 15.7 kB/s |
+| run | backend | fwd loss | rev loss | rtt avg | bw |
+|---|---|---|---|---|---|
+| 52840 → LM20 | mpsl | 12-14 % | 13 % | 633 µs | 15.7 kB/s |
+| 5340 → LM20 | mpsl | 13 % | 13 % | 644 µs | 15.7 kB/s |
+| 52840 → LM20 | bare | 13 % (best windows) | 13-68 % | 480 µs | 18.3 kB/s |
+| 5340 → LM20 | bare | 24 % (best windows) | 17-49 % | 484 µs | 18.8 kB/s |
 
-Everything else is 97-100 % loss:
-- **bare, all pairs** — at the time of this matrix the two free-running slot
-  loops ran at different rates per chip (6.5 kHz vs 2.5 kHz) and the bare
-  path had no cadence lock; the beacon phase-mirror only corrected phase,
-  and was itself missed while misaligned.
-- **mpsl, 5340/52840 as peripheral** — the 5340 net core receives the
-  frames (thousands of ADDRESS events) but decodes only ~10 % (CRC
-  failures); the LM20 decodes ~84 %.
-- **mpsl, LM20 as central** — the LM20's TX never reaches the peers
-  (addr = 0) and its RX gets nothing back; the 5340 peripheral also hangs
-  (starved executor) in one run.
+The bare path is no longer dead: the software slot scheduler, Fast ramp,
+TX on-air alignment and empty-slot pacing give it a real link with the
+LM20 peripheral. The remaining 97-100 %-loss rows are the same
+pre-existing RF-level issues as the MPSL matrix — the 5340 peripheral RX
+and the 52840/5340 central RX into those peripherals.
 
-> After this matrix the bare path gained a **software slot scheduler**
-> (`NrfRadioPhy::set_paced`, `BARE_SLOT_PERIOD_US`): both roles pace their
-> slot starts to the same 400 µs grid, the follower sweeps for the central's
-> phase and then phase-locks on the RX address anchor, the RX poll is
-> DWT-capped so a 100-200 µs listen budget is chip-independent, and the TX
-> ramp is set to Fast so the slot offsets are known. The follower also
-> delays its echo TX into the central's advertised RX window. A host-side
-> phase-lock model lives in `scripts/simulate_bare_scheduler.py`; the next
-> bench run needs to re-measure the bare rows with this scheduler — the
-> table above is the pre-scheduler baseline.
+Bare diagnostics are in the `RADIO` and `BARE PLL` bench lines; MPSL RSSI
+is in the `PLL` line. `scripts/bench_parse.py --rssi` prints the raw RSSI
+samples. `scripts/simulate_bare_scheduler.py` models the bare phase-lock
+on a host.
 
-The old table (pre-ratio architecture, measured before the slot-alignment
-work) is history — the current firmware's matrix is above; the per-window
-detail and the raw logs live in `docs/bench-results.md` and `bench/logs/`.
+The per-window detail and the raw logs live in `docs/bench-results.md` and
+`bench/logs/`.
 
 ## nRF54L field notes (things the SVD won't tell you)
 
