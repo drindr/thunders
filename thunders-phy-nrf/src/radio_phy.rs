@@ -986,6 +986,11 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         self.r.shorts().write(|w| {
             w.set_rxready_start(true);
             w.set_end_disable(true);
+            // Sample RSSI for the packet / idle RX slot; the RSSISAMPLE
+            // register reads 0 until RSSI is started (the 52840/5340 RSSI
+            // diagnostic was dead without these two shorts).
+            w.set_address_rssistart(true);
+            w.set_disabled_rssistop(true);
         });
 
         self.r.events_ready().write_value(0);

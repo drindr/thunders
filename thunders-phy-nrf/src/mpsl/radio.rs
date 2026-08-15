@@ -69,6 +69,10 @@ fn shorts_rx() -> regs::Shorts {
     {
         s.set_rxready_start(true);
         s.set_end_disable(true);
+        // RSSI is not started by default on the 52840/5340; without these
+        // the RSSISAMPLE register reads 0.
+        s.set_address_rssistart(true);
+        s.set_disabled_rssistop(true);
     }
     #[cfg(feature = "_nrf54")]
     {
