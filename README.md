@@ -184,8 +184,10 @@ peripheral**, now on both backends:
 The bare path is no longer dead: the software slot scheduler, Fast ramp,
 TX on-air alignment, empty-slot pacing, per-board follower target and echo
 phase compensation give all six bare directed pairs a working bidirectional
-link. The remaining MPSL problem rows are the LM20-as-central TX to
-old-IP RX direction, plus the intermittent LM20 boot HardFault.
+link. The MPSL LM20-as-central rows were fixed by running the LM20 MPSL
+example at the same 500 us slot cadence as the old-IP boards; the remaining
+MPSL weakness is the intermittent LM20 boot HardFault and the residual
+loss on the 52840/5340 peripheral pairs.
 
 Bare diagnostics are in the `RADIO` and `BARE PLL` bench lines; MPSL RSSI
 is in the `PLL` line. `scripts/bench_parse.py --rssi` prints the raw RSSI

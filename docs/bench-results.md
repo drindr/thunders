@@ -249,3 +249,20 @@ Final 30 s matrix (parser output; `fwd`/`rev` are loss percentages):
 LM20-peripheral pairs remain healthy; the MPSL LM20-as-central pairs still
 do not reach the old-IP peripherals, and the 52840 → LM20 mpsl run again
 hit the intermittent LM20 boot HardFault.
+
+### Sixth pass (MPSL LM20 central at 500 us slots)
+
+The LM20 mpsl example used 300/250/1200 slot constants while the
+52840/5340 peripheral MPSL app needs ~450-500 us per slot. The peripheral
+blindly adopted the central's 300 us cadence and starved, so LM20-as-central
+was 100% loss.
+
+Switching the LM20 mpsl example to the same 500/400/1400 constants as the
+old-IP boards makes the peripheral able to keep up:
+
+| run | peripheral rx/window | central rloss |
+|---|---|---|
+| LM20 → 52840 mpsl | 154-422 | 75-79% |
+| LM20 → 5340 mpsl | 689-769 | 63-79% |
+
+Still lossy, but the cadence mismatch is fixed.
