@@ -422,13 +422,14 @@ impl<P: Phy> Central<P> {
         // Anti-replay with a small forward window: accept seqs within a few
         // of the last one instead of exactly rx_seq+1, so the two nodes'
         // counters can drift without permanently locking out the link.
-        // The first-ever accept (rx_seq still at its initial 0 and never
-        // advanced) syncs to ANY seq: on free-running radios (MPSL chains)
-        // the peer's tx_seq can run far ahead before the first packet is
-        // accepted, and locking onto that first seq is what lets the link
-        // establish.
+        // Re-sync on ANY seq while Disconnected (the connection-state
+        // machine's own signal that the stream was lost): on free-running
+        // radios (MPSL chains) the peer's tx_seq can run far ahead before
+        // the first packet is accepted, and after an RF-level outage the
+        // receiver must lock onto the next valid seq or it rejects every
+        // subsequent packet forever.
         let diff = seq.wrapping_sub(self.state.rx_seq);
-        diff <= 8 || self.state.rx_seq == 0
+        diff <= 8 || self.state.rx_seq == 0 || self.state.status == LinkStatus::Disconnected
     }
 }
 
@@ -609,7 +610,11 @@ impl<P: Phy> Peripheral<P> {
     }
 
     fn accept_seq(&self, seq: u8) -> bool {
+        // Symmetric with the central: the first-ever accept syncs to ANY
+        // seq, and while Disconnected (the connection-state machine's own
+        // signal that the stream was lost) the receiver re-syncs to the next
+        // valid seq instead of rejecting every subsequent packet forever.
         let diff = seq.wrapping_sub(self.state.rx_seq);
-        diff <= 8
+        diff <= 8 || self.state.rx_seq == 0 || self.state.status == LinkStatus::Disconnected
     }
 }
