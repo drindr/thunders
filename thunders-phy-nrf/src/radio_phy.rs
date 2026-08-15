@@ -36,7 +36,7 @@ use embassy_time::Duration;
 use nrf_pac::radio::vals::S1incl;
 #[cfg(not(feature = "_nrf54"))]
 use nrf_pac::radio::vals::{
-    Crcinc, Crcstatus, Endian, Len, Map, Mode, Plen, Skipaddr, State, Txpower,
+    Crcinc, Crcstatus, Endian, Len, Map, Mode, Plen, Ru, Skipaddr, State, Txpower,
 };
 #[cfg(feature = "_nrf54")]
 use nrf_pac::radio::vals::{Crcinc, Crcstatus, Endian, Len, Mode, Plen, Skipaddr, State, Txpower};
@@ -104,6 +104,11 @@ pub const BARE_RX_OFFSET_US: u32 = 30;
 /// address stamp is [`BARE_RX_ON_AIR_TARGET_US`] + 28.
 pub const BARE_RX_ON_AIR_TARGET_US: u32 = 50;
 pub const BARE_RX_ADDR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US + 28;
+
+/// The TX ramp after TXEN (the Fast ramp; MODECNF0.RU is set in `new`).
+/// Used by the follower's echo placement to convert the desired on-air time
+/// into the TXEN delay.
+pub const BARE_TX_RAMP_US: u32 = 40;
 
 /// The follower's acquisition sweep walks the grid by +2 us per slot. The
 /// initial sweep starts immediately; after the first catch the follower
@@ -235,6 +240,9 @@ impl<'d> NrfRadioPhy<'d> {
         };
 
         r.mode().write(|w| w.set_mode(mode_val));
+        // Fast ramp (40 us, not the 129 us Legacy): both the slot scheduler's
+        // TX/RX offset assumptions and the tight RX window depend on it.
+        r.modecnf0().modify(|w| w.set_ru(Ru::Fast));
 
         // CRC config varies by mode. Nordic ESB includes the address in CRC.
         let crc_len = match mode {
@@ -710,6 +718,25 @@ impl<'d> NrfRadioPhy<'d> {
 
         self.r.events_end().write_value(0);
         let c2 = dwt_cycles();
+
+        // The follower's echo placement: with both grids phase-locked, the
+        // peripheral's TX slot starts together with the central's RX slot
+        // (the PLL's on-air target makes the central's TX offset equal to
+        // this PHY's TX offset when the chips have the same timing). Delay
+        // TXEN so the echo's on-air time is centered in the central's
+        // advertised RX window instead of starting at the window's left
+        // edge (or before it on a slower peer).
+        if self.paced && self.follower && self.peer_rx_window_us > 0 {
+            let air = 28 + 4 * (pkt.len() as u32 + 3);
+            let target_on_air = BARE_RX_OFFSET_US + self.peer_rx_window_us.saturating_sub(air) / 2;
+            let desired_txen = target_on_air.saturating_sub(BARE_TX_RAMP_US);
+            let txen_elapsed = c2.wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
+            if desired_txen > txen_elapsed {
+                let wait = desired_txen - txen_elapsed;
+                let start = dwt_cycles();
+                while (dwt_cycles().wrapping_sub(start)) / CPU_MHZ < wait {}
+            }
+        }
         self.r.tasks_txen().write_value(1);
 
         // Poll for completion (interrupt-driven waits are unreliable here).
