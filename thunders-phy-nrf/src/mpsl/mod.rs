@@ -42,26 +42,75 @@ pub fn mpsl_rssi() -> u32 {
     }
 }
 
+/// A named, ergonomic snapshot of the MPSL phase-lock state.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct MpslPllSnapshot {
+    /// Last chained timeslot distance (us).
+    pub distance_us: u32,
+    /// END-event stamp of the last catch (us from poll start).
+    pub catch_poll_us: u32,
+    /// Our measured RX listen window (us).
+    pub rx_window_us: u32,
+    /// The peer's advertised RX listen window (us).
+    pub peer_rx_window_us: u32,
+    /// Address events seen in RX polls.
+    pub addr_events: u32,
+    /// First bytes of the last address-matched packet.
+    pub last_rx_hdr: [u8; 14],
+    /// Address-event stamp of the last catch (us from poll start).
+    pub addr_poll_us: u32,
+    /// Completed TX ops.
+    pub tx_count: u32,
+    /// Echo TX delay from slot start (us).
+    pub tx_delay_us: u32,
+    /// Consecutive RX misses.
+    pub rx_misses: u32,
+    /// RX polls that ended with CRC ok.
+    pub crc_ok: u32,
+    /// RX polls that ended without CRC ok.
+    pub crc_bad: u32,
+}
+
+/// Snapshot the phase-lock state as a named struct.
+pub fn mpsl_pll_snapshot() -> MpslPllSnapshot {
+    unsafe {
+        let s = &*(STATE as *const MpslState);
+        MpslPllSnapshot {
+            distance_us: s.slot_distance,
+            catch_poll_us: s.catch_poll_us,
+            rx_window_us: s.rx_window_us,
+            peer_rx_window_us: s.peer_rx_window_us,
+            addr_events: s.addr_events,
+            last_rx_hdr: s.last_rx_hdr,
+            addr_poll_us: s.addr_poll_us,
+            tx_count: s.tx_count,
+            tx_delay_us: s.tx_delay_us,
+            rx_misses: s.rx_misses,
+            crc_ok: s.crc_ok,
+            crc_bad: s.crc_bad,
+        }
+    }
+}
+
 /// Snapshot the phase-lock state: (chain distance, last catch iter, our RX
 /// window us, the peer's advertised RX window us).
 pub fn mpsl_pll() -> (u32, u32, u32, u32, u32, [u8; 14], u32, u32, u32, u32, u32, u32) {
-    unsafe {
-        let s = &*(STATE as *const MpslState);
-        (
-            s.slot_distance,
-            s.catch_poll_us,
-            s.rx_window_us,
-            s.peer_rx_window_us,
-            s.addr_events,
-            s.last_rx_hdr,
-            s.addr_poll_us,
-            s.tx_count,
-            s.tx_delay_us,
-            s.rx_misses,
-            s.crc_ok,
-            s.crc_bad,
-        )
-    }
+    let s = mpsl_pll_snapshot();
+    (
+        s.distance_us,
+        s.catch_poll_us,
+        s.rx_window_us,
+        s.peer_rx_window_us,
+        s.addr_events,
+        s.last_rx_hdr,
+        s.addr_poll_us,
+        s.tx_count,
+        s.tx_delay_us,
+        s.rx_misses,
+        s.crc_ok,
+        s.crc_bad,
+    )
 }
 
 // --- the callback's context (the only global the C callback needs) ---

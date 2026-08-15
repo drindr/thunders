@@ -199,6 +199,57 @@ pub static RX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 pub static RX_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Last RSSI sample from the RADIO RSSISAMPLE register (RX diag).
 pub static RX_RSSI: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// A named, ergonomic snapshot of the bare slot scheduler's state.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BarePllSnapshot {
+    /// Last address-event stamp from RXEN (us).
+    pub addr_poll_us: u32,
+    /// Last address-event stamp from the slot start (us).
+    pub addr_slot_us: u32,
+    /// Last applied PLL correction (us, signed).
+    pub corr_us: i32,
+    /// Consecutive RX polls without an address match.
+    pub rx_misses: u32,
+    /// True while the follower is sweeping.
+    pub sweep: bool,
+    /// The peer's advertised RX window (us).
+    pub peer_rx_window_us: u32,
+    /// The slot period in use (us).
+    pub period_us: u32,
+    /// Last TX on-air offset from the slot start (us).
+    pub tx_on_air_us: u32,
+    /// Min TX on-air offset in the current window (us).
+    pub tx_air_min_us: u32,
+    /// Max TX on-air offset in the current window (us).
+    pub tx_air_max_us: u32,
+    /// Last RX radio-op duration (us).
+    pub rx_op_us: u32,
+    /// Last TX radio-op duration (us).
+    pub tx_op_us: u32,
+    /// Address events seen in the current window.
+    pub addr_events: u32,
+}
+
+/// Snapshot the bare slot scheduler state as a named struct.
+pub fn bare_pll() -> BarePllSnapshot {
+    BarePllSnapshot {
+        addr_poll_us: BARE_ADDR_POLL_US.load(core::sync::atomic::Ordering::Relaxed),
+        addr_slot_us: BARE_ADDR_SLOT_US.load(core::sync::atomic::Ordering::Relaxed),
+        corr_us: BARE_PLL_CORR_US.load(core::sync::atomic::Ordering::Relaxed),
+        rx_misses: BARE_RX_MISSES.load(core::sync::atomic::Ordering::Relaxed),
+        sweep: BARE_SWEEP.load(core::sync::atomic::Ordering::Relaxed) != 0,
+        peer_rx_window_us: BARE_PEER_WINDOW_US.load(core::sync::atomic::Ordering::Relaxed),
+        period_us: BARE_EFFECTIVE_PERIOD_US.load(core::sync::atomic::Ordering::Relaxed),
+        tx_on_air_us: BARE_TX_ON_AIR_US.load(core::sync::atomic::Ordering::Relaxed),
+        tx_air_min_us: BARE_TX_AIR_MIN.load(core::sync::atomic::Ordering::Relaxed),
+        tx_air_max_us: BARE_TX_AIR_MAX.load(core::sync::atomic::Ordering::Relaxed),
+        rx_op_us: BARE_RX_OP_US.load(core::sync::atomic::Ordering::Relaxed),
+        tx_op_us: BARE_TX_OP_US.load(core::sync::atomic::Ordering::Relaxed),
+        addr_events: BARE_ADDR_EVENTS.load(core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 /// Bare scheduler diagnostics (read from the app context).
 pub static BARE_ADDR_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static BARE_RX_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -215,7 +266,7 @@ pub static BARE_RX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::At
 pub static BARE_TX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static BARE_ADDR_SLOT_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static BARE_ADDR_EVENTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static BARE_PLL_CORR_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_PLL_CORR_US: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 /// Main-loop time outside the frame (the between-frame overhead; diagnostic).
 pub static LOOP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static RXOK_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -585,7 +636,7 @@ impl<'d> NrfRadioPhy<'d> {
         };
         let corr = (corr_us * BARE_SLOT_GAIN_NUM / BARE_SLOT_GAIN_DEN)
             .clamp(-BARE_SLOT_CORR_CLAMP_US, BARE_SLOT_CORR_CLAMP_US);
-        BARE_PLL_CORR_US.store(corr as u32, core::sync::atomic::Ordering::Relaxed);
+        BARE_PLL_CORR_US.store(corr, core::sync::atomic::Ordering::Relaxed);
         let corr_cyc = corr as i64 * CPU_MHZ as i64;
         self.next_slot_cyc = Some(if corr_cyc >= 0 {
             next.wrapping_add(corr_cyc as u32)
