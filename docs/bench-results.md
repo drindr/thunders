@@ -196,3 +196,25 @@ the old-IP peripheral can see a strong signal. In the MPSL case every
 address event also passes CRC (`crcok == addr`); the 5340 peripheral's
 problem there is that the PLL stays in sweep and only catches ~1% of the
 PINGs, not a decode failure.
+
+### Hop threshold experiment
+
+The default `HOP_MISS_THRESHOLD = 4` was too aggressive for a marginal
+link. On 52840 -> 5340 mpsl the central hopped after every 4 missed echoes,
+the peripheral missed the beacon and desynced, and the measured rx stayed
+near 0.
+
+Single-pair 30 s, 52840 -> 5340 mpsl, peripheral rx/window:
+
+| hop threshold | rx/window |
+|---|---|
+| 4 (old) | 91-163 |
+| 8 | 84-243 |
+| 16 (kept) | 709-1134 |
+| 32 | 696-1169 |
+| no-hop | 733-1273 |
+
+`HOP_MISS_THRESHOLD` is now **16**. Bare 52840 -> 5340 also improved:
+peripheral rx 210-268/window (was 91-126), central echo rx 222-444/window.
+The remaining loss is the RF-level miss rate, no longer a channel-desync
+lockout.
