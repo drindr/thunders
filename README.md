@@ -190,10 +190,13 @@ Everything else is 97-100 % loss:
 > After this matrix the bare path gained a **software slot scheduler**
 > (`NrfRadioPhy::set_paced`, `BARE_SLOT_PERIOD_US`): both roles pace their
 > slot starts to the same 400 µs grid, the follower sweeps for the central's
-> phase and then phase-locks on the RX address anchor, and the RX poll is
-> DWT-capped so a 100-200 µs listen budget is chip-independent. The next
-> bench run needs to re-measure the bare rows with this scheduler; the table
-> above is the pre-scheduler baseline.
+> phase and then phase-locks on the RX address anchor, the RX poll is
+> DWT-capped so a 100-200 µs listen budget is chip-independent, and the TX
+> ramp is set to Fast so the slot offsets are known. The follower also
+> delays its echo TX into the central's advertised RX window. A host-side
+> phase-lock model lives in `scripts/simulate_bare_scheduler.py`; the next
+> bench run needs to re-measure the bare rows with this scheduler — the
+> table above is the pre-scheduler baseline.
 
 The old table (pre-ratio architecture, measured before the slot-alignment
 work) is history — the current firmware's matrix is above; the per-window
