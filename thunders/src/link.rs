@@ -122,6 +122,15 @@ impl LinkState {
         }
     }
 
+    /// The seq window: accept `seq` when it is within a few steps of the
+    /// last accepted seq, or whenever the link is Disconnected (the
+    /// connection-state machine's re-sync signal), or before the first
+    /// accept (rx_seq still at its initial 0).
+    fn accept_seq(&self, seq: u8) -> bool {
+        let diff = seq.wrapping_sub(self.rx_seq);
+        diff <= 8 || self.rx_seq == 0 || self.status == LinkStatus::Disconnected
+    }
+
     /// A successful RX slot: the form-up streak forms the connection
     /// (enabling the hop) only after the link proves it can sustain.
     fn on_rx(&mut self, streak: &mut u8) {
@@ -419,17 +428,7 @@ impl<P: Phy> Central<P> {
     }
 
     fn accept_seq(&self, seq: u8) -> bool {
-        // Anti-replay with a small forward window: accept seqs within a few
-        // of the last one instead of exactly rx_seq+1, so the two nodes'
-        // counters can drift without permanently locking out the link.
-        // Re-sync on ANY seq while Disconnected (the connection-state
-        // machine's own signal that the stream was lost): on free-running
-        // radios (MPSL chains) the peer's tx_seq can run far ahead before
-        // the first packet is accepted, and after an RF-level outage the
-        // receiver must lock onto the next valid seq or it rejects every
-        // subsequent packet forever.
-        let diff = seq.wrapping_sub(self.state.rx_seq);
-        diff <= 8 || self.state.rx_seq == 0 || self.state.status == LinkStatus::Disconnected
+        self.state.accept_seq(seq)
     }
 }
 
@@ -610,11 +609,6 @@ impl<P: Phy> Peripheral<P> {
     }
 
     fn accept_seq(&self, seq: u8) -> bool {
-        // Symmetric with the central: the first-ever accept syncs to ANY
-        // seq, and while Disconnected (the connection-state machine's own
-        // signal that the stream was lost) the receiver re-syncs to the next
-        // valid seq instead of rejecting every subsequent packet forever.
-        let diff = seq.wrapping_sub(self.state.rx_seq);
-        diff <= 8 || self.state.rx_seq == 0 || self.state.status == LinkStatus::Disconnected
+        self.state.accept_seq(seq)
     }
 }
