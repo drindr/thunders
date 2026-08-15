@@ -306,8 +306,19 @@ impl<'d, const SLOT_US: u32, const SLOT_LEN_US: u32, const RX_POLL: u32> Phy
         self.state.slot_nominal as u16
     }
 
+    fn min_slot_period_us(&self) -> u16 {
+        SLOT_US as u16
+    }
+
     fn align_slot_period(&mut self, us: u16) {
-        self.state.slot_nominal = us as u32;
-        self.state.slot_distance = us as u32;
+        // Never adopt a cadence faster than this board's physical minimum;
+        // a central that advertised a shorter slot must slow down, not the
+        // peripheral starve.
+        let us = us.max(SLOT_US as u16) as u32;
+        self.state.slot_nominal = us;
+        self.state.slot_distance = us;
+        // Keep the MPSL inter-slot gap rule (>= 150 us) when the cadence
+        // changes at runtime, and give the RX poll a usable budget.
+        self.state.slot_len = us.saturating_sub(150);
     }
 }

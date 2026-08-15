@@ -54,6 +54,13 @@ pub trait Phy {
         0
     }
 
+    /// The minimum slot period this PHY can physically sustain, in us.
+    /// The central adopts `max(current, peer_min)` so a fast central cannot
+    /// starve a slower peripheral.
+    fn min_slot_period_us(&self) -> u16 {
+        0
+    }
+
     /// Adopt the master's advertised cadence at runtime (the align
     /// mechanism): no compile-time cadence matching needed.
     fn align_slot_period(&mut self, _us: u16) {}

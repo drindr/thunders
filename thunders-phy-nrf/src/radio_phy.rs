@@ -1274,9 +1274,19 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         }
     }
 
+    fn min_slot_period_us(&self) -> u16 {
+        if self.paced {
+            BARE_SLOT_PERIOD_US as u16
+        } else {
+            0
+        }
+    }
+
     fn align_slot_period(&mut self, us: u16) {
         if self.paced && us > 0 {
-            self.period_us = us as u32;
+            // Never adopt a cadence faster than the bare slot grid can
+            // physically support.
+            self.period_us = (us as u32).max(BARE_SLOT_PERIOD_US);
         }
     }
 

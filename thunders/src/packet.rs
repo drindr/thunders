@@ -46,6 +46,13 @@ pub enum Packet {
         /// Up to [`MAX_PAYLOAD`] bytes of user data.
         payload: Vec<u8, MAX_PAYLOAD>,
     },
+    /// Slot cadence request from a peripheral: the slowest board in the
+    /// network advertises the minimum slot period it can sustain, and the
+    /// central adopts `max(current, min_slot_us)`.
+    SlotRequest {
+        /// The peripheral's minimum slot period in microseconds.
+        min_slot_us: u16,
+    },
     /// Pairing request from a peripheral.
     PairingRequest {
         /// Device identifier.

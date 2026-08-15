@@ -376,17 +376,28 @@ impl<P: Phy> Central<P> {
                 .map_err(|_| Error::InvalidPacket)?;
 
             let mut received = None;
-            if let Packet::Data { seq, mut payload } = reply {
-                self.state.decrypt_payload(&mut self.phy, &mut payload, seq, false)?;
-                if self.accept_seq(seq) {
-                    let len = payload.len();
-                    if len > rx_buf.len() {
-                        return Err(Error::BufferTooSmall);
+            match reply {
+                Packet::Data { seq, mut payload } => {
+                    self.state.decrypt_payload(&mut self.phy, &mut payload, seq, false)?;
+                    if self.accept_seq(seq) {
+                        let len = payload.len();
+                        if len > rx_buf.len() {
+                            return Err(Error::BufferTooSmall);
+                        }
+                        rx_buf[..len].copy_from_slice(&payload);
+                        received = Some(len);
+                        self.state.rx_seq = seq;
                     }
-                    rx_buf[..len].copy_from_slice(&payload);
-                    received = Some(len);
-                    self.state.rx_seq = seq;
                 }
+                Packet::SlotRequest { min_slot_us } => {
+                    // Adopt the slowest board's minimum cadence. The central
+                    // is the time master, but the master must not run faster
+                    // than a peripheral can physically follow.
+                    if min_slot_us > self.phy.slot_period_us() {
+                        self.phy.align_slot_period(min_slot_us);
+                    }
+                }
+                _ => {}
             }
 
             // A healthy RX slot: form the connection + reset the streak.
@@ -436,6 +447,10 @@ impl<P: Phy> Central<P> {
 pub struct Peripheral<P: Phy> {
     phy: P,
     state: LinkState,
+    /// False until the central's beacon advertises a cadence >= our minimum
+    /// slot period. Until then this peripheral sends SlotRequest instead of
+    /// data in its TX slots, so a faster central can slow down.
+    cadence_ok: bool,
     missed_frames: u8,
     /// Last channel written to the phy (the phy is only re-tuned on change).
     last_channel: Option<u8>,
@@ -452,9 +467,11 @@ impl<P: Phy> Peripheral<P> {
     pub async fn new(mut phy: P, cfg: Config) -> Result<Self, Error<P::Error>> {
         phy.set_address(&cfg.address).await;
         phy.flush().await;
+        let cadence_ok = phy.min_slot_period_us() == 0;
         Ok(Self {
             phy,
             state: LinkState::new(&cfg),
+            cadence_ok,
             missed_frames: 0,
             last_channel: None,
             consecutive_misses: 0,
@@ -536,6 +553,8 @@ impl<P: Phy> Peripheral<P> {
                     if slot_us > 0 {
                         self.phy.align_slot_period(slot_us);
                     }
+                    let min = self.phy.min_slot_period_us();
+                    self.cadence_ok = min == 0 || slot_us >= min;
                     // The slot phase: our next slot mirrors the central's
                     // next (its TX/RX ratio decision), so our lone TX slot
                     // lands on its lone RX slot.
@@ -550,7 +569,16 @@ impl<P: Phy> Peripheral<P> {
             Ok(received)
         } else {
             // ---- the central's RX = our TX: the reverse Data ----
-            if let Some(data) = tx_payload {
+            let min_slot_us = self.phy.min_slot_period_us();
+            if !self.cadence_ok && min_slot_us > 0 {
+                // Until the central acknowledges a cadence we can follow,
+                // this slot carries our minimum period instead of data.
+                let outbound = Packet::SlotRequest { min_slot_us };
+                let n = outbound
+                    .to_bytes(&mut self.tx_buf)
+                    .map_err(Error::<P::Error>::from)?;
+                self.phy.transmit(&self.tx_buf[..n]).await?;
+            } else if let Some(data) = tx_payload {
                 let mut payload = Vec::<u8, MAX_PAYLOAD>::new();
                 if data.len() > payload.capacity() {
                     return Err(Error::BufferTooSmall);
@@ -567,9 +595,10 @@ impl<P: Phy> Peripheral<P> {
                 self.phy.transmit(&self.tx_buf[..n]).await?;
                 self.state.tx_seq = self.state.tx_seq.wrapping_add(1);
             } else {
-                // No payload: still pace this slot so the bare software slot
-                // grid stays time-aligned with the central (the MPSL chain
-                // already paces itself; its wait_slot is a no-op).
+                // No payload and the cadence is already agreed: still pace
+                // this slot so the bare software slot grid stays time-aligned
+                // (the MPSL chain already paces itself; its wait_slot is a
+                // no-op).
                 self.phy.wait_slot().await;
             }
             self.state.epoch = self.state.epoch.wrapping_add(1);
