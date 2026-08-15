@@ -92,7 +92,7 @@ async fn main(spawner: Spawner) {
     // 'static: the phy hands this pointer to the MPSL callback (ISR).
     static STATE: StaticCell<MpslState> = StaticCell::new();
     let state = STATE.init(MpslState::new(radio, cfg!(feature = "peripheral")));
-    let mut phy = MpslRadioPhy::<300, 250, 1200>::new(RadioMode::Nrf2Mbit, state);
+    let mut phy = MpslRadioPhy::<500, 400, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
     info!("MPSL ready");
