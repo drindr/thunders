@@ -104,9 +104,21 @@ run_all() {
   done
 }
 
+probe_check() {
+  echo "== probe check =="
+  local list
+  list="$(probe-rs list 2>&1 || true)"
+  echo "$list" | sed -n '1,12p'
+  if echo "$list" | grep -q "(inaccessible)"; then
+    echo "ERROR: some probes are still inaccessible." >&2
+    echo "Run '/flashdev add all' in this session (or re-plug the probes) and retry." >&2
+    return 1
+  fi
+}
+
 case "${1:-}" in
   build) build_all ;;
-  run) run_all "${2:-30}" ;;
-  run-pair) [ $# -ge 4 ] || { echo "usage: $0 run-pair C P BACKEND [SECS]"; exit 1; }; run_pair "$2" "$3" "$4" "${5:-30}" ;;
+  run) probe_check || exit 1; run_all "${2:-30}" ;;
+  run-pair) [ $# -ge 4 ] || { echo "usage: $0 run-pair C P BACKEND [SECS]"; exit 1; }; probe_check || exit 1; run_pair "$2" "$3" "$4" "${5:-30}" ;;
   *) echo "usage: $0 {build|run [SECS]|run-pair C P BACKEND [SECS]}"; exit 1 ;;
 esac
