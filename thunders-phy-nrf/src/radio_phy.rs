@@ -46,7 +46,7 @@ use nrf_pac::RADIO as PAC_RADIO;
 use nrf_pac::RADIO_NS as PAC_RADIO;
 #[cfg(feature = "_nrf54")]
 use nrf_pac::RADIO_S as PAC_RADIO;
-use thunders::{config::Address, error::Error, phy::Phy};
+use thunders::{config::Address, config::Role, error::Error, phy::Phy};
 
 /// RADIO mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -554,6 +554,23 @@ impl<'d> NrfRadioPhy<'d> {
             peer_rx_window_us: 0,
             addr_poll_us: 0,
         }
+    }
+
+    /// Enable the bare software slot scheduler with a [`Role`].
+    ///
+    /// The peripheral sweeps for the central's grid and phase-locks once
+    /// frames are caught; the central free-runs on the same fixed period
+    /// and advertises it in its beacons. This is the type-safe, ergonomic
+    /// entry point; [`set_paced`](Self::set_paced) is kept for
+    /// compatibility with the bool form.
+    pub fn set_paced_role(&mut self, role: Role) {
+        self.set_paced(matches!(role, Role::Peripheral));
+    }
+
+    /// Consuming builder form of [`set_paced_role`](Self::set_paced_role).
+    pub fn with_slot_pacing(mut self, role: Role) -> Self {
+        self.set_paced_role(role);
+        self
     }
 
     /// Enable the bare software slot scheduler.

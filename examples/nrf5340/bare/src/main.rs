@@ -78,7 +78,7 @@ async fn main(_spawner: Spawner) {
     }
 
     let mut phy = NrfRadioPhy::new(p.RADIO, Irqs, RadioMode::Nrf2Mbit);
-    phy.set_paced(cfg!(feature = "peripheral"));
+    phy.set_paced_role(role);
     let cfg = Config::new(
         [0xAB, 0xCD, 0xEF, 0x01],
         Address([0xE7, 0xE7, 0xE7, 0xE7, 0xE7]),
