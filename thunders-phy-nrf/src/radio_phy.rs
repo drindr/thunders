@@ -111,10 +111,16 @@ pub const BARE_RX_ADDR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US + 28;
 /// into the TXEN delay.
 pub const BARE_TX_RAMP_US: u32 = 40;
 
+/// The on-air start target for a paced TX slot, relative to the slot start.
+/// All central TX slots (burst-begin, burst-send, and the nRF54 plain-TX
+/// fallback) are aligned to this offset so the follower's PLL sees the same
+/// phase for every slot, not just the first slot of a burst.
+pub const BARE_TX_ON_AIR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US;
+
 /// The follower's acquisition sweep walks the grid by +2 us per slot. The
 /// initial sweep starts immediately; after the first catch the follower
 /// re-enables it only after this many consecutive misses.
-pub const BARE_SLOT_RESWEEP_MISSES: u32 = 500;
+pub const BARE_SLOT_RESWEEP_MISSES: u32 = 20_000;
 /// The sweep offset added to the slot period while sweeping.
 pub const BARE_SLOT_SWEEP_US: u32 = 2;
 
@@ -193,6 +199,23 @@ pub static RX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 pub static RX_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Last RSSI sample from the RADIO RSSISAMPLE register (RX diag).
 pub static RX_RSSI: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Bare scheduler diagnostics (read from the app context).
+pub static BARE_ADDR_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_RX_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_SWEEP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_PEER_WINDOW_US: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static BARE_EFFECTIVE_PERIOD_US: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static BARE_TX_ON_AIR_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_TX_AIR_MIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+pub static BARE_TX_AIR_MAX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_RX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_TX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_ADDR_SLOT_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_ADDR_EVENTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BARE_PLL_CORR_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Main-loop time outside the frame (the between-frame overhead; diagnostic).
 pub static LOOP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static RXOK_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -519,6 +542,7 @@ impl<'d> NrfRadioPhy<'d> {
                 }
                 self.slot_start_cyc = now;
                 let period_us = self.effective_period_us();
+                BARE_EFFECTIVE_PERIOD_US.store(period_us, core::sync::atomic::Ordering::Relaxed);
                 self.next_slot_cyc = Some(next.wrapping_add(period_us * CPU_MHZ));
             }
             None => {
@@ -548,12 +572,20 @@ impl<'d> NrfRadioPhy<'d> {
         while ((dwt_cycles().wrapping_sub(target)) as i32) < 0 {}
     }
 
+    fn track_tx_air(us: u32) {
+        BARE_TX_ON_AIR_US.store(us, core::sync::atomic::Ordering::Relaxed);
+        BARE_TX_AIR_MIN.fetch_min(us, core::sync::atomic::Ordering::Relaxed);
+        BARE_TX_AIR_MAX.fetch_max(us, core::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Apply a one-shot phase step to the next slot's scheduled start.
     fn nudge_next_slot(&mut self, corr_us: i32) {
         let Some(next) = self.next_slot_cyc else {
             return;
         };
-        let corr = corr_us.clamp(-BARE_SLOT_CORR_CLAMP_US, BARE_SLOT_CORR_CLAMP_US);
+        let corr = (corr_us * BARE_SLOT_GAIN_NUM / BARE_SLOT_GAIN_DEN)
+            .clamp(-BARE_SLOT_CORR_CLAMP_US, BARE_SLOT_CORR_CLAMP_US);
+        BARE_PLL_CORR_US.store(corr as u32, core::sync::atomic::Ordering::Relaxed);
         let corr_cyc = corr as i64 * CPU_MHZ as i64;
         self.next_slot_cyc = Some(if corr_cyc >= 0 {
             next.wrapping_add(corr_cyc as u32)
@@ -725,24 +757,25 @@ impl<'d> NrfRadioPhy<'d> {
         self.r.events_end().write_value(0);
         let c2 = dwt_cycles();
 
-        // The follower's echo placement: with both grids phase-locked, the
-        // peripheral's TX slot starts together with the central's RX slot
-        // (the PLL's on-air target makes the central's TX offset equal to
-        // this PHY's TX offset when the chips have the same timing). Delay
-        // TXEN so the echo's on-air time is centered in the central's
-        // advertised RX window instead of starting at the window's left
-        // edge (or before it on a slower peer).
-        if self.paced && self.follower && self.peer_rx_window_us > 0 {
-            let air = 28 + 4 * (pkt.len() as u32 + 3);
-            let target_on_air = BARE_RX_OFFSET_US + self.peer_rx_window_us.saturating_sub(air) / 2;
-            let desired_txen = target_on_air.saturating_sub(BARE_TX_RAMP_US);
-            let txen_elapsed = c2.wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
-            if desired_txen > txen_elapsed {
-                let wait = desired_txen - txen_elapsed;
-                let start = dwt_cycles();
-                while (dwt_cycles().wrapping_sub(start)) / CPU_MHZ < wait {}
+        // Align the TX on-air start within the slot:
+        // - the follower delays its echo into the central's advertised RX
+        //   window (centered, not at the left edge);
+        // - the central aligns every plain-TX slot to the same on-air
+        //   offset so the follower's PLL sees one phase.
+        if self.paced {
+            if self.follower && self.peer_rx_window_us > 0 {
+                let air = 28 + 4 * (pkt.len() as u32 + 3);
+                let target_on_air =
+                    BARE_RX_OFFSET_US + self.peer_rx_window_us.saturating_sub(air) / 2;
+                self.wait_until_slot_offset_us(target_on_air.saturating_sub(BARE_TX_RAMP_US));
+            } else if !self.follower {
+                self.wait_until_slot_offset_us(
+                    BARE_TX_ON_AIR_TARGET_US.saturating_sub(BARE_TX_RAMP_US),
+                );
             }
         }
+        let txen_elapsed = dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
+        Self::track_tx_air(txen_elapsed + BARE_TX_RAMP_US);
         self.r.tasks_txen().write_value(1);
 
         // Poll for completion (interrupt-driven waits are unreliable here).
@@ -784,6 +817,10 @@ impl<'d> NrfRadioPhy<'d> {
         // The END_DISABLE short already ramps the radio down; skip the
         // explicit disable() wait here (the next op's disable() is
         // state-aware and returns instantly when Disabled).
+        BARE_TX_OP_US.store(
+            dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -813,8 +850,21 @@ impl<'d> NrfRadioPhy<'d> {
             // No end_disable: the radio stays warm (TXIDLE) after the END.
         });
         self.r.events_end().write_value(0);
+        if self.paced {
+            // The first slot of a burst pays the TXEN ramp; TXEN must be
+            // early enough for the on-air start to land on the shared offset.
+            self.wait_until_slot_offset_us(
+                BARE_TX_ON_AIR_TARGET_US.saturating_sub(BARE_TX_RAMP_US),
+            );
+        }
+        let txen_elapsed = dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
+        Self::track_tx_air(txen_elapsed + BARE_TX_RAMP_US);
         self.r.tasks_txen().write_value(1);
         self.poll_tx_end();
+        BARE_TX_OP_US.store(
+            dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -833,8 +883,19 @@ impl<'d> NrfRadioPhy<'d> {
         compiler_fence(Ordering::Release);
         self.set_packet_ptr(tx_buf.as_ptr());
         self.r.events_end().write_value(0);
+        if self.paced {
+            // The radio is already ramped (TXIDLE): on-air follows START
+            // almost immediately, so START goes at the shared on-air offset.
+            self.wait_until_slot_offset_us(BARE_TX_ON_AIR_TARGET_US);
+        }
+        let start_elapsed = dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
+        Self::track_tx_air(start_elapsed);
         self.r.tasks_start().write_value(1);
         self.poll_tx_end();
+        BARE_TX_OP_US.store(
+            dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -963,6 +1024,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
             if !addr_seen && self.r.events_address().read() != 0 {
                 addr_seen = true;
                 addr_us = dwt_cycles().wrapping_sub(t0) / CPU_MHZ;
+                BARE_ADDR_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             elapsed = dwt_cycles().wrapping_sub(t0);
             if elapsed >= if addr_seen { hard_cyc } else { listen_cyc } {
@@ -984,14 +1046,17 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         // The follower's software PLL: correct on the address anchor (a
         // fixed 28 us after the on-air start) regardless of the decode
         // outcome - the MPSL lesson from the 5340 applies here too.
+        if addr_seen {
+            self.addr_poll_us = addr_us;
+        }
         if self.paced {
             if self.follower {
                 if addr_seen {
                     self.rx_misses = 0;
                     self.sweep = false;
-                    self.addr_poll_us = addr_us;
                     let setup_us = t_rx.wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
                     let addr_from_slot = setup_us + addr_us;
+                    BARE_ADDR_SLOT_US.store(addr_from_slot, core::sync::atomic::Ordering::Relaxed);
                     let err = addr_from_slot as i32 - BARE_RX_ADDR_TARGET_US as i32;
                     self.nudge_next_slot(err);
                 } else {
@@ -1009,6 +1074,13 @@ impl<'d> Phy for NrfRadioPhy<'d> {
                 // follower can place its echo (the flags beacon field).
                 self.rx_window_us = elapsed_us;
             }
+            BARE_ADDR_POLL_US.store(self.addr_poll_us, core::sync::atomic::Ordering::Relaxed);
+            BARE_RX_MISSES.store(self.rx_misses, core::sync::atomic::Ordering::Relaxed);
+            BARE_SWEEP.store(self.sweep as u32, core::sync::atomic::Ordering::Relaxed);
+            BARE_PEER_WINDOW_US.store(
+                self.peer_rx_window_us,
+                core::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         if got_end {
@@ -1025,6 +1097,10 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         }
         if !got_end || !crc_ok {
             self.disable();
+            BARE_RX_OP_US.store(
+                dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ,
+                core::sync::atomic::Ordering::Relaxed,
+            );
             return Ok(None);
         }
 
@@ -1039,11 +1115,23 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         }
         if payload_len == 0 || payload_len > buf.len() {
             self.disable();
+            BARE_RX_OP_US.store(
+                dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ,
+                core::sync::atomic::Ordering::Relaxed,
+            );
             return Err(Error::BufferTooSmall);
         }
         buf[..payload_len].copy_from_slice(&rx_buf[1..1 + payload_len]);
         self.disable();
+        BARE_RX_OP_US.store(
+            dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         Ok(Some(payload_len))
+    }
+
+    async fn wait_slot(&mut self) {
+        self.slot_wait();
     }
 
     async fn flush(&mut self) {

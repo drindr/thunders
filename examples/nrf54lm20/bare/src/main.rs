@@ -181,13 +181,27 @@ async fn main(_spawner: Spawner) {
                 info!("BENCH P slots={} rx={} lost={} floss={}% rate={}/s busy={}us", frames, rx_ok, fwd_lost, floss, rate, avg_busy);
             }
             let rxst =
-                thunders_phy_nrf::radio_phy::RX_STATS.load(core::sync::atomic::Ordering::Relaxed);
+                thunders_phy_nrf::radio_phy::RX_STATS.swap(0, core::sync::atomic::Ordering::Relaxed);
             let rxp = thunders_phy_nrf::radio_phy::RX_POLL.load(core::sync::atomic::Ordering::Relaxed);
             let rxp_us = thunders_phy_nrf::radio_phy::RX_POLL_US.load(core::sync::atomic::Ordering::Relaxed);
             let rssi = thunders_phy_nrf::radio_phy::RX_RSSI.load(core::sync::atomic::Ordering::Relaxed);
+            let ba = thunders_phy_nrf::radio_phy::BARE_ADDR_POLL_US.load(core::sync::atomic::Ordering::Relaxed);
+            let bmis = thunders_phy_nrf::radio_phy::BARE_RX_MISSES.load(core::sync::atomic::Ordering::Relaxed);
+            let bsw = thunders_phy_nrf::radio_phy::BARE_SWEEP.load(core::sync::atomic::Ordering::Relaxed);
+            let bpw = thunders_phy_nrf::radio_phy::BARE_PEER_WINDOW_US.load(core::sync::atomic::Ordering::Relaxed);
+            let bper = thunders_phy_nrf::radio_phy::BARE_EFFECTIVE_PERIOD_US.load(core::sync::atomic::Ordering::Relaxed);
+            let txair = thunders_phy_nrf::radio_phy::BARE_TX_ON_AIR_US.load(core::sync::atomic::Ordering::Relaxed);
+            let txair_min = thunders_phy_nrf::radio_phy::BARE_TX_AIR_MIN.swap(u32::MAX, core::sync::atomic::Ordering::Relaxed);
+            let txair_max = thunders_phy_nrf::radio_phy::BARE_TX_AIR_MAX.swap(0, core::sync::atomic::Ordering::Relaxed);
+            let rx_op = thunders_phy_nrf::radio_phy::BARE_RX_OP_US.swap(0, core::sync::atomic::Ordering::Relaxed);
+            let tx_op = thunders_phy_nrf::radio_phy::BARE_TX_OP_US.swap(0, core::sync::atomic::Ordering::Relaxed);
+            let ba_slot = thunders_phy_nrf::radio_phy::BARE_ADDR_SLOT_US.load(core::sync::atomic::Ordering::Relaxed);
+            let baddr_ev = thunders_phy_nrf::radio_phy::BARE_ADDR_EVENTS.swap(0, core::sync::atomic::Ordering::Relaxed);
+            let bcorr = thunders_phy_nrf::radio_phy::BARE_PLL_CORR_US.load(core::sync::atomic::Ordering::Relaxed);
             let txp = thunders_phy_nrf::radio_phy::TX_POLL.load(core::sync::atomic::Ordering::Relaxed);
             let txs = thunders_phy_nrf::radio_phy::TX_STATS.load(core::sync::atomic::Ordering::Relaxed);
             info!("RADIO rxst={:#x} rxp={} rxp_us={} rssi={} txp={} txs={:#x}", rxst, rxp, rxp_us, rssi, txp, txs);
+            info!("BARE PLL addr_us={} addr_slot={} corr={} misses={} sweep={} peerw={} period={} txair={} txair_min={} txair_max={} rx_op={} tx_op={} addr_ev={}", ba, ba_slot, bcorr, bmis, bsw, bpw, bper, txair, txair_min, txair_max, rx_op, tx_op, baddr_ev);
             frames = 0;
             busy_total = 0;
             report_at = now;

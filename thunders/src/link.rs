@@ -566,6 +566,11 @@ impl<P: Phy> Peripheral<P> {
                     .map_err(Error::<P::Error>::from)?;
                 self.phy.transmit(&self.tx_buf[..n]).await?;
                 self.state.tx_seq = self.state.tx_seq.wrapping_add(1);
+            } else {
+                // No payload: still pace this slot so the bare software slot
+                // grid stays time-aligned with the central (the MPSL chain
+                // already paces itself; its wait_slot is a no-op).
+                self.phy.wait_slot().await;
             }
             self.state.epoch = self.state.epoch.wrapping_add(1);
             Ok(None)

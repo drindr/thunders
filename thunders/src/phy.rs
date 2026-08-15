@@ -61,6 +61,15 @@ pub trait Phy {
     /// Flush any stale RX/TX state.
     async fn flush(&mut self);
 
+    /// Wait for the next software slot boundary without a radio op.
+    ///
+    /// Backends with their own slot cadence (the MPSL timeslot chain) do
+    /// nothing: the slot is already paced by hardware. The bare backend uses
+    /// this to keep its software slot grid aligned on empty slots (e.g. the
+    /// peripheral's TX slot when it has no payload queued), so the follower's
+    /// RX grid does not drift one slot earlier per ratio period.
+    async fn wait_slot(&mut self) {}
+
     /// Transmit then immediately listen for a reply as one combined
     /// operation. The default is [`transmit`](Self::transmit) followed by
     /// [`receive`](Self::receive); a backend may override it to keep the
