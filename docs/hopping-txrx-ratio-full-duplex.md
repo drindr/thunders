@@ -1,10 +1,11 @@
 # Hopping + TX/RX Ratio + Protocol-Level Full-Duplex
 
 The thunders link runs the same slot protocol on **both** the bare RADIO and
-the MPSL timeslot backends. The slot is the phy's atomic op — **125 µs on the
-bare path** (the 8 kHz target), **500 µs on the MPSL** (its grant floor,
-~375-500 µs, is above 125 µs). The ratio, the hopping and the full-duplex are
-identical at each backend's slot rate.
+the MPSL timeslot backends. The slot is the phy's atomic op — **400 µs on the
+bare path** (the software-paced slot grid; see the bare scheduler note in
+section 6), **500 µs on the MPSL** (its grant floor, ~375-500 µs). The
+ratio, the hopping and the full-duplex are identical at each backend's slot
+rate.
 
 ## 1. The Slot Model
 
@@ -82,7 +83,9 @@ MIC, the CRC and the radio entirely.
   ~10-12 kHz one-way on the bare). The MPSL backend returns
   `Error::Unsupported` and the link falls back to the plain per-slot
   `transmit` — the same slot-aware frame, the slower path.
-- **RX**: the fixed 100 µs listen window (`PERIPHERAL_LISTEN_TIMEOUT_US`).
+- **RX**: the DWT-capped listen window passed by the link layer
+  (`CENTRAL_REPLY_TIMEOUT_US` / `PERIPHERAL_LISTEN_TIMEOUT_US`, 200 µs), and
+  the RX window opens at a fixed 30 µs offset from the slot start.
 - **Turnaround**: the TX↔RX switch pays one ramp per direction-switch
   (amortized across the burst run).
 - **CRC**: the radio's hardware CRC-16 (the `crcstatus` gate) — no software
@@ -119,9 +122,14 @@ frame's END event fires.
   bang-bang (which climbed the distance and limit-cycled).
 - **It lives in the phy** (`MpslRadioPhy::receive`), not the link layer: the
   phy self-aligns its own RX window, so `Central`/`Peripheral` stay
-  backend-agnostic (`Phy::adjust_period` remains an unused hook). The bare
-  RADIO backend needs none of this — it is one radio, TX and RX share a clock,
-  so there is no independent chain to align.
+  backend-agnostic (`Phy::adjust_period` remains an unused hook).
+- **The bare RADIO backend now has its own software twin** of this loop in
+  `NrfRadioPhy` (`set_paced`): both roles pace their slot starts to the same
+  400 µs grid, the follower sweeps for the central's phase and then
+  phase-locks on the RX address anchor. The bare path needs it for a
+  different reason than the MPSL: there is no timeslot chain, so the app
+  loop's natural per-slot time differs per chip and per slot type; the fixed
+  software grid is what makes the two free-running CPUs share one cadence.
 
 Crystal drift (ppm) walks `δ` out of the deadband between catches and the
 bang-bang pulls it back, so the loop re-centres continuously rather than

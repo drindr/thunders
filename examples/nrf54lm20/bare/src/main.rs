@@ -55,7 +55,8 @@ async fn main(_spawner: Spawner) {
 
     info!("thunders link role={:?}", role);
 
-    let phy = NrfRadioPhy::new(p.RADIO, Irqs, RadioMode::Nrf2Mbit);
+    let mut phy = NrfRadioPhy::new(p.RADIO, Irqs, RadioMode::Nrf2Mbit);
+    phy.set_paced(cfg!(feature = "peripheral"));
     let cfg = Config::new(
         [0xAB, 0xCD, 0xEF, 0x01],
         Address([0xE7, 0xE7, 0xE7, 0xE7, 0xE7]),
@@ -182,9 +183,10 @@ async fn main(_spawner: Spawner) {
             let rxst =
                 thunders_phy_nrf::radio_phy::RX_STATS.load(core::sync::atomic::Ordering::Relaxed);
             let rxp = thunders_phy_nrf::radio_phy::RX_POLL.load(core::sync::atomic::Ordering::Relaxed);
+            let rxp_us = thunders_phy_nrf::radio_phy::RX_POLL_US.load(core::sync::atomic::Ordering::Relaxed);
             let txp = thunders_phy_nrf::radio_phy::TX_POLL.load(core::sync::atomic::Ordering::Relaxed);
             let txs = thunders_phy_nrf::radio_phy::TX_STATS.load(core::sync::atomic::Ordering::Relaxed);
-            info!("RADIO rxst={:#x} rxp={} txp={} txs={:#x}", rxst, rxp, txp, txs);
+            info!("RADIO rxst={:#x} rxp={} rxp_us={} txp={} txs={:#x}", rxst, rxp, rxp_us, txp, txs);
             frames = 0;
             busy_total = 0;
             report_at = now;

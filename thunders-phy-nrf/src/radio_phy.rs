@@ -6,8 +6,8 @@ use core::marker::PhantomData;
 use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::Poll;
 
-use embassy_nrf::{peripherals, Peri};
 use embassy_nrf::interrupt::typelevel::{self, Binding, Handler, Interrupt};
+use embassy_nrf::{peripherals, Peri};
 
 /// nRF54L HFXO load-cap trim (call once at boot). The 32 MHz crystal's
 /// internal capacitors come from FICR.XOSC32MTRIM + the DK's 15 pF target;
@@ -31,23 +31,21 @@ pub fn hfxo_cap_trim() {
         (0x5012_071C as *mut u32).write_volatile(cap as u32); // OSCILLATORS.XO32M.CONFIG.INTCAP
     }
 }
-#[cfg(feature = "_nrf54")]
-use nrf_pac::radio::vals::{
-    Crcinc, Crcstatus, Endian, Len, Mode, Plen, Skipaddr, State, Txpower,
-};
+use embassy_sync::waitqueue::AtomicWaker;
+use embassy_time::Duration;
+use nrf_pac::radio::vals::S1incl;
 #[cfg(not(feature = "_nrf54"))]
 use nrf_pac::radio::vals::{
     Crcinc, Crcstatus, Endian, Len, Map, Mode, Plen, Skipaddr, State, Txpower,
 };
-use nrf_pac::radio::vals::S1incl;
+#[cfg(feature = "_nrf54")]
+use nrf_pac::radio::vals::{Crcinc, Crcstatus, Endian, Len, Mode, Plen, Skipaddr, State, Txpower};
+#[cfg(not(any(feature = "nrf5340-net", feature = "_nrf54")))]
+use nrf_pac::RADIO as PAC_RADIO;
 #[cfg(feature = "nrf5340-net")]
 use nrf_pac::RADIO_NS as PAC_RADIO;
 #[cfg(feature = "_nrf54")]
 use nrf_pac::RADIO_S as PAC_RADIO;
-#[cfg(not(any(feature = "nrf5340-net", feature = "_nrf54")))]
-use nrf_pac::RADIO as PAC_RADIO;
-use embassy_sync::waitqueue::AtomicWaker;
-use embassy_time::Duration;
 use thunders::{config::Address, error::Error, phy::Phy};
 
 /// RADIO mode.
@@ -78,6 +76,47 @@ pub enum RadioError {
 
 static WAKER: AtomicWaker = AtomicWaker::new();
 
+/// CPU frequency per chip family (the DWT cycle counter ticks at this rate).
+#[cfg(feature = "nrf5340-net")]
+const CPU_MHZ: u32 = 64;
+#[cfg(feature = "nrf52840")]
+const CPU_MHZ: u32 = 64;
+#[cfg(feature = "_nrf54")]
+const CPU_MHZ: u32 = 128;
+#[cfg(not(any(feature = "nrf5340-net", feature = "nrf52840", feature = "_nrf54")))]
+const CPU_MHZ: u32 = 64;
+
+/// The fixed slot period for the bare software slot scheduler (us). Both
+/// roles pace their slot starts to this grid; the beacon advertises it and
+/// the follower phase-locks to the central. It must be large enough for the
+/// slowest slot on the slowest chip (the RX poll + the setup/tail), with
+/// margin for crystal drift between catches.
+pub const BARE_SLOT_PERIOD_US: u32 = 400;
+
+/// The follower's RX window starts this many us after the slot start. It
+/// must be after the follower's RXEN ramp so the radio is listening before
+/// the frame starts, and before the central's on-air start (setup + ramp).
+pub const BARE_RX_OFFSET_US: u32 = 30;
+
+/// Where the follower expects the central's frame to be on air, relative to
+/// the follower's slot start. The address event is a fixed 28 us after the
+/// on-air start at 2 Mbps (16-bit preamble + 4-byte address), so the target
+/// address stamp is [`BARE_RX_ON_AIR_TARGET_US`] + 28.
+pub const BARE_RX_ON_AIR_TARGET_US: u32 = 50;
+pub const BARE_RX_ADDR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US + 28;
+
+/// The follower's acquisition sweep walks the grid by +2 us per slot. The
+/// initial sweep starts immediately; after the first catch the follower
+/// re-enables it only after this many consecutive misses.
+pub const BARE_SLOT_RESWEEP_MISSES: u32 = 500;
+pub const BARE_SLOT_SWEEP_US: u32 = 2;
+
+/// The follower's phase-lock gain and clamp (a one-shot phase step, the
+/// software twin of the MPSL PLL).
+pub const BARE_SLOT_GAIN_NUM: i32 = 1;
+pub const BARE_SLOT_GAIN_DEN: i32 = 4;
+pub const BARE_SLOT_CORR_CLAMP_US: i32 = 20;
+
 /// Interrupt handler for the custom RADIO driver.
 ///
 /// On nRF52/nRF53, binds to `RADIO`.  On nRF54, binds to `RADIO_0`.
@@ -105,6 +144,27 @@ impl Handler<typelevel::RADIO_0> for RadioIrqHandler {
 pub struct NrfRadioPhy<'d> {
     r: nrf_pac::radio::Radio,
     _irq: PhantomData<&'d ()>,
+    /// The bare software slot scheduler is enabled (the link path, not the
+    /// raw one-way TX bench).
+    paced: bool,
+    /// True on the peripheral: sweep + phase-lock to the central's grid.
+    follower: bool,
+    /// The slot grid period in us (the beacon advertises this).
+    period_us: u32,
+    /// Scheduled start of the next slot (DWT cycles).
+    next_slot_cyc: Option<u32>,
+    /// Actual start of the current slot (DWT cycles).
+    slot_start_cyc: u32,
+    /// Consecutive RX polls without an address match (the sweep trigger).
+    rx_misses: u32,
+    /// True while the follower is sweeping its grid for the first catch.
+    sweep: bool,
+    /// Our measured RX listen window (us), advertised in the beacon.
+    rx_window_us: u32,
+    /// The peer's advertised RX listen window (us); 0 = unknown.
+    peer_rx_window_us: u32,
+    /// Address-event stamp of the last RX poll (us from RXEN).
+    addr_poll_us: u32,
 }
 
 // Static packet buffers: the radio DMA must reach them. Stack-allocated
@@ -120,6 +180,8 @@ pub static TX_STATS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 pub static TX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Max RX poll iterations (diagnostics).
 pub static RX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Last RX poll duration in us (the DWT-capped listen window).
+pub static RX_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Main-loop time outside the frame (the between-frame overhead; diagnostic).
 pub static LOOP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static RXOK_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -131,6 +193,17 @@ pub static TX_PHASE_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::At
 #[inline(always)]
 fn dwt_cycles() -> u32 {
     unsafe { (0xE000_1004 as *mut u32).read_volatile() }
+}
+
+/// Enable the DWT cycle counter (the bare scheduler and the RX time cap use
+/// it; on the nRF53/nRF54 the DWT is not on by default).
+fn dwt_enable() {
+    unsafe {
+        let demcr = 0xE000_EDFC as *mut u32;
+        demcr.write_volatile(demcr.read_volatile() | 1 << 24); // TRCENA
+        let dwt_ctrl = 0xE000_1000 as *mut u32;
+        dwt_ctrl.write_volatile(dwt_ctrl.read_volatile() | 1); // CYCCNTENA
+    }
 }
 
 /// Cumulative RADIO STATE reads inside disable() (the disable latency proxy).
@@ -197,7 +270,10 @@ impl<'d> NrfRadioPhy<'d> {
             w.set_termlen(0);
         });
 
-        let balen = match mode { RadioMode::Ble1Mbit | RadioMode::Ble2Mbit => 3u8, _ => 4u8 };
+        let balen = match mode {
+            RadioMode::Ble1Mbit | RadioMode::Ble2Mbit => 3u8,
+            _ => 4u8,
+        };
         // Whitening disabled: Nordic ESB does not whiten, and keeping it off
         // removes any cross-generation whitening-algorithm mismatch.
         let whiteen = false;
@@ -229,9 +305,21 @@ impl<'d> NrfRadioPhy<'d> {
         typelevel::RADIO::unpend();
         unsafe { typelevel::RADIO::enable() };
 
+        dwt_enable();
+
         Self {
             r,
             _irq: PhantomData,
+            paced: false,
+            follower: false,
+            period_us: 0,
+            next_slot_cyc: None,
+            slot_start_cyc: 0,
+            rx_misses: 0,
+            sweep: false,
+            rx_window_us: 0,
+            peer_rx_window_us: 0,
+            addr_poll_us: 0,
         }
     }
 
@@ -267,9 +355,13 @@ impl<'d> NrfRadioPhy<'d> {
             }
             nrf_pac::POWER_S.tasks_constlat().write_value(1);
             // Errata 54L/49 workaround (first on-air payload bits): hidden radio reg.
-            unsafe { (0x5008C58C as *mut u32).write_volatile(1); }
+            unsafe {
+                (0x5008C58C as *mut u32).write_volatile(1);
+            }
             // Report PLL state via a scratch RAM word (readable post-run).
-            unsafe { (0x2007F000 as *mut u32).write_volatile(if ok { 0x504C4C4F } else { 0x504C4C58 }); }
+            unsafe {
+                (0x2007F000 as *mut u32).write_volatile(if ok { 0x504C4C4F } else { 0x504C4C58 });
+            }
         }
 
         let (mode_val, plen) = match mode {
@@ -315,7 +407,10 @@ impl<'d> NrfRadioPhy<'d> {
             w.set_termlen(0);
         });
 
-        let balen = match mode { RadioMode::Ble1Mbit | RadioMode::Ble2Mbit => 3u8, _ => 4u8 };
+        let balen = match mode {
+            RadioMode::Ble1Mbit | RadioMode::Ble2Mbit => 3u8,
+            _ => 4u8,
+        };
         // Whitening disabled: Nordic ESB does not whiten, and keeping it off
         // removes any cross-generation whitening-algorithm mismatch.
         let whiteen = false;
@@ -355,10 +450,120 @@ impl<'d> NrfRadioPhy<'d> {
         typelevel::RADIO_0::unpend();
         unsafe { typelevel::RADIO_0::enable() };
 
+        dwt_enable();
+
         Self {
             r,
             _irq: PhantomData,
+            paced: false,
+            follower: false,
+            period_us: 0,
+            next_slot_cyc: None,
+            slot_start_cyc: 0,
+            rx_misses: 0,
+            sweep: false,
+            rx_window_us: 0,
+            peer_rx_window_us: 0,
+            addr_poll_us: 0,
         }
+    }
+
+    /// Enable the bare software slot scheduler.
+    ///
+    /// `follower` is true on the peripheral: it sweeps for the central's
+    /// grid and phase-locks once frames are caught. The central free-runs
+    /// on the same fixed period and advertises it in its beacons.
+    pub fn set_paced(&mut self, follower: bool) {
+        self.paced = true;
+        self.follower = follower;
+        self.period_us = BARE_SLOT_PERIOD_US;
+        self.next_slot_cyc = None;
+        self.slot_start_cyc = 0;
+        self.rx_misses = 0;
+        self.sweep = follower;
+        self.rx_window_us = 0;
+        self.peer_rx_window_us = 0;
+        self.addr_poll_us = 0;
+        dwt_enable();
+    }
+
+    /// Busy-wait until the scheduled slot start and schedule the next slot.
+    ///
+    /// The grid is anchored to the first slot start; a slot that overruns
+    /// simply makes the next slot start late (it runs immediately), and the
+    /// following slots stay on the original phase.
+    #[inline(always)]
+    fn slot_wait(&mut self) {
+        if !self.paced {
+            return;
+        }
+        let mut now = dwt_cycles();
+        match self.next_slot_cyc {
+            Some(next) => {
+                while ((now.wrapping_sub(next)) as i32) < 0 {
+                    now = dwt_cycles();
+                }
+                self.slot_start_cyc = now;
+                let period_us = self.effective_period_us();
+                self.next_slot_cyc = Some(next.wrapping_add(period_us * CPU_MHZ));
+            }
+            None => {
+                self.slot_start_cyc = now;
+                self.next_slot_cyc = Some(now.wrapping_add(self.period_us * CPU_MHZ));
+            }
+        }
+    }
+
+    /// The current slot period, including the follower's acquisition sweep.
+    #[inline(always)]
+    fn effective_period_us(&self) -> u32 {
+        if self.follower && self.sweep {
+            self.period_us.saturating_add(BARE_SLOT_SWEEP_US)
+        } else {
+            self.period_us
+        }
+    }
+
+    /// Busy-wait until `us` microseconds after the current slot start.
+    #[inline(always)]
+    fn wait_until_slot_offset_us(&self, us: u32) {
+        if !self.paced {
+            return;
+        }
+        let target = self.slot_start_cyc.wrapping_add(us * CPU_MHZ);
+        while ((dwt_cycles().wrapping_sub(target)) as i32) < 0 {}
+    }
+
+    /// Apply a one-shot phase step to the next slot's scheduled start.
+    fn nudge_next_slot(&mut self, corr_us: i32) {
+        let Some(next) = self.next_slot_cyc else {
+            return;
+        };
+        let corr = corr_us.clamp(-BARE_SLOT_CORR_CLAMP_US, BARE_SLOT_CORR_CLAMP_US);
+        let corr_cyc = corr as i64 * CPU_MHZ as i64;
+        self.next_slot_cyc = Some(if corr_cyc >= 0 {
+            next.wrapping_add(corr_cyc as u32)
+        } else {
+            next.wrapping_sub((-corr_cyc) as u32)
+        });
+    }
+
+    /// Clear the RX END/PHYEND event (the cfg-specific event register).
+    #[inline(always)]
+    fn rx_end_clear(&self) {
+        #[cfg(not(feature = "_nrf54"))]
+        self.r.events_end().write_value(0);
+        #[cfg(feature = "_nrf54")]
+        self.r.events_phyend().write_value(0);
+    }
+
+    /// True while the RX END/PHYEND event is set.
+    #[inline(always)]
+    fn rx_end_set(&self) -> bool {
+        #[cfg(not(feature = "_nrf54"))]
+        return self.r.events_end().read() != 0;
+        #[cfg(feature = "_nrf54")]
+        return self.r.events_phyend().read() != 0;
     }
 
     /// Read current radio state.
@@ -475,13 +680,11 @@ impl<'d> NrfRadioPhy<'d> {
 
     /// Synchronous transmit - no await hop, no executor. Measures the raw
     /// radio TX rate (the async wrapper alone costs the executor hop).
-    pub fn transmit_blocking(
-        &mut self,
-        pkt: &[u8],
-    ) -> Result<(), Error<RadioError>> {
+    pub fn transmit_blocking(&mut self, pkt: &[u8]) -> Result<(), Error<RadioError>> {
         if pkt.len() > 255 - 1 {
             return Err(Error::Phy(RadioError::BufferTooLong));
         }
+        self.slot_wait();
         let c0 = dwt_cycles();
         self.disable();
         let c1 = dwt_cycles();
@@ -497,7 +700,6 @@ impl<'d> NrfRadioPhy<'d> {
 
         compiler_fence(Ordering::Release);
         self.set_packet_ptr(tx_buf.as_ptr());
-
 
         // Shortcuts: ramp-up TX then start packet automatically; disable at END.
         #[cfg(not(feature = "_nrf54"))]
@@ -559,15 +761,13 @@ impl<'d> NrfRadioPhy<'d> {
     /// The nRF54L burst is not implemented (its SHORTS auto-disable and the
     /// per-packet PLL/TXD.AMOUNT differ) - return Unsupported so the link
     /// falls back to the plain per-packet transmit.
-    pub fn transmit_burst_begin(
-        &mut self,
-        pkt: &[u8],
-    ) -> Result<(), Error<RadioError>> {
+    pub fn transmit_burst_begin(&mut self, pkt: &[u8]) -> Result<(), Error<RadioError>> {
         #[cfg(feature = "_nrf54")]
         return Err(Error::Unsupported);
         if pkt.len() > 255 - 1 {
             return Err(Error::Phy(RadioError::BufferTooLong));
         }
+        self.slot_wait();
         self.disable();
         let tx_buf = unsafe { &mut TX_BUF };
         tx_buf[0] = pkt.len() as u8;
@@ -587,15 +787,13 @@ impl<'d> NrfRadioPhy<'d> {
 
     /// Send the next packet in a burst: the radio is already ramped, so only
     /// the packetptr + the START - no TXEN, no ramp (the ~on-air time).
-    pub fn transmit_burst_send(
-        &mut self,
-        pkt: &[u8],
-    ) -> Result<(), Error<RadioError>> {
+    pub fn transmit_burst_send(&mut self, pkt: &[u8]) -> Result<(), Error<RadioError>> {
         #[cfg(feature = "_nrf54")]
         return Err(Error::Unsupported);
         if pkt.len() > 255 - 1 {
             return Err(Error::Phy(RadioError::BufferTooLong));
         }
+        self.slot_wait();
         let tx_buf = unsafe { &mut TX_BUF };
         tx_buf[0] = pkt.len() as u8;
         tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
@@ -662,10 +860,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         self.write_address(addr);
     }
 
-    async fn transmit(
-        &mut self,
-        pkt: &[u8],
-    ) -> Result<(), Error<RadioError>> {
+    async fn transmit(&mut self, pkt: &[u8]) -> Result<(), Error<RadioError>> {
         // The body is fully synchronous (busy-polls, no awaits) - route
         // through the blocking twin so both paths share one implementation.
         self.transmit_blocking(pkt)
@@ -676,6 +871,8 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         buf: &mut [u8],
         timeout: Duration,
     ) -> Result<Option<usize>, Error<RadioError>> {
+        self.slot_wait();
+
         // nRF54: the radio auto-disables via the PHYEND_DISABLE short; skip the
         // explicit disable before RX (verified: explicit disable broke RX).
         #[cfg(not(feature = "_nrf54"))]
@@ -699,62 +896,88 @@ impl<'d> Phy for NrfRadioPhy<'d> {
 
         self.r.events_ready().write_value(0);
         self.r.events_phyend().write_value(0);
+        self.r.events_address().write_value(0);
+        self.r.events_end().write_value(0);
+
+        // Start the RX window at a fixed offset from the slot start. Both
+        // roles transmit at their slot start (plus the TX ramp), so the
+        // peer's frame falls inside this window when the grids are aligned.
+        self.wait_until_slot_offset_us(BARE_RX_OFFSET_US);
+
+        // The DWT-capped RX poll: the old iteration-count cap made the
+        // 100 us listen budget last ~400 us on the 5340 net core (the two
+        // chips' loops then free-ran at different rates). The hard cap lets
+        // an in-flight frame finish even when it started near the end of
+        // the listen budget (the same policy as the MPSL poll).
+        let timeout_us = timeout.as_micros() as u32;
+        let listen_cyc = timeout_us * CPU_MHZ;
+        let hard_cyc = listen_cyc.saturating_add(80 * CPU_MHZ);
+        let t_rx = dwt_cycles();
         self.r.tasks_rxen().write_value(1);
 
-
-
-        #[cfg(not(feature = "_nrf54"))]
-        let result: Result<(), embassy_time::TimeoutError> = {
-            // The net core's time driver does not tick here, so bound the
-            // poll by raw iteration count (the nRF54 path does the same).
-            let limit = (timeout.as_micros() as u64 * 12).min(4_000_000) as u32;
-            let mut t = 0u32;
-            while self.r.events_end().read() == 0 {
-                t += 1;
-                if t > limit {
-                    break;
-                }
+        let t0 = t_rx;
+        let mut t = 0u32;
+        let mut got_end = false;
+        let mut addr_seen = false;
+        let mut addr_us = 0u32;
+        let mut elapsed = 0u32;
+        loop {
+            if self.rx_end_set() {
+                got_end = true;
+                break;
             }
-            RX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
-            if t < limit {
-                self.r.events_end().write_value(0);
-                RX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            } else {
-                RX_STATS.fetch_or(8, core::sync::atomic::Ordering::Relaxed);
-                Err(embassy_time::TimeoutError)
+            t += 1;
+            if !addr_seen && self.r.events_address().read() != 0 {
+                addr_seen = true;
+                addr_us = dwt_cycles().wrapping_sub(t0) / CPU_MHZ;
             }
-        };
-        #[cfg(feature = "_nrf54")]
-        let result: Result<(), embassy_time::TimeoutError> = {
-            // Busy-poll PHYEND (matches the verified working raw sequence),
-            // bounded by the caller's timeout (~40 iterations/us at 128 MHz).
-            let limit = (timeout.as_micros() as u64 * 12).min(4_000_000) as u32;
-            let mut t = 0u32;
-            while self.r.events_phyend().read() == 0 {
-                t += 1;
-                if t > limit {
-                    break;
-                }
+            elapsed = dwt_cycles().wrapping_sub(t0);
+            if elapsed >= if addr_seen { hard_cyc } else { listen_cyc } {
+                break;
             }
-            RX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
-            if t < limit {
-                self.r.events_phyend().write_value(0);
-                RX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            } else {
-                RX_STATS.fetch_or(8, core::sync::atomic::Ordering::Relaxed);
-                Err(embassy_time::TimeoutError)
-            }
-        };
-
-        if result.is_err() {
-            // Timeout: stop and return None.
-            self.disable();
-            return Ok(None);
         }
+        let elapsed_us = elapsed / CPU_MHZ;
+        RX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
+        RX_POLL_US.store(elapsed_us, core::sync::atomic::Ordering::Relaxed);
+        self.rx_end_clear();
 
         compiler_fence(Ordering::Acquire);
+
+        // The follower's software PLL: correct on the address anchor (a
+        // fixed 28 us after the on-air start) regardless of the decode
+        // outcome - the MPSL lesson from the 5340 applies here too.
+        if self.paced {
+            if self.follower {
+                if addr_seen {
+                    self.rx_misses = 0;
+                    self.sweep = false;
+                    self.addr_poll_us = addr_us;
+                    let setup_us = t_rx.wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
+                    let addr_from_slot = setup_us + addr_us;
+                    let err = addr_from_slot as i32 - BARE_RX_ADDR_TARGET_US as i32;
+                    self.nudge_next_slot(err);
+                } else {
+                    self.rx_misses = self.rx_misses.saturating_add(1);
+                    // Re-enable the sweep if the phase is truly lost. The
+                    // first sweep starts in set_paced; this covers a lost
+                    // link.
+                    if self.rx_misses >= BARE_SLOT_RESWEEP_MISSES {
+                        self.sweep = true;
+                    }
+                    self.rx_window_us = elapsed_us;
+                }
+            } else if !addr_seen {
+                // The central advertises its measured listen window so the
+                // follower can place its echo (the flags beacon field).
+                self.rx_window_us = elapsed_us;
+            }
+        }
+
+        if got_end {
+            RX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            RX_STATS.fetch_or(8, core::sync::atomic::Ordering::Relaxed);
+        }
 
         let crc_ok = self.r.crcstatus().read().crcstatus() == Crcstatus::CrcOk;
         if crc_ok {
@@ -762,7 +985,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         } else {
             RX_STATS.fetch_or(4, core::sync::atomic::Ordering::Relaxed);
         }
-        if !crc_ok {
+        if !got_end || !crc_ok {
             self.disable();
             return Ok(None);
         }
@@ -793,9 +1016,37 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         self.r.events_ready().write_value(0);
         self.r.events_address().write_value(0);
         self.r.events_payload().write_value(0);
+        // Reset the software slot grid so the first frame starts immediately.
+        self.next_slot_cyc = None;
         // nRF54 requires explicit PLL enable before TX/RX.
         #[cfg(feature = "_nrf54")]
         self.pll_enable();
+    }
+
+    fn rx_window_us(&self) -> u16 {
+        if self.paced {
+            self.rx_window_us.min(u16::MAX as u32) as u16
+        } else {
+            0
+        }
+    }
+
+    fn set_peer_rx_window(&mut self, us: u16) {
+        self.peer_rx_window_us = us as u32;
+    }
+
+    fn slot_period_us(&self) -> u16 {
+        if self.paced {
+            self.period_us.min(u16::MAX as u32) as u16
+        } else {
+            0
+        }
+    }
+
+    fn align_slot_period(&mut self, us: u16) {
+        if self.paced && us > 0 {
+            self.period_us = us as u32;
+        }
     }
 
     fn transmit_burst_begin(&mut self, pkt: &[u8]) -> Result<(), Error<Self::Error>> {
@@ -843,8 +1094,11 @@ impl<'d> NrfRadioPhy<'d> {
         // The scratch must hold (16 + MAXPACKETSIZE) bytes when MODE.LENGTH
         // is Extended (the keystream + the AES state); MAXPACKETSIZE resets
         // to 251.
-        static mut CCM_CNF: CcmCnf =
-            CcmCnf { key: [0; 16], pktctr: [0; 9], iv: [0; 8] };
+        static mut CCM_CNF: CcmCnf = CcmCnf {
+            key: [0; 16],
+            pktctr: [0; 9],
+            iv: [0; 8],
+        };
         static mut CCM_SCRATCH: [u8; 267] = [0; 267];
         // The EasyDMA packet: [HEADER(S0) | LENGTH | RFU | payload | MIC].
         static mut CCM_BUF: [u8; 3 + 40] = [0; 3 + 40];
@@ -867,9 +1121,9 @@ impl<'d> NrfRadioPhy<'d> {
         let buf = unsafe { &mut CCM_BUF };
         let len = payload.len();
         buf[0] = 0; // the S0 header
-        // The LENGTH byte is the packet length the CCM processes: the
-        // plaintext alone on encrypt (the hardware appends the 4-byte MIC),
-        // the ciphertext + MIC on decrypt (the hardware strips the MIC).
+                    // The LENGTH byte is the packet length the CCM processes: the
+                    // plaintext alone on encrypt (the hardware appends the 4-byte MIC),
+                    // the ciphertext + MIC on decrypt (the hardware strips the MIC).
         buf[1] = if encrypt { len } else { len + 4 } as u8;
         buf[2] = 0; // the RFU
         buf[3..3 + len].copy_from_slice(payload);
@@ -907,7 +1161,8 @@ impl<'d> NrfRadioPhy<'d> {
         ccm.inptr().write_value(buf.as_ptr() as u32);
         let out = unsafe { &mut CCM_OUT };
         ccm.outptr().write_value(out.as_ptr() as u32);
-        ccm.scratchptr().write_value(unsafe { CCM_SCRATCH.as_ptr() } as u32);
+        ccm.scratchptr()
+            .write_value(unsafe { CCM_SCRATCH.as_ptr() } as u32);
 
         ccm.events_endksgen().write_value(0);
         ccm.tasks_ksgen().write_value(1);

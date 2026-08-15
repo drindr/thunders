@@ -16,12 +16,13 @@ pub const FRAME_DURATION_US: u32 = 1000;
 
 /// Max time the central waits for a peripheral reply within a frame.
 // The slot model: the RX window is one slot. The reply is expected at the
-// aligned RX slot's start, so the poll only needs to cover the peer's
-// turnaround + the on-air frame, not the free-running drift.
-pub const CENTRAL_REPLY_TIMEOUT_US: u64 = 100;
+// aligned RX slot's start; the window covers the peer's TX ramp + the
+// on-air frame + jitter, inside the bare slot period (400 us). The MPSL phy
+// ignores this timeout (it sizes its poll from the timeslot grant).
+pub const CENTRAL_REPLY_TIMEOUT_US: u64 = 200;
 
 /// Max time the peripheral listens for the central beacon/data.
-pub const PERIPHERAL_LISTEN_TIMEOUT_US: u64 = 100;
+pub const PERIPHERAL_LISTEN_TIMEOUT_US: u64 = 200;
 
 /// Number of retransmissions before a frame is declared lost.
 pub const MAX_RETRIES: u8 = 3;

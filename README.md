@@ -40,9 +40,11 @@ fetch-latency, the NVIC enables) live in `thunders-phy-nrf`.
 
 ## The protocol (see `docs/hopping-txrx-ratio-full-duplex.md`)
 
-- **The slot model** — the 125 µs slot on the bare (the 8 kHz target), the
-  500 µs slot on the MPSL (its grant floor). `Central::frame` /
-  `Peripheral::frame` run one slot each, the TX/RX type from the ratio.
+- **The slot model** — the **software-paced 400 µs slot** on the bare path
+  (the bare PHY's slot scheduler makes every slot start equidistant, so the
+  two boards share one cadence) and the 500 µs slot on the MPSL (its grant
+  floor). `Central::frame` / `Peripheral::frame` run one slot each, the
+  TX/RX type from the ratio.
 - **The TX:RX ratio** — `Config::with_tx_rx_ratio(tx, rx)`. The central runs
   `tx` TX slots then `rx` RX slots; the peripheral mirrors.
 - **The hopping** — beacon-driven: the central advances the 25-channel
@@ -132,7 +134,7 @@ connection-forming warmup):
 
 | metric | who | how |
 |---|---|---|
-| **RTT** (latency) | central | PING TX slot → echo RX slot (`rtt_avg/min/max`). The peripheral echoes the last PING of each 8-slot TX run, so RTT ≈ 1 slot period (500 µs mpsl / 125 µs bare) + processing. |
+| **RTT** (latency) | central | PING TX slot → echo RX slot (`rtt_avg/min/max`). The peripheral echoes the last PING of each 8-slot TX run, so RTT ≈ 1 slot period (500 µs mpsl / 400 µs bare) + processing. |
 | **bandwidth** | central | `bw` = payload bytes/s both ways (8 B per PING + 8 B per echo). `rate` = the slot rate. |
 | **forward loss** | peripheral | `floss` = seq gaps / expected — the central→peripheral leg. The PING seq is a per-PING counter, so structural gaps (beacons, ratio skips) are excluded; gaps ≥ 1 M seqs are peer restarts, not loss. |
 | **reverse loss** | central | `rloss` = RX slots with no echo — the peripheral→central leg. |
@@ -174,16 +176,24 @@ each way, RTT ≈ 633-644 µs, bandwidth ≈ 15.7 kB/s payload.
 | 5340 → LM20 | mpsl | 13% | 13% | 644 µs | 15.7 kB/s |
 
 Everything else is 97-100 % loss:
-- **bare, all pairs** — the two free-running slot loops run at different
-  rates per chip (6.5 kHz vs 2.5 kHz) and the bare path has no cadence
-  lock; the beacon phase-mirror only corrects phase, and is itself missed
-  while misaligned.
+- **bare, all pairs** — at the time of this matrix the two free-running slot
+  loops ran at different rates per chip (6.5 kHz vs 2.5 kHz) and the bare
+  path had no cadence lock; the beacon phase-mirror only corrected phase,
+  and was itself missed while misaligned.
 - **mpsl, 5340/52840 as peripheral** — the 5340 net core receives the
   frames (thousands of ADDRESS events) but decodes only ~10 % (CRC
   failures); the LM20 decodes ~84 %.
 - **mpsl, LM20 as central** — the LM20's TX never reaches the peers
   (addr = 0) and its RX gets nothing back; the 5340 peripheral also hangs
   (starved executor) in one run.
+
+> After this matrix the bare path gained a **software slot scheduler**
+> (`NrfRadioPhy::set_paced`, `BARE_SLOT_PERIOD_US`): both roles pace their
+> slot starts to the same 400 µs grid, the follower sweeps for the central's
+> phase and then phase-locks on the RX address anchor, and the RX poll is
+> DWT-capped so a 100-200 µs listen budget is chip-independent. The next
+> bench run needs to re-measure the bare rows with this scheduler; the table
+> above is the pre-scheduler baseline.
 
 The old table (pre-ratio architecture, measured before the slot-alignment
 work) is history — the current firmware's matrix is above; the per-window
