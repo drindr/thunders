@@ -190,6 +190,10 @@ pub struct NrfRadioPhy<'d> {
     peer_rx_window_us: u32,
     /// Address-event stamp of the last RX poll (us from RXEN).
     addr_poll_us: u32,
+    /// Last forward-catch address event measured from the slot start (us).
+    /// Used by the follower's echo placement so the echo lands in the
+    /// central's RX window even when the forward PLL holds a non-zero phase.
+    last_addr_slot_us: u32,
 }
 
 // Static packet buffers: the radio DMA must reach them. Stack-allocated
@@ -418,6 +422,7 @@ impl<'d> NrfRadioPhy<'d> {
             rx_window_us: 0,
             peer_rx_window_us: 0,
             addr_poll_us: 0,
+            last_addr_slot_us: 0,
         }
     }
 
@@ -563,6 +568,7 @@ impl<'d> NrfRadioPhy<'d> {
             rx_window_us: 0,
             peer_rx_window_us: 0,
             addr_poll_us: 0,
+            last_addr_slot_us: 0,
         }
     }
 
@@ -600,6 +606,7 @@ impl<'d> NrfRadioPhy<'d> {
         self.rx_window_us = 0;
         self.peer_rx_window_us = 0;
         self.addr_poll_us = 0;
+        self.last_addr_slot_us = 0;
         dwt_enable();
     }
 
@@ -846,7 +853,20 @@ impl<'d> NrfRadioPhy<'d> {
                 let air = 28 + 4 * (pkt.len() as u32 + 3);
                 let target_on_air =
                     BARE_RX_OFFSET_US + self.peer_rx_window_us.saturating_sub(air) / 2;
-                self.wait_until_slot_offset_us(target_on_air.saturating_sub(BARE_TX_RAMP_US));
+                // The forward PLL may hold a non-zero phase (the nRF52/53
+                // follower target sits 156 us into its own window). Measure
+                // the central's frame on-air start from our slot start on
+                // the last forward catch and fold that phase into the echo
+                // TX delay, like the MPSL path.
+                let desired_txen = if self.last_addr_slot_us > 0 {
+                    let s = self.last_addr_slot_us as i32 - 28;
+                    let our_tx_on_air =
+                        target_on_air as i32 + s - BARE_TX_ON_AIR_TARGET_US as i32;
+                    (our_tx_on_air - BARE_TX_RAMP_US as i32).max(0) as u32
+                } else {
+                    target_on_air.saturating_sub(BARE_TX_RAMP_US)
+                };
+                self.wait_until_slot_offset_us(desired_txen);
             } else if !self.follower {
                 self.wait_until_slot_offset_us(
                     BARE_TX_ON_AIR_TARGET_US.saturating_sub(BARE_TX_RAMP_US),
@@ -1140,6 +1160,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
                     self.sweep = false;
                     let setup_us = t_rx.wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
                     let addr_from_slot = setup_us + addr_us;
+                    self.last_addr_slot_us = addr_from_slot;
                     BARE_ADDR_SLOT_US.store(addr_from_slot, core::sync::atomic::Ordering::Relaxed);
                     let err = addr_from_slot as i32 - BARE_RX_ADDR_TARGET_US as i32;
                     self.nudge_next_slot(err);
