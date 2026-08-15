@@ -2,7 +2,7 @@
 
 /// Consecutive failed frames before the adaptive hop advances the channel
 /// (transient misses stay put; persistent jamming hops away).
-const HOP_MISS_THRESHOLD: u8 = 4;
+const HOP_MISS_THRESHOLD: u8 = 16;
 
 /// Consecutive failed frames before the link is declared lost: the status
 /// drops back to `Disconnected` and the node returns to the initial channel,
