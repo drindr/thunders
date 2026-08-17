@@ -79,17 +79,40 @@ pub trait Phy {
     /// The peer's measured TX ramp, in us (0 = unknown).
     fn set_peer_tx_ramp(&mut self, _us: u8) {}
 
-    /// Stamp the absolute slot the next `transmit`/`receive` op is meant
-    /// for. Backends with a hardware slot counter (MPSL) execute a
-    /// published op only in that exact slot; a late publish idles the slot
-    /// instead of running the op one slot off its phase. Default no-op
-    /// (software-paced PHYs pace their own ops).
-    fn set_op_slot(&mut self, _slot: u32) {}
+    /// Pipelined-op API (backends with a hardware slot counter, i.e.
+    /// MPSL): the link publishes each slot's op ~2 slots ahead of its
+    /// target, so the publish deadline is the target slot's START (a
+    /// ~2.5-slot budget) instead of the previous op's completion (~200
+    /// us). `op_pipelined` selects the pipelined `frame` path; the
+    /// default `false` keeps the legacy synchronous transmit/receive
+    /// pacing (software-paced PHYs).
+    fn op_pipelined(&self) -> bool {
+        false
+    }
 
-    /// How many extra slots a TX op may execute late (the link stamps 1
-    /// for the first TX op of a run: one slot late it still faces a
-    /// listening peer). Only honored for TX ops. Default no-op.
-    fn set_op_grace(&mut self, _slots: u8) {}
+    /// Publish an RX op for absolute slot `target`; returns immediately.
+    /// The radio DMAs `[len | payload]` into `buf` when the op executes.
+    async fn op_publish_rx(&mut self, _buf: &mut [u8], _target: u32) {}
+
+    /// Publish a TX op for absolute slot `target`. `grace` allows the
+    /// first TX op of a run to execute one slot late (it still faces a
+    /// listening peer); any other late op idles its slot.
+    async fn op_publish_tx(
+        &mut self,
+        _pkt: &[u8],
+        _target: u32,
+        _grace: u8,
+    ) -> Result<(), Error<Self::Error>> {
+        Ok(())
+    }
+
+    /// Wait for the op published for absolute slot `slot` (if any) and
+    /// return its RX result: `Some(len)` on a catch, `None` for a TX op,
+    /// an idle slot, a skipped op, or an empty listen. This is also the
+    /// frame's slot pacing.
+    async fn op_collect(&mut self, _slot: u32) -> Option<usize> {
+        None
+    }
 
     /// Enable/disable the acquisition TX-delay sweep. Used by the peripheral
     /// while it is still sending SlotRequest and has not received Data yet.

@@ -20,6 +20,51 @@ pub enum OpKind {
     Rx = 2,
 }
 
+/// One published op in the parity ring: the app publishes ops ~2 slots
+/// ahead of their target (the publish deadline is no longer the previous
+/// op's completion but the target slot's START, ~2.5 slots of budget), so
+/// two ops can be pending at once - entry `target % 2` holds the op for
+/// `target`, and consecutive targets never alias.
+pub struct OpEntry {
+    pub(crate) kind: u8,
+    /// Publication stamp (per-entry; bumped on each publish, written LAST).
+    pub(crate) seq: u32,
+    /// The absolute slot_count this op must execute in.
+    pub(crate) target: u32,
+    /// Extra slots a TX op may execute late (the first TX of a run).
+    pub(crate) grace: u8,
+    /// The RX target buffer (the caller's slice; the radio writes into it).
+    pub(crate) rx_ptr: *mut u8,
+    pub(crate) rx_cap: usize,
+    /// The TX DMA buffer: [0] = len, [1..=len] = payload.
+    pub(crate) tx_buf: [u8; 64],
+    /// The last seq the callback consumed (executed or skipped).
+    pub(crate) done_seq: u32,
+    /// The consumption was a skip (late), not an execution.
+    pub(crate) skipped: bool,
+    /// RX result (valid once done_seq covers seq).
+    pub(crate) rx_ok: bool,
+    pub(crate) rx_result: usize,
+}
+
+impl OpEntry {
+    const fn new() -> Self {
+        Self {
+            kind: OpKind::Idle as u8,
+            seq: 0,
+            target: 0,
+            grace: 0,
+            rx_ptr: core::ptr::null_mut(),
+            rx_cap: 0,
+            tx_buf: [0u8; 64],
+            done_seq: 0,
+            skipped: false,
+            rx_ok: false,
+            rx_result: 0,
+        }
+    }
+}
+
 /// The radio's runtime state, shared with the interrupt callback.
 ///
 /// The slot schedule (the TX:RX ratio) is driven by the `thunders` link layer
@@ -59,12 +104,8 @@ pub struct MpslState {
     /// The peer's advertised RX listen window (us); 0 = unknown.
     pub(crate) peer_rx_window_us: u32,
 
-    // The current RX target (the caller's slice; the radio writes into it).
-    pub(crate) rx_buf: [u8; 64],
-    pub(crate) rx_ptr: *mut u8,
-    pub(crate) rx_cap: usize,
-    pub(crate) rx_result: usize,
-    pub(crate) rx_ok: bool,
+    // RX result diagnostics (the catch/CRC counters stay global: they
+    // describe the radio, not one op).
     /// CRC diagnostics: packets with a good/bad CRCSTATUS (the 5340 net core
     /// decodes ~5% of address-matched frames - these count it).
     pub(crate) crc_ok: u32,
@@ -89,42 +130,30 @@ pub struct MpslState {
     pub(crate) last_rx_in_flight: bool,
     pub(crate) last_rx_len: u32,
 
-    // The TX DMA buffer (filled by `Phy::transmit`).
-    pub(crate) tx_buf: [u8; 64],
-    /// TX DMA source override: when non-null the radio reads here instead
-    /// of `tx_buf` (RAM-region diagnostic).
-    pub tx_ptr: *const u8,
-    pub(crate) op_kind: u8,
-
-    // The op publication protocol (app -> callback). The app bumps op_seq
-    // on every transmit/receive and stamps the slot the op is meant for
-    // (set_op_slot). The callback consumes a published op ONLY in its
-    // target slot; a stale or late op idles the slot instead of executing
-    // one slot off its phase. The previous level-based op_kind re-ran the
-    // previous slot's op whenever the app published late, smearing TX/RX
-    // across phases (the LM20 pairs' dead reverse link).
-    pub(crate) op_seq: u32,
-    pub(crate) op_target_slot: u32,
-    /// Extra slots a TX op may execute late (stamped by the link). Only
-    /// the first TX slot of a run gets grace: one slot late it still
-    /// faces a listening peer (the peer's RX run continues); any other
-    /// late op would execute against a peer that has moved on.
-    pub(crate) op_grace: u8,
-    /// The last op_seq the callback consumed (executed or skipped).
-    pub(crate) op_done_seq: u32,
-    /// True when the op_done_seq consumption was a skip (late), not an
-    /// execution: a skipped receive must report no-catch, not stale rx_ok.
-    pub(crate) op_skipped: bool,
+    // The op pipeline (app -> callback): a depth-2 parity ring. The app
+    // publishes each op ~2 slots ahead of its target slot; the callback
+    // consumes an entry only in its target slot (or one slot late for a
+    // grace TX). A late op idles the slot instead of running off-phase -
+    // the old level-based op_kind re-ran the previous slot's op whenever
+    // the app published late, smearing TX/RX across phases (the LM20
+    // pairs' dead reverse link).
+    pub(crate) ops: [OpEntry; 2],
     /// Ops skipped because their target slot had already passed at their
     /// START: the app-loop lateness counter.
     pub op_late: u32,
+    /// collect() return-path diagnostics (cumulative): no op published for
+    /// the slot / op already done when collected / catch / empty-or-skip.
+    pub coll_noop: u32,
+    pub coll_late: u32,
+    pub coll_catch: u32,
+    pub coll_empty: u32,
     /// TX ops that executed inside their grace slot (late but useful).
     pub op_grace_used: u32,
     /// DWT cycle count at the current slot's START (for publish latency).
     pub(crate) last_start_cyc: u32,
     /// Max op-publish delay since the last snapshot (us from slot START;
-    /// self-resetting). The app has from the previous op's completion to
-    /// the next START to publish; this shows how tight that budget is.
+    /// self-resetting). With the pipeline the app publishes ~2 slots
+    /// early; this only bites when the app stalls a whole slot.
     pub op_publish_max_us: u32,
 
     // The MPSL session.
@@ -219,7 +248,7 @@ impl MpslState {
 
 impl MpslState {
     pub fn new(radio: nrf_pac::radio::Radio, follower: bool) -> Self {
-        let mut this = Self {
+        let this = Self {
             radio,
             follower,
             slot_nominal: 0,
@@ -234,11 +263,6 @@ impl MpslState {
             tx_delay_us: 0,
             tx_count: 0,
             peer_rx_window_us: 0,
-            rx_buf: [0u8; 64],
-            rx_ptr: core::ptr::null_mut(),
-            rx_cap: 0,
-            rx_result: 0,
-            rx_ok: false,
             crc_ok: 0,
             crc_bad: 0,
             crc_bad_long: 0,
@@ -254,15 +278,12 @@ impl MpslState {
             last_rx_crc: 0,
             last_rx_in_flight: false,
             last_rx_len: 0,
-            tx_buf: [0u8; 64],
-            tx_ptr: core::ptr::null(),
-            op_kind: OpKind::Idle as u8,
-            op_seq: 0,
-            op_target_slot: 0,
-            op_grace: 0,
-            op_done_seq: 0,
-            op_skipped: false,
+            ops: [OpEntry::new(), OpEntry::new()],
             op_late: 0,
+            coll_noop: 0,
+            coll_late: 0,
+            coll_catch: 0,
+            coll_empty: 0,
             op_grace_used: 0,
             last_start_cyc: 0,
             op_publish_max_us: 0,
@@ -300,8 +321,6 @@ impl MpslState {
             cur_base0: 0xE7E7E7E7,
             cur_prefix: 0xE7,
         };
-        this.rx_ptr = this.rx_buf.as_mut_ptr() as *mut u8;
-        this.rx_cap = 64;
         this
     }
 }

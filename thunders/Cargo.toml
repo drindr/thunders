@@ -3,7 +3,7 @@ name = "thunders"
 version = "0.1.0"
 edition = "2021"
 authors = ["Drin"]
-description = "Core no_std RF protocol stack for nRF and external PHYs"
+description = "Core no_std RF protocol stack for Nordic nRF radios"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

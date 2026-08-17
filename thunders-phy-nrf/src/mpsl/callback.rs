@@ -23,55 +23,60 @@ pub unsafe extern "C" fn timeslot_cb(
         state.start_signal.signal(());
 
         // Consume the published op ONLY in the slot it was published for.
-        // The old level-based op_kind re-ran the previous slot's op when
-        // the app published late - a repeated TX/RX one slot off its phase,
-        // which smeared the peripheral's echoes into the central's TX
-        // phases. A late op now idles its slot (safe) and is counted -
-        // except a TX op with grace (the first of a run), which may run
-        // one slot late: it still faces a listening peer.
-        let mut executed = OpKind::Idle as u8;
-        if state.op_seq != state.op_done_seq {
+        // Ops live in a depth-2 parity ring (entry = target % 2) and the
+        // app publishes ~2 slots ahead, so a publish never clobbers a
+        // pending op (the entry is collected before reuse). Priority at
+        // each START: the on-target op for this slot; else a grace TX
+        // from the previous slot (it still faces a listening peer); else
+        // idle - a late op never runs off-phase (the old level-based
+        // op_kind smeared the peripheral's echoes into the central's TX
+        // phases). No defmt here: MPSL timer-IRQ context.
+        let slot = state.slot_count;
+        let on = (slot % 2) as usize;
+        let mut exec: Option<usize> = None;
+        if state.ops[on].seq != state.ops[on].done_seq {
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-            let target = state.op_target_slot;
-            let late_by = state.slot_count.wrapping_sub(target) as i32;
+            let target = state.ops[on].target;
+            let late_by = slot.wrapping_sub(target) as i32;
             if late_by == 0 {
-                executed = state.op_kind;
-            } else if late_by > 0
-                && late_by <= state.op_grace as i32
-                && state.op_kind == OpKind::Tx as u8
-            {
-                executed = OpKind::Tx as u8;
-                state.op_grace_used = state.op_grace_used.wrapping_add(1);
+                exec = Some(on);
             } else if late_by > 0 {
                 // The target slot has passed: skip, never execute an op
                 // one slot off its phase without grace.
                 state.op_late = state.op_late.wrapping_add(1);
-                state.op_done_seq = state.op_seq;
-                state.op_skipped = true;
+                state.ops[on].done_seq = state.ops[on].seq;
+                state.ops[on].skipped = true;
             }
-            // target > slot_count: the op is for a future slot; leave it
-            // pending and idle this one.
-            if executed != OpKind::Idle as u8 {
-                state.op_done_seq = state.op_seq;
-                state.op_skipped = false;
+            // target > slot: the op is for a future slot; leave pending.
+        }
+        if exec.is_none() {
+            // Grace: the first TX of a run may execute one slot late.
+            let g = (slot.wrapping_sub(1) % 2) as usize;
+            let e = &state.ops[g];
+            if e.seq != e.done_seq
+                && e.kind == OpKind::Tx as u8
+                && e.target == slot.wrapping_sub(1)
+                && e.grace > 0
+            {
+                exec = Some(g);
+                state.op_grace_used = state.op_grace_used.wrapping_add(1);
             }
         }
-        // Deterministic reverse acquisition: the central is the stable
-        // timing reference and never sweeps. Only the peripheral sweeps its
-        // RX grid and its SlotRequest TX delay. If both sides swept at
-        // +2 us/slot their equal periods would freeze the relative slot
-        // phase and acquisition could never converge.
-        // No defmt here: this runs in MPSL timer-IRQ context and defmt is
-        // not reentrant.
+        if let Some(i) = exec {
+            state.ops[i].done_seq = state.ops[i].seq;
+            state.ops[i].skipped = false;
+        }
 
-        radio::timeslot_do_work(state, executed);
+        radio::timeslot_do_work(state, exec);
 
         // The follower's phase-lock (the RX catch iter -> the chain distance).
         // Runs only for an RX op that actually executed in THIS slot: the
         // op kind is latched at START, not re-read after the work (the app
         // may have published the next op meanwhile).
-        if executed == OpKind::Rx as u8 {
-            if state.rx_ok {
+        let executed_kind = exec.map(|i| state.ops[i].kind).unwrap_or(OpKind::Idle as u8);
+        if executed_kind == OpKind::Rx as u8 {
+            let ei = exec.unwrap_or(0);
+            if state.ops[ei].rx_ok {
                 state.rx_misses = 0;
                 // The runtime align, length side: size the slot to the
                 // caught packet (airtime + 140 us of overhead/jitter
@@ -98,7 +103,7 @@ pub unsafe extern "C" fn timeslot_cb(
                         && state.peer_rx_ramp_us > 0
                         && state.tx_ramp_us > 0
                     {
-                        let air = state.airtime_us(state.rx_result as usize) as i32;
+                        let air = state.airtime_us(state.ops[ei].rx_result as usize) as i32;
                         // Everything below is measured; the only fixed
                         // constant is the named tail margin (the address
                         // anchor is mode-dependent).

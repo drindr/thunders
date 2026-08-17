@@ -199,22 +199,23 @@ fn pll_enable(r: Radio) {
     }
 }
 
-/// Perform the pending TX/RX inside the timeslot. `kind` is the op the
-/// callback latched at START (Idle for a stale/late/unpublished op) - the
-/// radio never runs an op outside its target slot.
-pub unsafe fn timeslot_do_work(state: &mut MpslState, kind: u8) {
+/// Perform the pending TX/RX inside the timeslot. `exec` is the ops-ring
+/// entry the callback latched at START (None for a stale/late/unpublished
+/// op) - the radio never runs an op outside its target slot.
+pub unsafe fn timeslot_do_work(state: &mut MpslState, exec: Option<usize>) {
     let slot_start_cyc = cyc();
     let r = state.radio;
     radio_configure(state);
+    let kind = match exec {
+        Some(i) => state.ops[i].kind,
+        None => OpKind::Idle as u8,
+    };
     match kind {
         x if x == OpKind::Tx as u8 => {
             // The pending TX buffer: [0] = len, [1..=len] = payload.
-            let air = state.airtime_us(state.tx_buf[0] as usize);
-            let buf: &mut [u8] = if state.tx_ptr.is_null() {
-                &mut state.tx_buf
-            } else {
-                core::slice::from_raw_parts_mut(state.tx_ptr as *mut u8, 64)
-            };
+            let ei = exec.unwrap_or(0);
+            let air = state.airtime_us(state.ops[ei].tx_buf[0] as usize);
+            let buf: &mut [u8] = &mut state.ops[ei].tx_buf;
             r.packetptr().write_value(buf.as_ptr() as u32);
             // The follower's echo placement: TXEN delayed into the slot so
             // the echo lands mid-window at the peer (see callback.rs).
@@ -283,12 +284,15 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, kind: u8) {
                 state.rx_phase_all[phase] += 1;
             }
             // The caller's RX slice (the radio writes into it in place).
-            let buf = core::slice::from_raw_parts_mut(state.rx_ptr, state.rx_cap);
+            let ei = exec.unwrap_or(0);
+            let rx_ptr = state.ops[ei].rx_ptr;
+            let rx_cap = state.ops[ei].rx_cap;
+            let buf = core::slice::from_raw_parts_mut(rx_ptr, rx_cap);
             buf.fill(0);
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
             pll_enable(r);
             r.shorts().write_value(shorts_rx());
-            r.packetptr().write_value(state.rx_ptr as u32);
+            r.packetptr().write_value(rx_ptr as u32);
             r.events_ready().write_value(0);
             r.events_address().write_value(0);
             r.events_payload().write_value(0);
@@ -351,9 +355,7 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, kind: u8) {
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
             if r.events_address().read() != 0 {
                 state.addr_events += 1;
-                state
-                    .last_rx_hdr
-                    .copy_from_slice(&buf[..14.min(state.rx_cap)]);
+                state.last_rx_hdr.copy_from_slice(&buf[..14.min(rx_cap)]);
             }
             let crc = r.crcstatus().read().0;
             state.rssi_last = r.rssisample().read().rssisample() as u32;
@@ -378,9 +380,9 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, kind: u8) {
                 }
                 let len = buf[0] as usize;
                 // Valid only if the phy frame [len | payload] fits the
-                // caller's buffer (receive() shifts left by one).
-                state.rx_ok = len > 0 && len + 1 <= state.rx_cap;
-                state.rx_result = len.min(63);
+                // caller's buffer (op_collect shifts left by one).
+                state.ops[ei].rx_ok = len > 0 && len + 1 <= rx_cap;
+                state.ops[ei].rx_result = len.min(63);
                 state.catch_poll_us = (cyc() - t_rx) / CPU_MHZ; // END stamp
             } else {
                 state.crc_bad += 1;
@@ -405,8 +407,8 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, kind: u8) {
                     state.last_rx_in_flight = in_flight;
                     state.last_rx_len = buf[0] as u32;
                 }
-                state.rx_ok = false;
-                state.rx_result = 0;
+                state.ops[ei].rx_ok = false;
+                state.ops[ei].rx_result = 0;
             }
         }
         _ => {}

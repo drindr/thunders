@@ -82,6 +82,33 @@ Data 后立即切回严格镜像比例。
 带宽仍由 filler 测量）。效果：`ow ≈ 0`，`rev_arq` 落到 0~2%，与 fwd
 同量级——这才是 ARQ 层的真实投递率。`ow` 保留为回归检查。
 
+### 4c. MPSL op 流水线（发布期限从 ~200 µs 放宽到 ~2.5 slot）
+
+旧协议在「上一 op 完成 → 下一 slot START」之间发布下一 op：op 完成
+在 slot 的 ~250-310 µs 处，预算只有 ~200 µs，而 frame() 的处理
+（解密/NACK/deliver/应用工作）实测 ~100-250 µs——52840 勉强不晚，
+5340/LM20 有 8-30% 的 op 晚发布（`late=`），集中在 RX→TX 边界，一
+次晚发布损失两个 op。
+
+现在 MPSL phy 用**深度 2 的奇偶 op 环**（entry = target % 2），link
+的 `frame_pipelined` 每个 frame 先发布 `hw_slot + 2` 的 op（期限是该
+slot 的 START，预算 ~2.5 slot），再 collect + 处理 `hw_slot + 1` 的
+结果（collect 即节奏）。TX 内容（echo 载荷、NACK 位图）提前一个
+slot 构建：NACK 比旧路径旧一个 slot（有界浪费：多一次重复重传），
+echo 空口延迟 +1 slot。grace 机制保留（app 整 slot 卡死时兜底）。
+bare 后端走原同步路径（`Phy::op_pipelined()` 默认 false）。
+
+附带修复：`nack_for_peer` 的 run-end 收尾条件原来是全局 `phase ==
+rx_run_end`（局部索引）——peripheral 的 RX 分支里全局 phase 最多到
+c_tx-1，**收尾永远不会触发**，peripheral 从不发送真实 NACK（前向重
+传只能靠 tick 超时）。改为 `local_phase == rx_run_end`（central 本
+来就两者相等，行为不变）。
+
+代码位置：`thunders-phy-nrf/src/mpsl/state.rs` 的 `OpEntry` 环、
+`callback.rs` 的消费逻辑、`mod.rs` 的 `publish_rx/publish_tx/collect`、
+`thunders/src/link.rs` 的 `frame_pipelined` / `handle_rx_packet` /
+`handle_rx_miss`。
+
 ### 5. bench 计时从 central BENCH READY 开始
 
 `scripts/bench.sh run-pair`：

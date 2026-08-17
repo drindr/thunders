@@ -380,6 +380,10 @@ struct LinkCore<P: Phy> {
     tx_space: Signal<CriticalSectionRawMutex, ()>,
     tx_buf: [u8; MAX_PAYLOAD + 16],
     rx_pkt_buf: [u8; MAX_PAYLOAD + 16],
+    /// Second RX buffer for the pipelined phy path (the parity
+    /// double-buffer: the next op's DMA target while the previous catch
+    /// is being processed).
+    rx_pkt_buf2: [u8; MAX_PAYLOAD + 16],
 }
 
 impl<P: Phy> LinkCore<P> {
@@ -407,6 +411,7 @@ impl<P: Phy> LinkCore<P> {
             tx_space: Signal::new(),
             tx_buf: [0u8; MAX_PAYLOAD + 16],
             rx_pkt_buf: [0u8; MAX_PAYLOAD + 16],
+            rx_pkt_buf2: [0u8; MAX_PAYLOAD + 16],
             state: LinkState::new(&cfg),
             phy,
         })
@@ -649,17 +654,14 @@ impl<P: Phy> LinkCore<P> {
         if !self.state.lm.tx.is_full() {
             self.tx_space.signal(());
         }
+        if self.phy.op_pipelined() {
+            return self.frame_pipelined(tx_payload, rx_buf).await;
+        }
 
         let (c_tx, c_rx) = self.state.tx_rx_ratio;
         let period = c_tx as u16 + c_rx as u16 + self.state.idle_slots as u16;
         let hw_slot = self.phy.slot_count();
         let phase = self.state.next_phase(hw_slot, period as u32);
-        if hw_slot != 0 {
-            // Stamp the op's target slot: the MPSL callback executes the
-            // op this frame publishes only in that exact slot (a late
-            // publish idles instead of running one slot off-phase).
-            self.phy.set_op_slot(hw_slot.wrapping_add(1));
-        }
         if hw_slot == 0 {
             self.state.slot_step = self.state.slot_step.wrapping_add(1);
         }
@@ -678,17 +680,6 @@ impl<P: Phy> LinkCore<P> {
             local_phase < local_tx as u32
         };
         let active_end = local_tx as u32 + local_rx as u32;
-        if hw_slot != 0 {
-            // The first TX op of a run may execute one slot late: it still
-            // lands inside the peer's RX run. Any other late op would face
-            // a peer that has stopped listening (or transmit into its TX),
-            // so grace is 1 only here and only when the run continues.
-            self.phy.set_op_grace(if is_tx && local_phase == 0 && local_tx > 1 {
-                1
-            } else {
-                0
-            });
-        }
 
         if is_tx {
             let mut tx_payload = tx_payload;
@@ -792,9 +783,6 @@ impl<P: Phy> LinkCore<P> {
         } else {
             // ---- RX slot (the shared listen path) ----
             self.in_burst = false;
-            let slot_idx = (local_phase - local_tx as u32) as usize;
-            let rx_run_len = local_rx as usize;
-            let rx_run_end = active_end - 1;
             if local_phase == local_tx as u32 {
                 self.state.lm.rx_run_mask = [0; NACK_BYTES];
             }
@@ -808,129 +796,353 @@ impl<P: Phy> LinkCore<P> {
             {
                 Some(len) => len,
                 None => {
-                    if !central {
-                        self.missed_frames = self.missed_frames.saturating_add(1);
-                    }
-                    self.state.on_miss(&mut self.consecutive_misses);
                     self.advance_epoch(hw_slot);
-                    if phase == rx_run_end {
-                        self.state.lm.nack_for_peer =
-                            nack_from_mask(rx_run_len, &self.state.lm.rx_run_mask);
-                        self.state.lm.rx_run_mask = [0; NACK_BYTES];
-                    }
-                    return deliver_rx(&mut self.state.lm.rx, rx_buf);
+                    return self.handle_rx_miss(local_phase, rx_buf);
                 }
             };
 
             let reply = Packet::from_bytes(&self.rx_pkt_buf[..reply_len])
                 .map_err(|_| Error::InvalidPacket)?;
-            if !central {
-                self.missed_frames = 0;
-            }
-            nack_set(&mut self.state.lm.rx_run_mask, slot_idx);
-
-            // Sync-only packets (SlotRequest/Beacon) prove a window exists
-            // but do NOT form a data link: enabling the adaptive hop on them
-            // can move the master away before the first Data ever lands.
-            let mut link_rx = false;
-            match reply {
-                Packet::Data {
-                    seq,
-                    ack,
-                    nack,
-                    mut payload,
-                } => {
-                    self.state
-                        .decrypt_payload(&mut self.phy, &mut payload, seq, central)?;
-                    self.apply_ack_nack(ack, &nack);
-                    if !central && self.state.status == LinkStatus::Disconnected
-                        && !self.state.lm.rx.in_window(seq)
-                    {
-                        self.state.lm.rx.resync(seq);
-                        self.resyncs = self.resyncs.wrapping_add(1);
-                    }
-                    link_rx = true;
-                    self.state.lm.rx.receive(seq, &payload);
-                }
-                Packet::Ack { ack, nack } => {
-                    link_rx = true;
-                    self.apply_ack_nack(ack, &nack);
-                }
-                Packet::Drop { seq, ack, nack } => {
-                    link_rx = true;
-                    self.state.lm.rx.skip_to(seq);
-                    self.apply_ack_nack(ack, &nack);
-                }
-                Packet::SlotRequest { min_slot_us } if central => {
-                    if !self.cadence_negotiated {
-                        self.cadence_negotiated = true;
-                        let negotiated = self.phy.min_slot_period_us().max(min_slot_us).max(1);
-                        if negotiated != self.phy.slot_period_us() {
-                            self.phy.align_slot_period(negotiated);
-                        }
-                    }
-                }
-                Packet::Beacon {
-                    channel_index,
-                    flags,
-                    slot_us,
-                    slot_phase,
-                    rx_en_offset,
-                    tx_en_offset,
-                    rx_ramp,
-                    tx_ramp,
-                    ..
-                } if !central => {
-                    self.state.scheduler.sync(channel_index);
-                    if flags > 0 {
-                        self.phy.set_peer_rx_window(flags as u16 * 16);
-                    }
-                    if rx_en_offset > 0 {
-                        self.phy.set_peer_rx_en_offset(rx_en_offset);
-                    }
-                    if tx_en_offset > 0 {
-                        self.phy.set_peer_tx_en_offset(tx_en_offset);
-                    }
-                    if rx_ramp > 0 {
-                        self.phy.set_peer_rx_ramp(rx_ramp);
-                    }
-                    if tx_ramp > 0 {
-                        self.phy.set_peer_tx_ramp(tx_ramp);
-                    }
-                    if slot_us > 0 {
-                        self.phy.align_slot_period(slot_us);
-                    }
-                    let min = self.phy.min_slot_period_us();
-                    self.cadence_ok = min == 0 || slot_us >= min;
-                    // Re-anchor the mirror phase only while still acquiring.
-                    if !self.state.lm.rx.have {
-                        let p_hw_slot = self.phy.slot_count();
-                        if p_hw_slot != 0 {
-                            let beacon_phase = slot_phase as u32 % period as u32;
-                            self.state.slot_offset =
-                                (beacon_phase.wrapping_sub(p_hw_slot % period as u32))
-                                    % period as u32;
-                        } else {
-                            self.state.slot_step = (slot_phase as u32 + 1) % period as u32;
-                        }
-                    }
-                }
-                _ => {}
-            }
-
-            self.clear_pending_drop();
-            if link_rx {
-                self.state.on_rx(&mut self.consecutive_misses);
-            } else {
-                self.consecutive_misses = 0;
-            }
+            let out = self
+                .handle_rx_packet(reply, local_phase, period as u32, rx_buf)
+                .await?;
             self.advance_epoch(hw_slot);
-            if phase == rx_run_end {
-                self.state.lm.nack_for_peer =
-                    nack_from_mask(rx_run_len, &self.state.lm.rx_run_mask);
+            Ok(out)
+        }
+    }
+
+    /// RX-run bookkeeping for a listen slot that caught nothing (the miss
+    /// path shared by both frame flavors). `local_phase` is the missed
+    /// slot's local phase.
+    fn handle_rx_miss(
+        &mut self,
+        local_phase: u32,
+        rx_buf: &mut [u8],
+    ) -> Result<Option<usize>, Error<P::Error>> {
+        let central = self.state.central;
+        if !central {
+            self.missed_frames = self.missed_frames.saturating_add(1);
+        }
+        self.state.on_miss(&mut self.consecutive_misses);
+        let (local_tx, local_rx) = self.local_ratio();
+        let rx_run_end = local_tx as u32 + local_rx as u32 - 1;
+        if local_phase == rx_run_end {
+            self.state.lm.nack_for_peer =
+                nack_from_mask(local_rx as usize, &self.state.lm.rx_run_mask);
+            self.state.lm.rx_run_mask = [0; NACK_BYTES];
+        }
+        deliver_rx(&mut self.state.lm.rx, rx_buf)
+    }
+
+    /// Process a caught packet (the shared RX-catch path of both frame
+    /// flavors). `local_phase` is the phase of the slot it was caught in.
+    ///
+    /// The run-end NACK finalize compares the LOCAL phase: the previous
+    /// `phase == rx_run_end` form mixed the global phase with a local
+    /// index and never fired on the peripheral (its RX branch sees global
+    /// phases 0..c_tx while rx_run_end is the last local slot), so the
+    /// peripheral never sent a real NACK and the forward direction fell
+    /// back to tick-timeout retransmits.
+    async fn handle_rx_packet(
+        &mut self,
+        reply: Packet,
+        local_phase: u32,
+        period: u32,
+        rx_buf: &mut [u8],
+    ) -> Result<Option<usize>, Error<P::Error>> {
+        let central = self.state.central;
+        if !central {
+            self.missed_frames = 0;
+        }
+        let (local_tx, local_rx) = self.local_ratio();
+        let active_end = local_tx as u32 + local_rx as u32;
+        let slot_idx = (local_phase - local_tx as u32) as usize;
+        let rx_run_len = local_rx as usize;
+        let rx_run_end = active_end - 1;
+        nack_set(&mut self.state.lm.rx_run_mask, slot_idx);
+
+        // Sync-only packets (SlotRequest/Beacon) prove a window exists
+        // but do NOT form a data link: enabling the adaptive hop on them
+        // can move the master away before the first Data ever lands.
+        let mut link_rx = false;
+        match reply {
+            Packet::Data {
+                seq,
+                ack,
+                nack,
+                mut payload,
+            } => {
+                self.state
+                    .decrypt_payload(&mut self.phy, &mut payload, seq, central)?;
+                self.apply_ack_nack(ack, &nack);
+                if !central && self.state.status == LinkStatus::Disconnected
+                    && !self.state.lm.rx.in_window(seq)
+                {
+                    self.state.lm.rx.resync(seq);
+                    self.resyncs = self.resyncs.wrapping_add(1);
+                }
+                link_rx = true;
+                self.state.lm.rx.receive(seq, &payload);
+            }
+            Packet::Ack { ack, nack } => {
+                link_rx = true;
+                self.apply_ack_nack(ack, &nack);
+            }
+            Packet::Drop { seq, ack, nack } => {
+                link_rx = true;
+                self.state.lm.rx.skip_to(seq);
+                self.apply_ack_nack(ack, &nack);
+            }
+            Packet::SlotRequest { min_slot_us } if central => {
+                if !self.cadence_negotiated {
+                    self.cadence_negotiated = true;
+                    let negotiated = self.phy.min_slot_period_us().max(min_slot_us).max(1);
+                    if negotiated != self.phy.slot_period_us() {
+                        self.phy.align_slot_period(negotiated);
+                    }
+                }
+            }
+            Packet::Beacon {
+                channel_index,
+                flags,
+                slot_us,
+                slot_phase,
+                rx_en_offset,
+                tx_en_offset,
+                rx_ramp,
+                tx_ramp,
+                ..
+            } if !central => {
+                self.state.scheduler.sync(channel_index);
+                if flags > 0 {
+                    self.phy.set_peer_rx_window(flags as u16 * 16);
+                }
+                if rx_en_offset > 0 {
+                    self.phy.set_peer_rx_en_offset(rx_en_offset);
+                }
+                if tx_en_offset > 0 {
+                    self.phy.set_peer_tx_en_offset(tx_en_offset);
+                }
+                if rx_ramp > 0 {
+                    self.phy.set_peer_rx_ramp(rx_ramp);
+                }
+                if tx_ramp > 0 {
+                    self.phy.set_peer_tx_ramp(tx_ramp);
+                }
+                if slot_us > 0 {
+                    self.phy.align_slot_period(slot_us);
+                }
+                let min = self.phy.min_slot_period_us();
+                self.cadence_ok = min == 0 || slot_us >= min;
+                // Re-anchor the mirror phase only while still acquiring.
+                if !self.state.lm.rx.have {
+                    let p_hw_slot = self.phy.slot_count();
+                    if p_hw_slot != 0 {
+                        let beacon_phase = slot_phase as u32 % period;
+                        self.state.slot_offset =
+                            (beacon_phase.wrapping_sub(p_hw_slot % period)) % period;
+                    } else {
+                        self.state.slot_step = (slot_phase as u32 + 1) % period;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        self.clear_pending_drop();
+        if link_rx {
+            self.state.on_rx(&mut self.consecutive_misses);
+        } else {
+            self.consecutive_misses = 0;
+        }
+        if local_phase == rx_run_end {
+            self.state.lm.nack_for_peer =
+                nack_from_mask(rx_run_len, &self.state.lm.rx_run_mask);
+            self.state.lm.rx_run_mask = [0; NACK_BYTES];
+        }
+        deliver_rx(&mut self.state.lm.rx, rx_buf)
+    }
+
+    /// The pipelined frame (phys with a hardware slot counter): publish the
+    /// op for `hw_slot + 2` FIRST - the publish deadline is that slot's
+    /// START, a ~2.5-slot budget instead of the ~200 us between the
+    /// previous op's completion and the next START (the 8-30% op-late rate
+    /// on the 5340/LM20) - then collect and process the op for
+    /// `hw_slot + 1` (the frame's pacing). Costs: a TX op's NACK/ACK
+    /// bitmap is one slot staler, and the echo path has one extra slot of
+    /// latency.
+    async fn frame_pipelined(
+        &mut self,
+        tx_payload: Option<&[u8]>,
+        rx_buf: &mut [u8],
+    ) -> Result<Option<usize>, Error<P::Error>> {
+        let (c_tx, c_rx) = self.state.tx_rx_ratio;
+        let period = (c_tx as u16 + c_rx as u16 + self.state.idle_slots as u16) as u32;
+        let hw_slot = self.phy.slot_count();
+        let collect_slot = hw_slot.wrapping_add(1);
+        let target = hw_slot.wrapping_add(2);
+        // next_phase applies the follower's mirror offset (slot_offset);
+        // target % period alone would ignore the re-anchor and scramble
+        // the peripheral's TX/RX phase decisions.
+        let phase = self.state.next_phase(target.wrapping_sub(1), period);
+        let (local_tx, local_rx) = self.local_ratio();
+        let local_phase = self.to_local_phase(phase);
+        let central = self.state.central;
+        let central_is_tx = phase < c_tx as u32;
+        let acquiring = !central && (!self.cadence_ok || !self.state.lm.rx.have);
+        let listen = central_is_tx || (acquiring && phase % 2 == 0);
+        let is_tx = if central {
+            local_phase < local_tx as u32
+        } else if acquiring {
+            !listen
+        } else {
+            local_phase < local_tx as u32
+        };
+        let active_end = local_tx as u32 + local_rx as u32;
+
+        // ---- publish the op for `target` ----
+        let mut offer_rejected = false;
+        if is_tx {
+            // The first TX op of a run may execute one slot late: it still
+            // lands inside the peer's RX run. Any other late op would face
+            // a peer that has stopped listening.
+            let grace = if local_phase == 0 && local_tx > 1 { 1 } else { 0 };
+            let min_slot_us = self.phy.min_slot_period_us();
+            let slotrequest =
+                !central && min_slot_us > 0 && (!self.cadence_ok || !self.state.lm.rx.have);
+            let cadence_pending = central && !self.cadence_negotiated && min_slot_us > 0;
+            let forced_beacon = central && (target % 64 == 0 || cadence_pending);
+
+            // Start of a new local TX run: clear the slot-position table.
+            if local_phase == 0 {
+                self.state.lm.tx_run_slots = [None; WINDOW_SIZE];
+            }
+
+            if slotrequest {
+                // Peripheral acquisition: this slot carries our minimum
+                // cadence instead of data, with the TX delay swept.
+                self.phy.set_tx_delay_sweep(true);
+                let outbound = Packet::SlotRequest { min_slot_us };
+                let n = self.encode_packet(&outbound)?;
+                self.phy
+                    .op_publish_tx(&self.tx_buf[..n], target, grace)
+                    .await?;
+            } else {
+                self.phy.set_tx_delay_sweep(false);
+                if central {
+                    if forced_beacon {
+                        let outbound = self.beacon_packet(phase, period as u16);
+                        let n = self.encode_packet(&outbound)?;
+                        self.phy
+                            .op_publish_tx(&self.tx_buf[..n], target, grace)
+                            .await?;
+                    } else {
+                        offer_rejected = self.enqueue_offer(tx_payload)?;
+                        let picked = self.pick_data_seq();
+                        let outbound = if self.pending_drop.is_some() {
+                            self.drop_packet(local_rx as usize)
+                        } else if let Some(seq) = picked {
+                            self.data_packet(seq, local_phase as u8, local_rx as usize)
+                        } else if self.state.lm.rx.have {
+                            self.ack_packet(local_rx as usize)
+                        } else {
+                            self.beacon_packet(phase, period as u16)
+                        };
+                        let outbound_is_data = matches!(outbound, Packet::Data { .. });
+                        let n = self.encode_packet(&outbound)?;
+                        self.phy
+                            .op_publish_tx(&self.tx_buf[..n], target, grace)
+                            .await?;
+                        if outbound_is_data {
+                            self.mark_data_sent(picked);
+                        }
+                    }
+                } else {
+                    offer_rejected = self.enqueue_offer(tx_payload)?;
+                    let picked = self.pick_data_seq();
+                    let outbound = if self.pending_drop.is_some() {
+                        Some(self.drop_packet(local_rx as usize))
+                    } else if let Some(seq) = picked {
+                        Some(self.data_packet(seq, local_phase as u8, local_rx as usize))
+                    } else if self.state.lm.rx.have {
+                        Some(self.ack_packet(local_rx as usize))
+                    } else {
+                        None
+                    };
+                    if let Some(outbound) = outbound {
+                        let outbound_is_data = matches!(outbound, Packet::Data { .. });
+                        let n = self.encode_packet(&outbound)?;
+                        self.phy
+                            .op_publish_tx(&self.tx_buf[..n], target, grace)
+                            .await?;
+                        if self.state.lm.nack_nonzero() {
+                            self.nack_sent = self.nack_sent.wrapping_add(1);
+                        }
+                        if outbound_is_data {
+                            self.mark_data_sent(picked);
+                        }
+                    }
+                    // else: nothing to send - the slot idles.
+                }
+            }
+        } else if local_phase < active_end {
+            // RX slot: content-free, publish into this slot's parity buffer
+            // (the run-start mask reset happens here, one collect before the
+            // run's first catch is processed).
+            if local_phase == local_tx as u32 {
                 self.state.lm.rx_run_mask = [0; NACK_BYTES];
             }
-            deliver_rx(&mut self.state.lm.rx, rx_buf)
+            if (target % 2) as usize == 0 {
+                self.phy.op_publish_rx(&mut self.rx_pkt_buf, target).await;
+            } else {
+                self.phy.op_publish_rx(&mut self.rx_pkt_buf2, target).await;
+            }
+        }
+        // Idle slot: publish nothing; the collect below still paces.
+
+        // ---- collect + process the op for `collect_slot` ----
+        let c_phase = self.state.next_phase(collect_slot.wrapping_sub(1), period);
+        let c_local_phase = self.to_local_phase(c_phase);
+        let c_central_is_tx = c_phase < c_tx as u32;
+        let c_listen = c_central_is_tx || (acquiring && c_phase % 2 == 0);
+        let c_is_tx = if central {
+            c_local_phase < local_tx as u32
+        } else if acquiring {
+            !c_listen
+        } else {
+            c_local_phase < local_tx as u32
+        };
+        let collected = self.phy.op_collect(collect_slot).await;
+        let out = match collected {
+            Some(len) => {
+                // The radio left `[len | payload]`; shift to payload-only.
+                let buf = if (collect_slot % 2) as usize == 0 {
+                    &mut self.rx_pkt_buf
+                } else {
+                    &mut self.rx_pkt_buf2
+                };
+                let n = len.min(buf.len() - 1);
+                buf.copy_within(1..1 + n, 0);
+                let reply =
+                    Packet::from_bytes(&buf[..n]).map_err(|_| Error::InvalidPacket)?;
+                self.handle_rx_packet(reply, c_local_phase, period, rx_buf)
+                    .await?
+            }
+            None => {
+                if !c_is_tx && c_local_phase < active_end {
+                    // A listen slot with no catch.
+                    self.handle_rx_miss(c_local_phase, rx_buf)?
+                } else {
+                    // A TX or idle slot: nothing to process.
+                    None
+                }
+            }
+        };
+        self.advance_epoch(hw_slot);
+        if offer_rejected {
+            Err(Error::WindowFull)
+        } else {
+            Ok(out)
         }
     }
 
