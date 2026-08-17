@@ -284,7 +284,7 @@ async fn main(_spawner: Spawner) {
                 } else {
                     0
                 };
-                info!("BENCH C slots={} tx={} rx={} rloss={}% rate={}/s bw={}B/s rtt_avg={}us rtt_min={}us rtt_max={}us busy={}us df={} wf={} rt={} nk={} rev_lost={} rev_loss={}% dup={} fill={}", frames, ping_tx, echo_rx, rloss, rate, bw, ra, rmin, rmax, avg_busy, link.delivery_failures(), link.window_full(), link.retransmits(), link.nacks_recv(), rev_lost, rev_loss, dup, fill_rx);
+                info!("BENCH C slots={} tx={} rx={} rloss={}% rate={}/s bw={}B/s rtt_avg={}us rtt_min={}us rtt_max={}us busy={}us df={} wf={} rt={} nk={} rev_lost={} rev_loss={}% dup={} fill={} rxd={} txd={}", frames, ping_tx, echo_rx, rloss, rate, bw, ra, rmin, rmax, avg_busy, link.delivery_failures(), link.window_full(), link.retransmits(), link.nacks_recv(), rev_lost, rev_loss, dup, fill_rx, link.rx_data(), link.tx_data());
             }
             #[cfg(feature = "peripheral")]
             {

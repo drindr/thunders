@@ -353,7 +353,7 @@ async fn main(_spawner: Spawner) {
                     } else {
                         0
                     };
-                    info!("BENCH C slots={} tx={} rx={} rloss={}% rate={}/s bw={}B/s rtt_avg={}us rtt_min={}us rtt_max={}us busy={}us df={} wf={} rt={} rev_lost={} rev_loss={}% dup={} fill={}", frames, ping_tx, echo_rx, rloss, rate, bw, ra, rmin, rmax, avg_busy, link.delivery_failures(), link.window_full(), link.retransmits(), rev_lost, rev_loss, dup, fill_rx);
+                    info!("BENCH C slots={} tx={} rx={} rloss={}% rate={}/s bw={}B/s rtt_avg={}us rtt_min={}us rtt_max={}us busy={}us df={} wf={} rt={} rev_lost={} rev_loss={}% dup={} fill={} rxd={} txd={}", frames, ping_tx, echo_rx, rloss, rate, bw, ra, rmin, rmax, avg_busy, link.delivery_failures(), link.window_full(), link.retransmits(), rev_lost, rev_loss, dup, fill_rx, link.rx_data(), link.tx_data());
                 }
                 #[cfg(feature = "peripheral")]
                 {
@@ -362,7 +362,7 @@ async fn main(_spawner: Spawner) {
                     } else {
                         0
                     };
-                    info!("BENCH P slots={} rx={} lost={} floss={}% rate={}/s busy={}us df={} wf={} rt={} rs={} ns={} span={} ow={}", frames, rx_ok, fwd_lost, floss, rate, avg_busy, link.delivery_failures(), link.window_full(), link.retransmits(), link.resyncs(), link.nack_sent(), link.rx_span(), ow);
+                    info!("BENCH P slots={} rx={} lost={} floss={}% rate={}/s busy={}us df={} wf={} rt={} rs={} ns={} span={} ow={} rxd={} txd={}", frames, rx_ok, fwd_lost, floss, rate, avg_busy, link.delivery_failures(), link.window_full(), link.retransmits(), link.resyncs(), link.nack_sent(), link.rx_span(), ow, link.rx_data(), link.tx_data());
                 }
                 let rxst =
                     thunders_phy_nrf::radio_phy::RX_STATS.swap(0, core::sync::atomic::Ordering::Relaxed);

@@ -109,6 +109,33 @@ c_tx-1，**收尾永远不会触发**，peripheral 从不发送真实 NACK（前
 `thunders/src/link.rs` 的 `frame_pipelined` / `handle_rx_packet` /
 `handle_rx_miss`。
 
+#### 4c-2. 镜像锚定的精确化（beacon catch_slot + 投票）
+
+镜像偏移 `slot_offset` 的 re-anchor 原来用**处理时刻**的
+`phy.slot_count()`：应用处理可能比捕获晚整个 slot（5 s 的 defmt 报
+告卡 ~1 ms），晚处理会被当成假的偏移位移。现在用**捕获 slot**（该
+op 的目标 slot，与处理延迟无关），且只有**连续两个 beacon 算出同一
+候选值**才采纳（投票）——单个被晚处理的 beacon 无法冻结错误偏移。
+实测曾抓到 `txph=[1,2]+[8,9]` 的混合：同一个 run 里偏移中途跳变并
+冻结，整对变哑。差分锚定（按两次 beacon 间的计数滞后增量修正）在
+实测中更差（7/8 失败 vs 4/8），已回退。
+
+#### 4c-3. echo 放置的 peer-window 钳位
+
+反向死亡的典型现场：central 只听到 len=3 的 SlotRequest，**19 字节
+的 Data echo 全部死在窗口尾部裁剪**（帧尾超出对端监听窗，被 MPSL
+硬边切断 CRC）。echo delay 公式测量值偏斜时会把 TX 推到窗口边缘；
+现在给 delay 加**对端窗口尾部钳位**（帧尾必须落在对端窗口内，宁可
+偏中心也要进窗），与 slot 内预算钳位取 min。
+
+#### 4c-4. 中央 drop 死锁（SlotRequest 视为存活证明）
+
+丢包后 central 的 `pending_drop` 只有收到覆盖该 seq 的 ACK 才会清
+除；而采集期的 peripheral 只回 SlotRequest（不带 ACK）——central
+永远卡在只发 Drop、不再发新 Data，对偶死锁。现在 central 收到
+SlotRequest 即**强制清 pending_drop**（对端存活证明）。实测该修复
+前失败的 run 里 central `txd=0`（整个窗口没发过一条 Data）。
+
 ### 5. bench 计时从 central BENCH READY 开始
 
 `scripts/bench.sh run-pair`：

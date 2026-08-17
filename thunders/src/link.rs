@@ -83,6 +83,18 @@ struct LinkState {
     /// schedule lines up with the central's phase. Computed from the last
     /// beacon's `slot_phase`.
     slot_offset: u32,
+    /// Beacon-anchor voting: a candidate is adopted only when two
+    /// CONSECUTIVE beacons agree, so a single late-processed or
+    /// gap-shifted measurement cannot freeze the mirror at a wrong
+    /// offset.
+    beacon_anchor_pending: Option<u32>,
+    /// The previous beacon's (phase, catch_slot) for the differential
+    /// anchor update (which measures the count lag accumulated between
+    /// beacons - see the beacon arm).
+    beacon_anchor_prev: Option<(u32, u32)>,
+    /// True once the absolute first anchor was adopted (the differential
+    /// form then maintains it).
+    beacon_anchor_abs: bool,
     /// The connection status (the hop gate).
     status: LinkStatus,
     /// Consecutive catches while Disconnected (the form-up streak).
@@ -123,6 +135,9 @@ impl LinkState {
             idle_slots,
             slot_step: 0,
             slot_offset: 0,
+            beacon_anchor_pending: None,
+            beacon_anchor_prev: None,
+            beacon_anchor_abs: false,
             status: LinkStatus::Disconnected,
             connect_streak: 0,
             central: matches!(cfg.role, Role::Central),
@@ -352,6 +367,10 @@ struct LinkCore<P: Phy> {
     /// A TX burst is in progress (central-only for now; the bare follower
     /// joins this path once burst begin respects follower echo timing).
     in_burst: bool,
+    /// Diagnostics: Data packets decoded from the peer (cumulative).
+    pub(crate) rx_data: u32,
+    /// Diagnostics: Data packets published for TX (cumulative).
+    pub(crate) tx_data: u32,
     /// Packets dropped after [`crate::config::MAX_RETRIES`] retransmits
     /// (delivery failures).
     delivery_failures: u32,
@@ -397,6 +416,8 @@ impl<P: Phy> LinkCore<P> {
             consecutive_misses: 0,
             missed_frames: 0,
             in_burst: false,
+            rx_data: 0,
+            tx_data: 0,
             delivery_failures: 0,
             window_full: 0,
             offer_taken: false,
@@ -738,6 +759,7 @@ impl<P: Phy> LinkCore<P> {
                     let n = self.encode_packet(&outbound)?;
                     self.transmit_outbound(n).await?;
                     if outbound_is_data {
+                        self.tx_data = self.tx_data.wrapping_add(1);
                         self.mark_data_sent(picked);
                     }
                 }
@@ -761,6 +783,7 @@ impl<P: Phy> LinkCore<P> {
                         self.nack_sent = self.nack_sent.wrapping_add(1);
                     }
                     if outbound_is_data {
+                        self.tx_data = self.tx_data.wrapping_add(1);
                         self.mark_data_sent(picked);
                     }
                 } else {
@@ -804,7 +827,7 @@ impl<P: Phy> LinkCore<P> {
             let reply = Packet::from_bytes(&self.rx_pkt_buf[..reply_len])
                 .map_err(|_| Error::InvalidPacket)?;
             let out = self
-                .handle_rx_packet(reply, local_phase, period as u32, rx_buf)
+                .handle_rx_packet(reply, local_phase, period as u32, hw_slot.wrapping_add(1), rx_buf)
                 .await?;
             self.advance_epoch(hw_slot);
             Ok(out)
@@ -834,6 +857,29 @@ impl<P: Phy> LinkCore<P> {
         deliver_rx(&mut self.state.lm.rx, rx_buf)
     }
 
+    /// The follower's current mirror offset (diagnostic).
+    pub fn slot_offset(&self) -> u32 {
+        self.state.slot_offset
+    }
+
+    /// Data packets decoded from the peer (diagnostic; cumulative).
+    pub fn rx_data(&self) -> u32 {
+        self.rx_data
+    }
+
+    /// Data packets published for TX (diagnostic; cumulative).
+    pub fn tx_data(&self) -> u32 {
+        self.tx_data
+    }
+
+    /// The current hardware slot's phase, offset applied (diagnostic).
+    pub fn hw_phase(&self) -> u32 {
+        let (c_tx, c_rx) = self.state.tx_rx_ratio;
+        let period = c_tx as u16 + c_rx as u16 + self.state.idle_slots as u16;
+        self.state
+            .next_phase(self.phy.slot_count().wrapping_sub(1), period as u32)
+    }
+
     /// Process a caught packet (the shared RX-catch path of both frame
     /// flavors). `local_phase` is the phase of the slot it was caught in.
     ///
@@ -848,6 +894,10 @@ impl<P: Phy> LinkCore<P> {
         reply: Packet,
         local_phase: u32,
         period: u32,
+        // The hardware slot the packet was caught in (the op's target
+        // slot) - the beacon re-anchor must use this, not the slot count
+        // at processing time.
+        catch_slot: u32,
         rx_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<P::Error>> {
         let central = self.state.central;
@@ -883,6 +933,7 @@ impl<P: Phy> LinkCore<P> {
                 }
                 link_rx = true;
                 self.state.lm.rx.receive(seq, &payload);
+                self.rx_data = self.rx_data.wrapping_add(1);
             }
             Packet::Ack { ack, nack } => {
                 link_rx = true;
@@ -901,6 +952,14 @@ impl<P: Phy> LinkCore<P> {
                         self.phy.align_slot_period(negotiated);
                     }
                 }
+                // A SlotRequest proves the reverse link lives (the peer is
+                // still transmitting to us). Without this, a dropped Data
+                // leaves the central stuck sending Drop packets forever:
+                // the acquiring peer answers only with SlotRequests (which
+                // carry no ACK), so pending_drop never clears (the ACK
+                // check can't fire) and no new Data is ever sent - the
+                // pair deadlocks. Force-clear on liveness proof.
+                self.pending_drop = None;
             }
             Packet::Beacon {
                 channel_index,
@@ -935,12 +994,24 @@ impl<P: Phy> LinkCore<P> {
                 let min = self.phy.min_slot_period_us();
                 self.cadence_ok = min == 0 || slot_us >= min;
                 // Re-anchor the mirror phase only while still acquiring.
+                // The anchor is exact when the beacon's CATCH slot is used:
+                // processing can lag the catch by a whole slot (the 5 s
+                // defmt report stalls the app up to ~1 ms), and the old
+                // phy.slot_count() at processing time measured that lag as
+                // a fake offset shift. Adopt only when two consecutive
+                // beacons agree (voting) - a single late-processed beacon
+                // then cannot freeze the mirror at a wrong offset.
                 if !self.state.lm.rx.have {
-                    let p_hw_slot = self.phy.slot_count();
-                    if p_hw_slot != 0 {
+                    if catch_slot != 0 {
                         let beacon_phase = slot_phase as u32 % period;
-                        self.state.slot_offset =
-                            (beacon_phase.wrapping_sub(p_hw_slot % period)) % period;
+                        let candidate =
+                            (beacon_phase.wrapping_sub(catch_slot % period)) % period;
+                        if self.state.beacon_anchor_pending == Some(candidate) {
+                            self.state.slot_offset = candidate;
+                            self.state.beacon_anchor_pending = None;
+                        } else {
+                            self.state.beacon_anchor_pending = Some(candidate);
+                        }
                     } else {
                         self.state.slot_step = (slot_phase as u32 + 1) % period;
                     }
@@ -1054,6 +1125,7 @@ impl<P: Phy> LinkCore<P> {
                             .op_publish_tx(&self.tx_buf[..n], target, grace)
                             .await?;
                         if outbound_is_data {
+                            self.tx_data = self.tx_data.wrapping_add(1);
                             self.mark_data_sent(picked);
                         }
                     }
@@ -1079,6 +1151,7 @@ impl<P: Phy> LinkCore<P> {
                             self.nack_sent = self.nack_sent.wrapping_add(1);
                         }
                         if outbound_is_data {
+                            self.tx_data = self.tx_data.wrapping_add(1);
                             self.mark_data_sent(picked);
                         }
                     }
@@ -1125,7 +1198,7 @@ impl<P: Phy> LinkCore<P> {
                 buf.copy_within(1..1 + n, 0);
                 let reply =
                     Packet::from_bytes(&buf[..n]).map_err(|_| Error::InvalidPacket)?;
-                self.handle_rx_packet(reply, c_local_phase, period, rx_buf)
+                self.handle_rx_packet(reply, c_local_phase, period, collect_slot, rx_buf)
                     .await?
             }
             None => {
@@ -1217,6 +1290,26 @@ impl<P: Phy> Central<P> {
         self.core.offer_taken
     }
 
+    /// The follower's current mirror offset (diagnostic).
+    pub fn slot_offset(&self) -> u32 {
+        self.core.slot_offset()
+    }
+
+    /// The current hardware slot's phase, offset applied (diagnostic).
+    pub fn hw_phase(&self) -> u32 {
+        self.core.hw_phase()
+    }
+
+    /// Data packets decoded from the peer (diagnostic; cumulative).
+    pub fn rx_data(&self) -> u32 {
+        self.core.rx_data
+    }
+
+    /// Data packets published for TX (diagnostic; cumulative).
+    pub fn tx_data(&self) -> u32 {
+        self.core.tx_data
+    }
+
     /// In-flight (unacknowledged) Data entries in the TX window.
     pub fn tx_inflight(&self) -> u8 {
         self.core.tx_inflight()
@@ -1299,6 +1392,26 @@ impl<P: Phy> Peripheral<P> {
     /// into the TX window (a TX slot with window space).
     pub fn offer_taken(&self) -> bool {
         self.core.offer_taken
+    }
+
+    /// The follower's current mirror offset (diagnostic).
+    pub fn slot_offset(&self) -> u32 {
+        self.core.slot_offset()
+    }
+
+    /// The current hardware slot's phase, offset applied (diagnostic).
+    pub fn hw_phase(&self) -> u32 {
+        self.core.hw_phase()
+    }
+
+    /// Data packets decoded from the peer (diagnostic; cumulative).
+    pub fn rx_data(&self) -> u32 {
+        self.core.rx_data
+    }
+
+    /// Data packets published for TX (diagnostic; cumulative).
+    pub fn tx_data(&self) -> u32 {
+        self.core.tx_data
     }
 
     /// In-flight (unacknowledged) Data entries in the TX window.
