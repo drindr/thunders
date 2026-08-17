@@ -175,6 +175,8 @@ async fn main(spawner: Spawner) {
             let mut busy_total: u64 = 0;
             let mut busy_max: u64 = 0;
             let mut t_ping_tx = Instant::now();
+            // delivery_failures() at the window start, for the ping-pong pacing.
+            let mut df_base: u32 = 0;
             let mut report_at = Instant::now();
             info!("BENCH READY role=C ratio={},{}", tx_n, rx_n);
 
@@ -187,7 +189,15 @@ async fn main(spawner: Spawner) {
                 if tx_phase {
                     tx_frames += 1;
                 }
-                let tx: Option<&[u8]> = if tx_phase && !central.tx_window_full() {
+                // Ping-pong pacing: one outstanding PING at a time. The
+                // peripheral's single echo buffer is consumed once per
+                // period; offering faster overwrites pending echoes (ow)
+                // and rev_loss measures the 8:2 capacity mismatch, not
+                // the radio. A dropped PING (df) frees its slot.
+                let echo_pending =
+                    ping_tx > echo_rx + central.delivery_failures().saturating_sub(df_base) as u64;
+                let tx: Option<&[u8]> =
+                    if tx_phase && !echo_pending && !central.tx_window_full() {
                     ping_tx += 1;
                     ping_seq = ping_seq.wrapping_add(1);
                     t_ping_tx = Instant::now();
@@ -295,6 +305,7 @@ async fn main(spawner: Spawner) {
                     rtt_sum = 0;
                     rtt_min = u32::MAX;
                     rtt_max = 0;
+                    df_base = central.delivery_failures();
                     busy_total = 0;
                     busy_max = 0;
                     report_at = now;

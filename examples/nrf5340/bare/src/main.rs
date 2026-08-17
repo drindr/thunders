@@ -146,10 +146,9 @@ async fn main(_spawner: Spawner) {
     // count no longer equals the TX-slot count.
     #[cfg(not(feature = "peripheral"))]
     let mut tx_frames = 0u64;
-    // The peripheral has reverse_tx slots per period (2 with the default
-    // 8,2 ratio), so the ping offer rate must stay at or below that or
-    // echoes pile up and get overwritten (ow).
-    const RATE_DIV: u64 = 4;
+    // delivery_failures() at the window start, for the ping-pong pacing.
+    #[cfg(not(feature = "peripheral"))]
+    let mut df_base = 0u32;
     #[cfg(feature = "peripheral")]
     let (mut rx_ok, mut fwd_lost, mut last_seq) = (0u64, 0u64, 0u32);
     #[cfg(feature = "peripheral")]
@@ -184,6 +183,13 @@ async fn main(_spawner: Spawner) {
         }
         #[cfg(not(feature = "peripheral"))]
         let mut p = [0x50u8, 0x49, 0x4E, 0x47, 0, 0, 0, 0];
+        // Ping-pong pacing: one outstanding PING at a time. The
+        // peripheral's single echo buffer is consumed once per period;
+        // offering faster overwrites pending echoes (ow) and rev_loss
+        // measures the 8:2 capacity mismatch, not the radio. A dropped
+        // PING (df) frees its slot.
+        #[cfg(not(feature = "peripheral"))]
+        let echo_pending = ping_tx > echo_rx + link.delivery_failures().saturating_sub(df_base) as u64;
         #[cfg(not(feature = "peripheral"))]
         let tx: Option<&[u8]> = {
             #[cfg(feature = "host")]
@@ -191,7 +197,7 @@ async fn main(_spawner: Spawner) {
                 if !link.tx_window_full() {
                     if let Some(n) = mailbox().take_tx(&mut ipc_tx) {
                         Some(&ipc_tx[..n])
-                    } else if tx_phase && frames % RATE_DIV == 0 {
+                    } else if tx_phase && !echo_pending {
                         ping_tx += 1;
                         ping_seq = ping_seq.wrapping_add(1);
                         t_ping_tx = Instant::now();
@@ -206,7 +212,7 @@ async fn main(_spawner: Spawner) {
             }
             #[cfg(not(feature = "host"))]
             {
-                if tx_phase && frames % RATE_DIV == 0 && !link.tx_window_full() {
+                if tx_phase && !echo_pending && !link.tx_window_full() {
                     ping_tx += 1;
                     ping_seq = ping_seq.wrapping_add(1);
                     t_ping_tx = Instant::now();
@@ -384,6 +390,10 @@ async fn main(_spawner: Spawner) {
             info!("BARE PLL addr_us={} addr_slot={} corr={} misses={} sweep={} peerw={} period={} txair={} txair_min={} txair_max={} rx_op={} tx_op={} addr_ev={} txph={:?} rxph={:?} phase={}", ba, ba_slot, bcorr, bmis, bsw, bpw, bper, txair, txair_min, txair_max, rx_op, tx_op, baddr_ev, btxph, brxph, link.slot_phase());
             frames = 0;
             busy_total = 0;
+            #[cfg(not(feature = "peripheral"))]
+            {
+                df_base = link.delivery_failures();
+            }
             report_at = now;
             #[cfg(not(feature = "peripheral"))]
             {

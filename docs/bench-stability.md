@@ -72,6 +72,16 @@ Data 后立即切回严格镜像比例。
 代码位置：`thunders/src/link.rs` 的 `tx_window_full()`，以及各 example
 `src/main.rs` 的 bench 投放条件。
 
+### 4b. central 严格 ping-pong 投放（ow 归零）
+
+8:2 比例下前向每周期 8 个 TX slot，而 peripheral 的 echo 缓冲只有 1
+个、每周期只被消费 1 次。central 按前向速率投 PING 时，待发 echo 必
+被新 PING 覆盖（`ow`），`rev_loss` 量的是 8:2 容量错配而不是无线电。
+现在 central 严格 ping-pong：上一 PING 收到 echo 或被丢弃（df）之前
+不投新 PING（`echo_pending`）。代价：PING 流吞吐降到约 1/周期（反向
+带宽仍由 filler 测量）。效果：`ow ≈ 0`，`rev_arq` 落到 0~2%，与 fwd
+同量级——这才是 ARQ 层的真实投递率。`ow` 保留为回归检查。
+
 ### 5. bench 计时从 central BENCH READY 开始
 
 `scripts/bench.sh run-pair`：
