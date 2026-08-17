@@ -103,7 +103,23 @@ pub unsafe extern "C" fn timeslot_cb(
                         && state.peer_rx_ramp_us > 0
                         && state.tx_ramp_us > 0
                     {
-                        let air = state.airtime_us(state.ops[ei].rx_result as usize) as i32;
+                    {
+                        // The frame being placed is the NEXT (pending) op -
+                        // a TX, published 2 slots ahead in the pipeline -
+                        // whose length is known. The old code used the last
+                        // RECEIVED frame's length: the echo (a ~19 B Data)
+                        // is longer than the beacons it mostly receives
+                        // (~15 B), so the centering term (w-air)/2 and the
+                        // peer-window clamp both under-shrunk for the real
+                        // TX and the frame tail escaped the peer's window
+                        // (the reverse dead state).
+                        let next = 1 - ei;
+                        let pending_len = state.ops[next].tx_buf[0] as usize;
+                        let air = if state.ops[next].kind == OpKind::Tx as u8 && pending_len > 0 {
+                            state.airtime_us(pending_len)
+                        } else {
+                            state.airtime_us(state.ops[ei].rx_result as usize)
+                        } as i32;
                         // Everything below is measured; the only fixed
                         // constant is the named tail margin (the address
                         // anchor is mode-dependent).
