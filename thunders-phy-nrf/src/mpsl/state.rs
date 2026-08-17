@@ -96,6 +96,37 @@ pub struct MpslState {
     pub tx_ptr: *const u8,
     pub(crate) op_kind: u8,
 
+    // The op publication protocol (app -> callback). The app bumps op_seq
+    // on every transmit/receive and stamps the slot the op is meant for
+    // (set_op_slot). The callback consumes a published op ONLY in its
+    // target slot; a stale or late op idles the slot instead of executing
+    // one slot off its phase. The previous level-based op_kind re-ran the
+    // previous slot's op whenever the app published late, smearing TX/RX
+    // across phases (the LM20 pairs' dead reverse link).
+    pub(crate) op_seq: u32,
+    pub(crate) op_target_slot: u32,
+    /// Extra slots a TX op may execute late (stamped by the link). Only
+    /// the first TX slot of a run gets grace: one slot late it still
+    /// faces a listening peer (the peer's RX run continues); any other
+    /// late op would execute against a peer that has moved on.
+    pub(crate) op_grace: u8,
+    /// The last op_seq the callback consumed (executed or skipped).
+    pub(crate) op_done_seq: u32,
+    /// True when the op_done_seq consumption was a skip (late), not an
+    /// execution: a skipped receive must report no-catch, not stale rx_ok.
+    pub(crate) op_skipped: bool,
+    /// Ops skipped because their target slot had already passed at their
+    /// START: the app-loop lateness counter.
+    pub op_late: u32,
+    /// TX ops that executed inside their grace slot (late but useful).
+    pub op_grace_used: u32,
+    /// DWT cycle count at the current slot's START (for publish latency).
+    pub(crate) last_start_cyc: u32,
+    /// Max op-publish delay since the last snapshot (us from slot START;
+    /// self-resetting). The app has from the previous op's completion to
+    /// the next START to publish; this shows how tight that budget is.
+    pub op_publish_max_us: u32,
+
     // The MPSL session.
     pub(crate) session_id: u8,
     pub(crate) first_request: bool,
@@ -226,6 +257,15 @@ impl MpslState {
             tx_buf: [0u8; 64],
             tx_ptr: core::ptr::null(),
             op_kind: OpKind::Idle as u8,
+            op_seq: 0,
+            op_target_slot: 0,
+            op_grace: 0,
+            op_done_seq: 0,
+            op_skipped: false,
+            op_late: 0,
+            op_grace_used: 0,
+            last_start_cyc: 0,
+            op_publish_max_us: 0,
             session_id: 0,
             first_request: true,
             next_req: MaybeUninit::uninit(),

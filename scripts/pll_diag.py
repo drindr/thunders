@@ -55,6 +55,12 @@ PLL_RE = {
     "rsum": re.compile(r"\brsum=(\d+)"),
     "rcnt": re.compile(r"\brcnt=(\d+)"),
     "rmax": re.compile(r"\brmax=(\d+)"),
+    # Ops skipped for missing their target slot (app-loop lateness).
+    "late": re.compile(r"\blate=(\d+)"),
+    # TX ops rescued by the +1-slot grace (late but still executed).
+    "grc": re.compile(r"\bgrc=(\d+)"),
+    # Max op-publish delay since the previous line (us from slot START).
+    "pub": re.compile(r"\bpub=(\d+)"),
 }
 RADIO_RXST = re.compile(r"RADIO rxst=(0x[0-9a-fA-F]+|\d+).*?\brssi=(\d+)")
 BARE_PLL = {
@@ -72,7 +78,7 @@ def parse_pll(line):
     for k, rx in PLL_RE.items():
         m = rx.search(line)
         if not m:
-            if k in ("rsum", "rcnt", "rmax"):
+            if k in ("rsum", "rcnt", "rmax", "late", "grc", "pub"):
                 row[k] = None  # pre-instrumentation log
                 continue
             return None
@@ -101,10 +107,13 @@ def classify(d_addr, d_crcok, d_crcbad, d_crcbadl, last):
 def show_pll(fn, rows):
     print(f"== {fn} (MPSL) ==")
     have_rssi_stats = any(r["rsum"] is not None for r in rows)
+    have_late = any(r["late"] is not None for r in rows)
     hdr = (f"{'win':>4} {'rx-slots':>8} {'crcok':>6} {'d_addr':>6} {'d_cbad':>6} "
            f"{'d_cbadl':>7} {'catch%':>7} {'corr/addr%':>10} {'rssi':>6}")
     if have_rssi_stats:
         hdr += f" {'cavg':>6} {'cweak':>6}"
+    if have_late:
+        hdr += f" {'d_late':>6} {'d_grc':>6} {'pubmax':>6}"
     print(hdr + f" {'tag':>8}  last-fail")
     tot = {"rx": 0, "ok": 0, "addr": 0, "cbad": 0, "cbadl": 0}
     tags = {}
@@ -135,11 +144,29 @@ def show_pll(fn, rows):
             cavg = f"{-d_rsum / d_rcnt:>5.0f}d" if d_rcnt else "     -"
             cweak = f"{-r['rmax']:>5}d" if r["rmax"] else "     -"
             line += f" {cavg:>6} {cweak:>6}"
+        if have_late:
+            d_late = (r["late"] - prev["late"]) & 0xFFFFFFFF
+            d_grc = (r["grc"] - prev["grc"]) & 0xFFFFFFFF
+            pub = r["pub"] if r["pub"] is not None else 0
+            line += f" {d_late:>6} {d_grc:>6} {pub:>5}u"
         print(line + f" {tag:>8}  {last}")
         prev = r
     n = sum(tags.values()) or 1
     print(f"-- windows by tag: " +
           "  ".join(f"{k}={100.0 * v / n:.0f}%" for k, v in sorted(tags.items())))
+    if have_late and rows[0]["late"] is not None:
+        d_late = (rows[-1]["late"] - rows[0]["late"]) & 0xFFFFFFFF
+        d_grc = (rows[-1]["grc"] - rows[0]["grc"]) & 0xFFFFFFFF
+        pub_max = max((r["pub"] for r in rows if r["pub"] is not None), default=0)
+        total_slots = sum(r["crcok"] - p["crcok"] + r["crcbad"] - p["crcbad"]
+                          for r, p in zip(rows[1:], rows[:-1]))
+        print(f"-- op_late: {d_late} skips, {d_grc} grace-rescued over the run "
+              f"({100.0 * (d_late + d_grc) / (d_late + d_grc + total_slots):.2f}% of slots late), "
+              f"max publish delay {pub_max} us"
+              if d_late + d_grc + total_slots else "")
+        if d_late + d_grc:
+            print("   late ops idle their slot unless grace-rescued; a high rate = "
+                  "the app loop publishes after the target slot's START.")
     if tot["rx"]:
         print(f"-- totals: rx_slots={tot['rx']} catch={100.0 * tot['ok'] / tot['rx']:.1f}% "
               f"addr={tot['addr']} crcbadl={tot['cbadl']} "

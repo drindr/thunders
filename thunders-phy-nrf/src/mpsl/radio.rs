@@ -24,16 +24,16 @@ fn end_ev_clear(r: Radio) {
 }
 
 #[cfg(feature = "nrf5340-net")]
-const CPU_MHZ: u32 = 64;
+pub(crate) const CPU_MHZ: u32 = 64;
 #[cfg(feature = "nrf52840")]
-const CPU_MHZ: u32 = 64;
+pub(crate) const CPU_MHZ: u32 = 64;
 #[cfg(feature = "_nrf54")]
-const CPU_MHZ: u32 = 128;
+pub(crate) const CPU_MHZ: u32 = 128;
 
 /// Cycle-accurate busy wait on the DWT cycle counter (embassy_time's tick
 /// is 30 us - far too coarse for echo placement). Enabled once by the phy.
 #[inline(always)]
-fn cyc() -> u32 {
+pub(crate) fn cyc() -> u32 {
     unsafe { (0xE000_1004 as *const u32).read_volatile() }
 }
 
@@ -199,12 +199,14 @@ fn pll_enable(r: Radio) {
     }
 }
 
-/// Perform the pending TX/RX inside the timeslot.
-pub unsafe fn timeslot_do_work(state: &mut MpslState) {
+/// Perform the pending TX/RX inside the timeslot. `kind` is the op the
+/// callback latched at START (Idle for a stale/late/unpublished op) - the
+/// radio never runs an op outside its target slot.
+pub unsafe fn timeslot_do_work(state: &mut MpslState, kind: u8) {
     let slot_start_cyc = cyc();
     let r = state.radio;
     radio_configure(state);
-    match state.op_kind {
+    match kind {
         x if x == OpKind::Tx as u8 => {
             // The pending TX buffer: [0] = len, [1..=len] = payload.
             let air = state.airtime_us(state.tx_buf[0] as usize);

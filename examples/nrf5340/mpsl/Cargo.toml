@@ -25,6 +25,10 @@ static_cell = "1.2"
 default = ["central", "host"]
 central = []
 peripheral = []
+radio-1m = []
+ratio-8-4-4 = []
+ratio-6-2-2 = []
+ratio-4-2-2 = []
 # The app-core mailbox integration (the host/controller split). Disable for
 # the standalone radio bench: without the host's SPU config the mailbox RAM
 # is secure and the net core faults on it.

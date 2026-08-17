@@ -25,6 +25,10 @@ static_cell = "1.2"
 default = ["central"]
 central = []
 peripheral = []
+radio-1m = []
+ratio-8-4-4 = []
+ratio-6-2-2 = []
+ratio-4-2-2 = []
 
 [[bin]]
 name = "thunders-mpsl"

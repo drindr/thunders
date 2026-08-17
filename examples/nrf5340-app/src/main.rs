@@ -14,7 +14,10 @@ use {defmt_rtt as _, panic_probe as _};
 use defmt::info;
 
 use embassy_nrf::ipc::{Ipc, IpcChannel};
-use thunders::ipc::mailbox;
+#[path = "../../nrf5340/ipc.rs"]
+mod ipc_mailbox;
+
+use crate::ipc_mailbox::mailbox;
 use thunders::MAX_PAYLOAD;
 
 bind_interrupts!(struct Irqs {

@@ -125,6 +125,14 @@ pub struct MpslPllSnapshot {
     /// Weakest catch since the previous snapshot (dBm = -value); the
     /// snapshot read resets it.
     pub rssi_catch_max: u32,
+    /// Ops skipped because their target slot had already passed (app-loop
+    /// lateness counter; cumulative).
+    pub op_late: u32,
+    /// TX ops that executed inside their grace slot (cumulative).
+    pub op_grace_used: u32,
+    /// Max op-publish delay since the previous snapshot (us from slot
+    /// START); the snapshot read resets it.
+    pub op_publish_max_us: u32,
 }
 
 /// Snapshot the phase-lock state as a named struct.
@@ -133,6 +141,8 @@ pub fn mpsl_pll_snapshot() -> MpslPllSnapshot {
         let s = &mut *(STATE as *mut MpslState);
         let rssi_catch_max = s.rssi_catch_max;
         s.rssi_catch_max = 0; // self-resetting "weakest since last read"
+        let op_publish_max_us = s.op_publish_max_us;
+        s.op_publish_max_us = 0; // self-resetting "tightest budget" probe
         MpslPllSnapshot {
             distance_us: s.slot_distance,
             catch_poll_us: s.catch_poll_us,
@@ -172,6 +182,9 @@ pub fn mpsl_pll_snapshot() -> MpslPllSnapshot {
             rssi_catch_sum: s.rssi_catch_sum,
             rssi_catch_cnt: s.rssi_catch_cnt,
             rssi_catch_max,
+            op_late: s.op_late,
+            op_grace_used: s.op_grace_used,
+            op_publish_max_us,
         }
     }
 }
@@ -284,6 +297,17 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
     pub async fn wait_ready(&self) {
         self.state.done_signal.wait().await;
     }
+
+    /// Record how deep into the current slot this publish lands (the app
+    /// publishes during slot N for slot N+1; the remainder of slot N is
+    /// the app's processing budget). Self-resetting max per snapshot.
+    fn note_publish_delay(&mut self) {
+        let us = radio::cyc().wrapping_sub(self.state.last_start_cyc) / radio::CPU_MHZ;
+        // Ignore publishes before the chain is flowing (no START seen yet).
+        if us < 4_000 && us > self.state.op_publish_max_us {
+            self.state.op_publish_max_us = us;
+        }
+    }
 }
 
 impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_US, RX_POLL>
@@ -314,31 +338,20 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state.tx_buf[0] = pkt.len() as u8;
         self.state.tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
         self.state.tx_ptr = core::ptr::null();
-        // Publish the op, then wait for the next timeslot START so the op
-        // executes in the slot that follows this call. Without the START
-        // wait, a late call can see the currently-running slot finish and
-        // return Ok while the op actually runs one slot later, silently
-        // desynchronizing the link layer's slot phase (the peripheral then
-        // echoes in the central's TX phases and the reverse link is dead).
+        // Publish the op: kind and target slot (stamped via set_op_slot by
+        // the link) first, op_seq LAST - the callback reads op_seq first,
+        // so a mid-publish IRQ can never consume a half-written op. The
+        // callback executes the op only in its target slot; a late publish
+        // idles the slot instead of running one slot off-phase. Then wait
+        // until the callback consumed THIS op (executed or skipped): that
+        // is the exact completion sync, immune to late-call races.
+        self.note_publish_delay();
         self.state.op_kind = state::OpKind::Tx as u8;
-        let start_before = self.state.slot_count;
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        self.state.op_seq = self.state.op_seq.wrapping_add(1);
+        let my_seq = self.state.op_seq;
         for _ in 0..10_000 {
-            if self.state.slot_count != start_before {
-                break;
-            }
-            self.state.start_signal.wait().await;
-        }
-        // The op is executing (or has just completed) in the slot whose
-        // START we observed. `slot_start_done` is the done_count at that
-        // START, so waiting for a change waits exactly one completion.
-        let start_done = self.state.slot_start_done;
-        for _ in 0..10_000 {
-            if self
-                .state
-                .done_count
-                .load(core::sync::atomic::Ordering::Acquire)
-                != start_done
-            {
+            if self.state.op_done_seq == my_seq {
                 break;
             }
             self.state.done_signal.wait().await;
@@ -353,27 +366,22 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
     ) -> Result<Option<usize>, Error<Self::Error>> {
         self.state.rx_ptr = buf.as_mut_ptr();
         self.state.rx_cap = buf.len();
-        // Same slot-boundary wait as transmit: publish first, wait for the
-        // next START, then wait exactly that slot's completion.
+        // Same publication protocol as transmit.
+        self.note_publish_delay();
         self.state.op_kind = state::OpKind::Rx as u8;
-        let start_before = self.state.slot_count;
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        self.state.op_seq = self.state.op_seq.wrapping_add(1);
+        let my_seq = self.state.op_seq;
         for _ in 0..10_000 {
-            if self.state.slot_count != start_before {
-                break;
-            }
-            self.state.start_signal.wait().await;
-        }
-        let start_done = self.state.slot_start_done;
-        for _ in 0..10_000 {
-            if self
-                .state
-                .done_count
-                .load(core::sync::atomic::Ordering::Acquire)
-                != start_done
-            {
+            if self.state.op_done_seq == my_seq {
                 break;
             }
             self.state.done_signal.wait().await;
+        }
+        if self.state.op_skipped {
+            // The op missed its target slot: no listen happened. Report
+            // no-catch - never the stale rx_ok of a previous op.
+            return Ok(None);
         }
         if self.state.rx_ok {
             // The radio left `[len, payload..]`; the Phy contract is the
@@ -418,6 +426,14 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
 
     fn set_peer_rx_window(&mut self, us: u16) {
         self.state.peer_rx_window_us = us as u32;
+    }
+
+    fn set_op_slot(&mut self, slot: u32) {
+        self.state.op_target_slot = slot;
+    }
+
+    fn set_op_grace(&mut self, slots: u8) {
+        self.state.op_grace = slots;
     }
 
     fn set_peer_rx_en_offset(&mut self, us: u8) {

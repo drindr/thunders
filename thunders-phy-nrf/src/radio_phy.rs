@@ -62,6 +62,29 @@ pub enum RadioMode {
     Ble2Mbit,
 }
 
+impl RadioMode {
+    /// On-air timing constants for the Nordic proprietary modes used by the
+    /// link: (preamble + address anchor in us, us per payload byte).
+    ///
+    /// Nrf1Mbit uses an 8-bit preamble and 1 Mbit data; Nrf2Mbit uses a
+    /// 16-bit preamble and 2 Mbit data.
+    pub fn air_timing(self) -> (u32, u32) {
+        match self {
+            RadioMode::Nrf1Mbit => (48, 8),
+            RadioMode::Nrf2Mbit => (28, 4),
+            RadioMode::Ble1Mbit => (48, 8),
+            RadioMode::Ble2Mbit => (28, 4),
+        }
+    }
+
+    /// Total on-air time for `len` payload bytes plus the 1 length byte and
+    /// 2 CRC bytes, from TX start to the end of the frame.
+    pub fn airtime_us(self, len: usize) -> u32 {
+        let (prefix, byte_us) = self.air_timing();
+        prefix + byte_us * (len as u32 + 3)
+    }
+}
+
 /// PHY-specific error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -115,6 +138,11 @@ pub const BARE_RX_ON_AIR_TARGET_US: u32 = 50;
 pub const BARE_RX_ADDR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US + 28;
 #[cfg(not(feature = "_nrf54"))]
 pub const BARE_RX_ADDR_TARGET_US: u32 = 156;
+
+/// Fixed early margin subtracted from the follower's computed on-air start.
+/// Keeps the address event inside the peer's RX window across the measured
+/// board-to-board slot-start offsets.
+pub const BARE_TX_PHASE_MARGIN_US: i32 = 10;
 
 /// The TX ramp after TXEN (the Fast ramp; MODECNF0.RU is set in `new`).
 /// Used by the follower's echo placement to convert the desired on-air time
@@ -194,6 +222,23 @@ pub struct NrfRadioPhy<'d> {
     /// Used by the follower's echo placement so the echo lands in the
     /// central's RX window even when the forward PLL holds a non-zero phase.
     last_addr_slot_us: u32,
+    /// Preamble/address anchor duration for the configured radio mode (us).
+    air_prefix_us: u32,
+    /// On-air duration per payload/CRC byte for the configured mode (us).
+    air_byte_us: u32,
+    /// Fastest slot period this board can sustain for the configured mode.
+    min_period_us: u32,
+    /// Number of paced slot starts seen by this PHY (raw phase diagnostic).
+    slot_count: u32,
+    /// Peer's advertised TXEN offset and ramp (0 = unknown). Used by the
+    /// follower echo formula instead of assuming the master's TX starts at
+    /// `BARE_TX_ON_AIR_TARGET_US`.
+    peer_tx_en_offset_us: u32,
+    peer_tx_ramp_us: u32,
+    /// Extra early margin applied to the follower's computed on-air start.
+    /// Defaults to [`BARE_TX_PHASE_MARGIN_US`]; boards can override it with
+    /// [`Self::set_tx_phase_margin_us`].
+    tx_phase_margin_us: i32,
 }
 
 // Static packet buffers: the radio DMA must reach them. Stack-allocated
@@ -280,6 +325,60 @@ pub static BARE_RX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::At
 pub static BARE_TX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static BARE_ADDR_SLOT_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static BARE_ADDR_EVENTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Raw paced TX/RX phase histograms (`slot_count % 10`), mirroring the
+/// MPSL `txph`/`rxph` diagnostics.
+pub static BARE_TX_PHASE: [core::sync::atomic::AtomicU32; 10] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+pub static BARE_RX_PHASE: [core::sync::atomic::AtomicU32; 10] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+pub fn bare_phase_snapshot() -> ([u32; 10], [u32; 10]) {
+    let tx = [
+        BARE_TX_PHASE[0].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_TX_PHASE[1].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_TX_PHASE[2].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_TX_PHASE[3].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_TX_PHASE[4].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_TX_PHASE[5].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_TX_PHASE[6].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_TX_PHASE[7].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_TX_PHASE[8].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_TX_PHASE[9].swap(0, core::sync::atomic::Ordering::Relaxed),
+    ];
+    let rx = [
+        BARE_RX_PHASE[0].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_RX_PHASE[1].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_RX_PHASE[2].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_RX_PHASE[3].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_RX_PHASE[4].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_RX_PHASE[5].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_RX_PHASE[6].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_RX_PHASE[7].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_RX_PHASE[8].swap(0, core::sync::atomic::Ordering::Relaxed),
+        BARE_RX_PHASE[9].swap(0, core::sync::atomic::Ordering::Relaxed),
+    ];
+    (tx, rx)
+}
+
 pub static BARE_PLL_CORR_US: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 /// Main-loop time outside the frame (the between-frame overhead; diagnostic).
 pub static LOOP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -387,7 +486,11 @@ impl<'d> NrfRadioPhy<'d> {
             w.set_whiteen(whiteen);
         });
 
-        // Default power and channel.
+        // Board TX power ceiling: the 52840 runs +8 dBm; the 5340 net core
+        // stays at its 0 dBm maximum.
+        #[cfg(feature = "nrf52840")]
+        r.txpower().write(|w| w.set_txpower(Txpower::Pos8dBm));
+        #[cfg(feature = "nrf5340-net")]
         r.txpower().write(|w| w.set_txpower(Txpower::_0dBm));
         // Whitening IV kept for completeness (unused while whiteen=false).
         #[cfg(not(feature = "_nrf54"))]
@@ -408,6 +511,7 @@ impl<'d> NrfRadioPhy<'d> {
         unsafe { typelevel::RADIO::enable() };
 
         dwt_enable();
+        let (air_prefix_us, air_byte_us) = mode.air_timing();
 
         Self {
             r,
@@ -423,6 +527,13 @@ impl<'d> NrfRadioPhy<'d> {
             peer_rx_window_us: 0,
             addr_poll_us: 0,
             last_addr_slot_us: 0,
+            air_prefix_us,
+            air_byte_us,
+            min_period_us: 0,
+            slot_count: 0,
+            peer_tx_en_offset_us: 0,
+            peer_tx_ramp_us: 0,
+            tx_phase_margin_us: BARE_TX_PHASE_MARGIN_US,
         }
     }
 
@@ -525,8 +636,9 @@ impl<'d> NrfRadioPhy<'d> {
             w.set_whiteen(whiteen);
         });
 
-        // Default power and channel.
-        r.txpower().write(|w| w.set_txpower(Txpower::_0dBm));
+        // The 54L runs +8 dBm: its reverse link into the 52/53 is marginal
+        // at 0 dBm even on-frequency (the MPSL backend does the same).
+        r.txpower().write(|w| w.set_txpower(Txpower::Pos8dBm));
         // Whitening IV kept for completeness (unused while whiteen=false).
         #[cfg(feature = "_nrf54")]
         r.datawhite().write(|w| w.set_iv(25));
@@ -554,6 +666,7 @@ impl<'d> NrfRadioPhy<'d> {
         unsafe { typelevel::RADIO_0::enable() };
 
         dwt_enable();
+        let (air_prefix_us, air_byte_us) = mode.air_timing();
 
         Self {
             r,
@@ -569,6 +682,13 @@ impl<'d> NrfRadioPhy<'d> {
             peer_rx_window_us: 0,
             addr_poll_us: 0,
             last_addr_slot_us: 0,
+            air_prefix_us,
+            air_byte_us,
+            min_period_us: 0,
+            slot_count: 0,
+            peer_tx_en_offset_us: 0,
+            peer_tx_ramp_us: 0,
+            tx_phase_margin_us: BARE_TX_PHASE_MARGIN_US,
         }
     }
 
@@ -598,16 +718,88 @@ impl<'d> NrfRadioPhy<'d> {
     pub fn set_paced(&mut self, follower: bool) {
         self.paced = true;
         self.follower = follower;
+        self.min_period_us = BARE_SLOT_PERIOD_US;
         self.period_us = BARE_SLOT_PERIOD_US;
         self.next_slot_cyc = None;
         self.slot_start_cyc = 0;
+        self.slot_count = 0;
         self.rx_misses = 0;
         self.sweep = follower;
         self.rx_window_us = 0;
         self.peer_rx_window_us = 0;
+        self.peer_tx_en_offset_us = 0;
+        self.peer_tx_ramp_us = 0;
         self.addr_poll_us = 0;
         self.last_addr_slot_us = 0;
         dwt_enable();
+    }
+
+    /// Override the bare slot period for a mode that needs more airtime than
+    /// the 2 Mbit default 400 us. Call before the first `frame`.
+    pub fn set_paced_period_us(&mut self, period_us: u32) {
+        debug_assert!(self.paced);
+        debug_assert!(self.next_slot_cyc.is_none());
+        let period_us = period_us.max(BARE_SLOT_PERIOD_US);
+        self.min_period_us = period_us;
+        self.period_us = period_us;
+    }
+
+    /// Override the follower's early TX margin. Call before the first
+    /// `frame`; the central role ignores this value.
+    pub fn set_tx_phase_margin_us(&mut self, margin_us: i32) {
+        self.tx_phase_margin_us = margin_us;
+    }
+
+    /// On-air duration for a `pkt` payload (the PHY adds the length byte and
+    /// two CRC bytes).
+    #[inline(always)]
+    fn airtime_us(&self, len: usize) -> u32 {
+        self.air_prefix_us + self.air_byte_us * (len as u32 + 3)
+    }
+
+    /// The paced TX start offsets for `len` payload bytes:
+    /// `(txen_offset_us, on_air_offset_us)`.
+    ///
+    /// The follower centers its packet in the peer's advertised RX window
+    /// and folds in the measured forward-catch phase; the master uses the
+    /// shared `BARE_TX_ON_AIR_TARGET_US` anchor. The same offsets are used
+    /// by plain TX and by both halves of a burst, so the forward and reverse
+    /// data planes are symmetric.
+    fn tx_offsets_us(&self, len: usize) -> (u32, u32) {
+        if !self.paced {
+            return (0, 0);
+        }
+        if !self.follower {
+            return (
+                BARE_TX_ON_AIR_TARGET_US.saturating_sub(BARE_TX_RAMP_US),
+                BARE_TX_ON_AIR_TARGET_US,
+            );
+        }
+        if self.peer_rx_window_us == 0 {
+            // The follower has not heard a beacon yet: transmit at its own
+            // slot start (the acquisition sweep covers the peer window).
+            return (0, 0);
+        }
+        let air = self.airtime_us(len);
+        let target_on_air =
+            BARE_RX_OFFSET_US + self.peer_rx_window_us.saturating_sub(air) / 2;
+        let peer_tx_air = if self.peer_tx_en_offset_us > 0 && self.peer_tx_ramp_us > 0 {
+            self.peer_tx_en_offset_us + self.peer_tx_ramp_us
+        } else {
+            BARE_TX_ON_AIR_TARGET_US
+        };
+        let desired_on_air = if self.last_addr_slot_us > 0 {
+            let s = self.last_addr_slot_us as i32 - self.air_prefix_us as i32;
+            (target_on_air as i32 + s - peer_tx_air as i32)
+                .saturating_sub(self.tx_phase_margin_us)
+                .max(0) as u32
+        } else {
+            target_on_air
+        };
+        (
+            desired_on_air.saturating_sub(BARE_TX_RAMP_US),
+            desired_on_air,
+        )
     }
 
     /// Busy-wait until the scheduled slot start and schedule the next slot.
@@ -627,6 +819,7 @@ impl<'d> NrfRadioPhy<'d> {
                     now = dwt_cycles();
                 }
                 self.slot_start_cyc = now;
+                self.slot_count = self.slot_count.wrapping_add(1);
                 let period_us = self.effective_period_us();
                 BARE_EFFECTIVE_PERIOD_US.store(period_us, core::sync::atomic::Ordering::Relaxed);
                 self.next_slot_cyc = Some(next.wrapping_add(period_us * CPU_MHZ));
@@ -656,6 +849,20 @@ impl<'d> NrfRadioPhy<'d> {
         }
         let target = self.slot_start_cyc.wrapping_add(us * CPU_MHZ);
         while ((dwt_cycles().wrapping_sub(target)) as i32) < 0 {}
+    }
+
+    fn track_tx_phase(&self) {
+        if self.paced {
+            let idx = (self.slot_count % 10) as usize;
+            BARE_TX_PHASE[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn track_rx_phase(&self) {
+        if self.paced {
+            let idx = (self.slot_count % 10) as usize;
+            BARE_RX_PHASE[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn track_tx_air(us: u32) {
@@ -817,6 +1024,7 @@ impl<'d> NrfRadioPhy<'d> {
             return Err(Error::Phy(RadioError::BufferTooLong));
         }
         self.slot_wait();
+        self.track_tx_phase();
         let c0 = dwt_cycles();
         self.disable();
         let c1 = dwt_cycles();
@@ -843,35 +1051,12 @@ impl<'d> NrfRadioPhy<'d> {
         self.r.events_end().write_value(0);
         let c2 = dwt_cycles();
 
-        // Align the TX on-air start within the slot:
-        // - the follower delays its echo into the central's advertised RX
-        //   window (centered, not at the left edge);
-        // - the central aligns every plain-TX slot to the same on-air
-        //   offset so the follower's PLL sees one phase.
+        // Align the TX start within the slot. Master and follower share the
+        // same offset calculation; only the follower folds in peer window
+        // and forward-catch phase.
         if self.paced {
-            if self.follower && self.peer_rx_window_us > 0 {
-                let air = 28 + 4 * (pkt.len() as u32 + 3);
-                let target_on_air =
-                    BARE_RX_OFFSET_US + self.peer_rx_window_us.saturating_sub(air) / 2;
-                // The forward PLL may hold a non-zero phase (the nRF52/53
-                // follower target sits 156 us into its own window). Measure
-                // the central's frame on-air start from our slot start on
-                // the last forward catch and fold that phase into the echo
-                // TX delay, like the MPSL path.
-                let desired_txen = if self.last_addr_slot_us > 0 {
-                    let s = self.last_addr_slot_us as i32 - 28;
-                    let our_tx_on_air =
-                        target_on_air as i32 + s - BARE_TX_ON_AIR_TARGET_US as i32;
-                    (our_tx_on_air - BARE_TX_RAMP_US as i32).max(0) as u32
-                } else {
-                    target_on_air.saturating_sub(BARE_TX_RAMP_US)
-                };
-                self.wait_until_slot_offset_us(desired_txen);
-            } else if !self.follower {
-                self.wait_until_slot_offset_us(
-                    BARE_TX_ON_AIR_TARGET_US.saturating_sub(BARE_TX_RAMP_US),
-                );
-            }
+            let (txen_offset, _) = self.tx_offsets_us(pkt.len());
+            self.wait_until_slot_offset_us(txen_offset);
         }
         let txen_elapsed = dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
         Self::track_tx_air(txen_elapsed + BARE_TX_RAMP_US);
@@ -937,6 +1122,7 @@ impl<'d> NrfRadioPhy<'d> {
             return Err(Error::Phy(RadioError::BufferTooLong));
         }
         self.slot_wait();
+        self.track_tx_phase();
         self.disable();
         let tx_buf = unsafe { &mut TX_BUF };
         tx_buf[0] = pkt.len() as u8;
@@ -951,10 +1137,10 @@ impl<'d> NrfRadioPhy<'d> {
         self.r.events_end().write_value(0);
         if self.paced {
             // The first slot of a burst pays the TXEN ramp; TXEN must be
-            // early enough for the on-air start to land on the shared offset.
-            self.wait_until_slot_offset_us(
-                BARE_TX_ON_AIR_TARGET_US.saturating_sub(BARE_TX_RAMP_US),
-            );
+            // early enough for the on-air start to land at the computed
+            // offset (the follower's echo window, or the master anchor).
+            let (txen_offset, _) = self.tx_offsets_us(pkt.len());
+            self.wait_until_slot_offset_us(txen_offset);
         }
         let txen_elapsed = dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
         Self::track_tx_air(txen_elapsed + BARE_TX_RAMP_US);
@@ -976,6 +1162,7 @@ impl<'d> NrfRadioPhy<'d> {
             return Err(Error::Phy(RadioError::BufferTooLong));
         }
         self.slot_wait();
+        self.track_tx_phase();
         let tx_buf = unsafe { &mut TX_BUF };
         tx_buf[0] = pkt.len() as u8;
         tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
@@ -984,8 +1171,10 @@ impl<'d> NrfRadioPhy<'d> {
         self.r.events_end().write_value(0);
         if self.paced {
             // The radio is already ramped (TXIDLE): on-air follows START
-            // almost immediately, so START goes at the shared on-air offset.
-            self.wait_until_slot_offset_us(BARE_TX_ON_AIR_TARGET_US);
+            // almost immediately, so START goes at the computed on-air
+            // offset (the follower's echo window, or the master anchor).
+            let (_, on_air_offset) = self.tx_offsets_us(pkt.len());
+            self.wait_until_slot_offset_us(on_air_offset);
         }
         let start_elapsed = dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
         Self::track_tx_air(start_elapsed);
@@ -1065,6 +1254,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         timeout: Duration,
     ) -> Result<Option<usize>, Error<RadioError>> {
         self.slot_wait();
+        self.track_rx_phase();
 
         // nRF54: the radio auto-disables via the PHYEND_DISABLE short; skip the
         // explicit disable before RX (verified: explicit disable broke RX).
@@ -1162,7 +1352,8 @@ impl<'d> Phy for NrfRadioPhy<'d> {
                     let addr_from_slot = setup_us + addr_us;
                     self.last_addr_slot_us = addr_from_slot;
                     BARE_ADDR_SLOT_US.store(addr_from_slot, core::sync::atomic::Ordering::Relaxed);
-                    let err = addr_from_slot as i32 - BARE_RX_ADDR_TARGET_US as i32;
+                    let target = (BARE_RX_ADDR_TARGET_US - 28) + self.air_prefix_us;
+                    let err = addr_from_slot as i32 - target as i32;
                     self.nudge_next_slot(err);
                 } else {
                     self.rx_misses = self.rx_misses.saturating_add(1);
@@ -1266,6 +1457,32 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         self.peer_rx_window_us = us as u32;
     }
 
+    fn tx_en_offset_us(&self) -> u8 {
+        BARE_TX_ON_AIR_US
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(BARE_TX_RAMP_US) as u8
+    }
+
+    fn tx_ramp_us(&self) -> u8 {
+        BARE_TX_RAMP_US as u8
+    }
+
+    fn set_peer_tx_en_offset(&mut self, us: u8) {
+        if us > 0 {
+            self.peer_tx_en_offset_us = us as u32;
+        }
+    }
+
+    fn set_peer_tx_ramp(&mut self, us: u8) {
+        if us > 0 {
+            self.peer_tx_ramp_us = us as u32;
+        }
+    }
+
+    fn set_tx_phase_margin_us(&mut self, margin_us: i32) {
+        self.tx_phase_margin_us = margin_us;
+    }
+
     fn slot_period_us(&self) -> u16 {
         if self.paced {
             self.period_us.min(u16::MAX as u32) as u16
@@ -1276,7 +1493,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
 
     fn min_slot_period_us(&self) -> u16 {
         if self.paced {
-            BARE_SLOT_PERIOD_US as u16
+            self.min_period_us.min(u16::MAX as u32) as u16
         } else {
             0
         }
@@ -1284,7 +1501,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
 
     fn fallback_slot_period_us(&self) -> u16 {
         if self.paced {
-            BARE_SLOT_PERIOD_US as u16
+            self.min_period_us.min(u16::MAX as u32) as u16
         } else {
             0
         }
@@ -1292,9 +1509,9 @@ impl<'d> Phy for NrfRadioPhy<'d> {
 
     fn align_slot_period(&mut self, us: u16) {
         if self.paced && us > 0 {
-            // Never adopt a cadence faster than the bare slot grid can
+            // Never adopt a cadence faster than the configured mode can
             // physically support.
-            self.period_us = (us as u32).max(BARE_SLOT_PERIOD_US);
+            self.period_us = (us as u32).max(self.min_period_us);
         }
     }
 
@@ -1357,7 +1574,7 @@ impl<'d> NrfRadioPhy<'d> {
 
         // The nonce -> the CNF mapping (PS Table 56): the pktctr field is
         // the 5-byte packet counter + 3 reserved bytes + the direction byte;
-        // the IV carries the channel. make_nonce_13 = [seq | 0*4 | channel
+        // the IV carries the channel. make_nonce_13 = [seq(2) | 0*3 | channel
         // | direction | 0*6]; the channel is dropped so the IV is zeroed.
         let cnf = unsafe { &mut CCM_CNF };
         cnf.key.copy_from_slice(key);

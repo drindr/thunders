@@ -1,10 +1,10 @@
 //! Link-layer state machines for central and peripheral.
 
-/// Consecutive failed frames before the adaptive hop advances the channel
+/// Consecutive missed RX slots before the central advances the channel
 /// (transient misses stay put; persistent jamming hops away).
 const HOP_MISS_THRESHOLD: u8 = 16;
 
-/// Consecutive failed frames before the link is declared lost: the status
+/// Consecutive missed RX slots before the link is declared lost: the status
 /// drops back to `Disconnected` and the node returns to the initial channel,
 /// so a recovered link can re-align.
 const LINK_LOSS_THRESHOLD: u8 = 16;
@@ -19,31 +19,33 @@ const CONNECT_STREAK_THRESHOLD: u8 = 8;
 /// The status gates channel hopping: while [`LinkStatus::Disconnected`] the
 /// scheduler is pinned to the initial channel (no hop), so the two nodes'
 /// slot schedules can align without ever landing on different channels. The
-/// first successful receive forms the connection and enables the adaptive
-/// hop.
+/// `CONNECT_STREAK_THRESHOLD`-long receive streak forms the connection and
+/// enables the adaptive hop on the central.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum LinkStatus {
     /// No packet received yet, or the link was lost. Hop is disabled — the
     /// node holds the initial channel.
     Disconnected,
-    /// A packet was received. Adaptive channel hopping is enabled.
+    /// The form-up streak has been reached; the central's adaptive channel
+    /// hop is enabled.
     Connected,
 }
 
-/// Frame-phase profile accumulators (us per 1000 frames; diagnostic).
-pub static PROFILE_CH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static PROFILE_TX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static PROFILE_RX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static PROFILE_PARSE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static PROFILE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::Duration;
 use heapless::Vec;
 
 use crate::{
-    config::{CENTRAL_REPLY_TIMEOUT_US, Config, MAX_PAYLOAD, PERIPHERAL_LISTEN_TIMEOUT_US, Role},
+    config::{
+        Config, Role, CENTRAL_REPLY_TIMEOUT_US, MAX_PAYLOAD, NACK_BYTES,
+        PERIPHERAL_LISTEN_TIMEOUT_US, WINDOW_SIZE,
+    },
     error::Error,
+    link_mgmt::{
+        nack_from_mask, nack_nonzero, nack_set, nack_vec, seq_gt, LinkMgmt, RxWindow, TxRunSlot,
+    },
     packet::Packet,
     phy::Phy,
     scheduler::Scheduler,
@@ -59,13 +61,28 @@ const TAG_LEN: usize = 16;
 /// Shared link state.
 struct LinkState {
     scheduler: Scheduler,
-    tx_seq: u8,
-    rx_seq: u8,
+    /// The link-management layer: sender window, receiver window, and the
+    /// slot-NACK run bookkeeping.
+    lm: LinkMgmt,
     epoch: u32,
-    /// TX:RX slot ratio (the shared schedule).
+    /// Central/forward TX:RX slot ratio.
     tx_rx_ratio: (u8, u8),
+    /// Peripheral/reverse TX:RX slot ratio (normalized to the complement of
+    /// `tx_rx_ratio` if the caller provided an incompatible schedule).
+    reverse_tx_rx_ratio: (u8, u8),
+    /// Shared idle slots appended after both local TX/RX runs.
+    idle_slots: u8,
     /// The slot step counter (the TX/RX decision).
-    slot_step: u8,
+    ///
+    /// Kept as u32 so the ratio phase never jumps when a byte-sized counter
+    /// wraps: with a u8, step 255 -> 0 skips part of the period whenever
+    /// `tx + rx` does not divide 256 (e.g. the default 8:2 period of 10).
+    /// Used only when the PHY has no hardware slot counter.
+    slot_step: u32,
+    /// Peripheral only: added to the hardware slot count so the mirrored
+    /// schedule lines up with the central's phase. Computed from the last
+    /// beacon's `slot_phase`.
+    slot_offset: u32,
     /// The connection status (the hop gate).
     status: LinkStatus,
     /// Consecutive catches while Disconnected (the form-up streak).
@@ -84,13 +101,28 @@ impl LinkState {
     fn new(cfg: &Config) -> Self {
         let mut scheduler = Scheduler::new(cfg.network);
         scheduler.sync(cfg.initial_channel);
+        // Normalize the ratio even when `Config.tx_rx_ratio` was mutated
+        // directly: a zero component would make the slot period zero and
+        // `% period` would panic in `next_phase`.
+        let tx_rx_ratio = (cfg.tx_rx_ratio.0.max(1), cfg.tx_rx_ratio.1.max(1));
+        // The two local schedules must be complementary. An incompatible
+        // manually-written reverse ratio is normalized so construction can
+        // never produce two nodes that transmit at the same phase.
+        let reverse_tx_rx_ratio = if cfg.reverse_tx_rx_ratio == (tx_rx_ratio.1, tx_rx_ratio.0) {
+            cfg.reverse_tx_rx_ratio
+        } else {
+            (tx_rx_ratio.1, tx_rx_ratio.0)
+        };
+        let idle_slots = cfg.idle_slots.min(255);
         Self {
             scheduler,
-            tx_seq: 0,
-            rx_seq: 0,
+            lm: LinkMgmt::new(),
             epoch: 0,
-            tx_rx_ratio: cfg.tx_rx_ratio,
+            tx_rx_ratio,
+            reverse_tx_rx_ratio,
+            idle_slots,
             slot_step: 0,
+            slot_offset: 0,
             status: LinkStatus::Disconnected,
             connect_streak: 0,
             central: matches!(cfg.role, Role::Central),
@@ -100,10 +132,42 @@ impl LinkState {
         }
     }
 
+    /// Map a central-schedule phase to this node's local phase. With idle
+    /// slots the complement is piecewise: central TX -> peripheral RX,
+    /// central RX -> peripheral TX, central idle -> peripheral idle.
+    fn local_phase_for(&self, phase: u32) -> u32 {
+        let (c_tx, c_rx) = self.tx_rx_ratio;
+        let period = c_tx as u32 + c_rx as u32 + self.idle_slots as u32;
+        if self.central {
+            phase % period
+        } else if phase < c_tx as u32 {
+            (phase + c_rx as u32) % period
+        } else if phase < c_tx as u32 + c_rx as u32 {
+            phase - c_tx as u32
+        } else {
+            phase % period
+        }
+    }
+
+    /// The phase of the slot that is about to execute.
+    ///
+    /// With a hardware slot counter (MPSL), the next slot is
+    /// `hw_slot + 1`; the peripheral additionally applies the beacon-derived
+    /// `slot_offset`. With a software-paced PHY (`hw_slot == 0`), the
+    /// link's own `slot_step` is the phase.
+    fn next_phase(&self, hw_slot: u32, period: u32) -> u32 {
+        if hw_slot == 0 {
+            self.slot_step % period
+        } else {
+            (hw_slot.wrapping_add(1).wrapping_add(self.slot_offset)) % period
+        }
+    }
+
     /// A missed RX slot. While disconnected the scheduler is pinned to the
-    /// initial channel (no hop). Once connected, a short streak hops away
-    /// from a jammed channel; a long streak declares the link lost and pins
-    /// back to the initial channel so a recovered link can re-align.
+    /// initial channel (no hop). Once connected, a short streak makes the
+    /// central hop away from a jammed channel; a long streak declares the
+    /// link lost and pins back to the initial channel so a recovered link
+    /// can re-align. The peripheral never hops on its own streak.
     fn on_miss(&mut self, streak: &mut u8) {
         *streak = streak.saturating_add(1);
         self.connect_streak = 0;
@@ -122,15 +186,6 @@ impl LinkState {
         }
     }
 
-    /// The seq window: accept `seq` when it is within a few steps of the
-    /// last accepted seq, or whenever the link is Disconnected (the
-    /// connection-state machine's re-sync signal), or before the first
-    /// accept (rx_seq still at its initial 0).
-    fn accept_seq(&self, seq: u8) -> bool {
-        let diff = seq.wrapping_sub(self.rx_seq);
-        diff <= 8 || self.rx_seq == 0 || self.status == LinkStatus::Disconnected
-    }
-
     /// A successful RX slot: the form-up streak forms the connection
     /// (enabling the hop) only after the link proves it can sustain.
     fn on_rx(&mut self, streak: &mut u8) {
@@ -144,12 +199,15 @@ impl LinkState {
     /// Encrypt a `Data` payload in place before transmission.
     ///
     /// `sender_central` is `true` when *this* node is encrypting the
-    /// outbound payload (central-to-peripheral direction).
+    /// outbound payload (central-to-peripheral direction). The nonce binds
+    /// only to `seq` + the direction, so a retransmission of the same seq
+    /// produces the same ciphertext (the receiver derives the same nonce).
     #[cfg(feature = "secure")]
     fn encrypt_payload<P: Phy>(
         &self,
         phy: &mut P,
         payload: &mut Vec<u8, MAX_PAYLOAD>,
+        seq: u16,
         sender_central: bool,
     ) -> Result<(), Error<P::Error>> {
         let cipher = match self.cipher.as_ref() {
@@ -161,21 +219,21 @@ impl LinkState {
                 if payload.len() + TAG_LEN > MAX_PAYLOAD {
                     return Err(Error::BufferTooSmall);
                 }
-                let nonce =
-                    make_nonce(self.epoch, self.tx_seq, self.scheduler.index(), sender_central);
+                let nonce = make_nonce(seq, sender_central);
                 cipher.encrypt(payload, &nonce)?;
             }
             CipherMode::Ccm => {
                 if payload.len() + 4 > MAX_PAYLOAD {
                     return Err(Error::BufferTooSmall);
                 }
-                let nonce =
-                    make_nonce_13(self.epoch, self.tx_seq, self.scheduler.index(), sender_central);
+                let nonce = make_nonce_13(seq, sender_central);
                 let mut key16 = [0u8; 16];
                 key16.copy_from_slice(&cipher.key[..16]);
                 let mut mic = [0u8; 4];
                 phy.ccm_crypt(&key16, &nonce, payload, &mut mic, true)?;
-                payload.extend_from_slice(&mic).map_err(|_| Error::BufferTooSmall)?;
+                payload
+                    .extend_from_slice(&mic)
+                    .map_err(|_| Error::BufferTooSmall)?;
             }
         }
         Ok(())
@@ -186,6 +244,7 @@ impl LinkState {
         &self,
         _phy: &mut P,
         _payload: &mut Vec<u8, MAX_PAYLOAD>,
+        _seq: u16,
         _sender_central: bool,
     ) -> Result<(), Error<P::Error>> {
         Ok(())
@@ -199,7 +258,7 @@ impl LinkState {
         &self,
         phy: &mut P,
         payload: &mut Vec<u8, MAX_PAYLOAD>,
-        seq: u8,
+        seq: u16,
         sender_central: bool,
     ) -> Result<(), Error<P::Error>> {
         let cipher = match self.cipher.as_ref() {
@@ -208,15 +267,14 @@ impl LinkState {
         };
         match cipher.mode {
             CipherMode::ChaCha => {
-                let nonce = make_nonce(self.epoch, seq, self.scheduler.index(), sender_central);
+                let nonce = make_nonce(seq, sender_central);
                 cipher.decrypt(payload, &nonce)?;
             }
             CipherMode::Ccm => {
                 if payload.len() < 4 {
                     return Err(Error::InvalidPacket);
                 }
-                let nonce =
-                    make_nonce_13(self.epoch, seq, self.scheduler.index(), sender_central);
+                let nonce = make_nonce_13(seq, sender_central);
                 let mut key16 = [0u8; 16];
                 key16.copy_from_slice(&cipher.key[..16]);
                 let plen = payload.len() - 4;
@@ -234,294 +292,513 @@ impl LinkState {
         &self,
         _phy: &mut P,
         _payload: &mut Vec<u8, MAX_PAYLOAD>,
-        _seq: u8,
+        _seq: u16,
         _sender_central: bool,
     ) -> Result<(), Error<P::Error>> {
         Ok(())
     }
 }
 
-/// Central node.
-pub struct Central<P: Phy> {
+/// Build the beacon packet for a TX slot.
+fn make_beacon<P: Phy>(state: &LinkState, phy: &P, step: u32, period: u16) -> Packet {
+    Packet::Beacon {
+        epoch: state.epoch,
+        channel_index: state.scheduler.index(),
+        flags: (phy.rx_window_us() / 16).min(255) as u8,
+        slot_us: phy.slot_period_us(),
+        slot_phase: (step % period as u32) as u16,
+        rx_en_offset: phy.rx_en_offset_us(),
+        tx_en_offset: phy.tx_en_offset_us(),
+        rx_ramp: phy.rx_ramp_us(),
+        tx_ramp: phy.tx_ramp_us(),
+    }
+}
+
+/// Deliver one in-order payload from the reorder window into `rx_buf`.
+fn deliver_rx<P>(rx: &mut RxWindow, rx_buf: &mut [u8]) -> Result<Option<usize>, Error<P>> {
+    if let Some(len) = rx.peek_len() {
+        if len > rx_buf.len() {
+            return Err(Error::BufferTooSmall);
+        }
+        if let Some(entry) = rx.pop_head() {
+            rx_buf[..len].copy_from_slice(&entry.payload[..len]);
+            return Ok(Some(len));
+        }
+    }
+    Ok(None)
+}
+
+/// Shared link data plane.
+///
+/// Forward and reverse share the same TX/RX slot engine. `Role` only changes
+/// the synchronization path: the central is the hop/cadence master and sends
+/// beacons; the peripheral follows the beacon and sends SlotRequest while
+/// acquiring. See `docs/symmetric-link-design.md`.
+struct LinkCore<P: Phy> {
     phy: P,
     state: LinkState,
     /// True after the first SlotRequest: cadence is negotiated once, then
     /// the central keeps that period and the peripheral follows it.
     cadence_negotiated: bool,
+    /// False until the central's beacon advertises a cadence >= our minimum
+    /// slot period. Peripheral-only; the central ignores this field.
+    cadence_ok: bool,
     /// Last channel written to the phy (the phy is only re-tuned on change).
     last_channel: Option<u8>,
     /// Consecutive missed replies (the adaptive-hop trigger).
     consecutive_misses: u8,
-    /// A TX burst is in progress (the radio stays ramped across TX slots).
+    /// Peripheral-only missed-frame counter.
+    missed_frames: u8,
+    /// A TX burst is in progress (central-only for now; the bare follower
+    /// joins this path once burst begin respects follower echo timing).
     in_burst: bool,
+    /// Packets dropped after [`crate::config::MAX_RETRIES`] retransmits
+    /// (delivery failures).
+    delivery_failures: u32,
+    /// Raw `frame` offers that found the TX window full (backpressure).
+    window_full: u32,
+    /// The raw offer of the last `frame()` call was enqueued into the TX
+    /// window (false on RX/idle slots, on rejection, and while a pending
+    /// typed-send payload took precedence).
+    offer_taken: bool,
+    /// Retransmissions performed (a packet re-sent after its first send).
+    retransmits: u32,
+    /// Receiver re-baselines (a peer-restart resync; diagnostic).
+    resyncs: u32,
+    /// Non-zero NACK bitmaps sent (diagnostic).
+    nack_sent: u32,
+    /// Non-zero NACK bitmaps received (diagnostic).
+    nacks_recv: u32,
+    /// A Data seq we dropped after retry exhaustion and must tell the peer
+    /// about (the delivery-failure resync hint). Cleared once the peer's
+    /// cumulative ACK covers it.
+    pending_drop: Option<u16>,
+    pending_tx: [u8; MAX_PAYLOAD],
+    pending_tx_len: usize,
+    send_done: Signal<CriticalSectionRawMutex, ()>,
+    /// Signaled when TX-window space is available.
+    tx_space: Signal<CriticalSectionRawMutex, ()>,
     tx_buf: [u8; MAX_PAYLOAD + 16],
     rx_pkt_buf: [u8; MAX_PAYLOAD + 16],
 }
 
-impl<P: Phy> Central<P> {
-    /// Create a new central.
-    pub async fn new(mut phy: P, cfg: Config) -> Result<Self, Error<P::Error>> {
+impl<P: Phy> LinkCore<P> {
+    async fn new(mut phy: P, cfg: Config) -> Result<Self, Error<P::Error>> {
         phy.set_address(&cfg.address).await;
         phy.flush().await;
         Ok(Self {
-            phy,
-            state: LinkState::new(&cfg),
             cadence_negotiated: false,
+            cadence_ok: phy.min_slot_period_us() == 0,
             last_channel: None,
             consecutive_misses: 0,
+            missed_frames: 0,
             in_burst: false,
+            delivery_failures: 0,
+            window_full: 0,
+            offer_taken: false,
+            retransmits: 0,
+            resyncs: 0,
+            nack_sent: 0,
+            nacks_recv: 0,
+            pending_drop: None,
+            pending_tx: [0u8; MAX_PAYLOAD],
+            pending_tx_len: 0,
+            send_done: Signal::new(),
+            tx_space: Signal::new(),
             tx_buf: [0u8; MAX_PAYLOAD + 16],
             rx_pkt_buf: [0u8; MAX_PAYLOAD + 16],
+            state: LinkState::new(&cfg),
+            phy,
         })
     }
 
-    /// The current connection status (the hop gate).
-    pub fn status(&self) -> LinkStatus {
+    fn status(&self) -> LinkStatus {
         self.state.status
     }
 
-    /// Run one slot from the central side (the TX:RX ratio drives which).
-    ///
-    /// The TX slots carry the PING/Data (or the Beacon when `tx_payload` is
-    /// `None` - the beacon carries the hop index); the RX slots listen for
-    /// the peripheral's reverse Data. The TX run uses the phy's burst (the
-    /// ramp once, the on-air per packet) and falls back to the plain
-    /// transmit on backends without the burst (the MPSL).
-    pub async fn frame(
+    fn tx_window_full(&self) -> bool {
+        self.state.lm.tx.is_full()
+    }
+
+    fn tx_inflight(&self) -> u8 {
+        self.state.lm.tx.inflight
+    }
+
+    fn link_phase(&self) -> u32 {
+        let (c_tx, c_rx) = self.state.tx_rx_ratio;
+        let period = c_tx as u16 + c_rx as u16 + self.state.idle_slots as u16;
+        let phase = self.state.next_phase(0, period as u32);
+        self.to_local_phase(phase)
+    }
+
+    /// Map a central-schedule phase to this node's local phase. With idle
+    /// slots the complement is piecewise: central TX -> peripheral RX,
+    /// central RX -> peripheral TX, central idle -> peripheral idle.
+    fn to_local_phase(&self, phase: u32) -> u32 {
+        self.state.local_phase_for(phase)
+    }
+
+    /// Adjust the follower early TX margin at runtime (central is a no-op).
+    fn set_tx_phase_margin_us(&mut self, margin_us: i32) {
+        self.phy.set_tx_phase_margin_us(margin_us);
+    }
+
+    /// Transmit an encoded packet through the symmetric TX path: burst when
+    /// the PHY supports it, plain per-slot transmit otherwise.
+    async fn transmit_outbound(&mut self, n: usize) -> Result<(), Error<P::Error>> {
+        if self.in_burst {
+            match self.phy.transmit_burst_send(&self.tx_buf[..n]) {
+                Ok(()) => {}
+                Err(Error::Unsupported) => {
+                    self.phy.transmit(&self.tx_buf[..n]).await?;
+                    self.in_burst = false;
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            match self.phy.transmit_burst_begin(&self.tx_buf[..n]) {
+                Ok(()) => self.in_burst = true,
+                Err(Error::Unsupported) => {
+                    self.phy.transmit(&self.tx_buf[..n]).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Serialize `pkt` into the shared TX buffer; returns the byte length.
+    fn encode_packet(&mut self, pkt: &Packet) -> Result<usize, Error<P::Error>> {
+        pkt.to_bytes(&mut self.tx_buf)
+            .map_err(Error::<P::Error>::from)
+    }
+
+    /// Build the outbound `Packet::Data` for `seq` and record the slot
+    /// position mapping for slot-NACK.
+    fn data_packet(&mut self, seq: u16, slot: u8, nack_run_len: usize) -> Packet {
+        for entry in self.state.lm.tx_run_slots.iter_mut() {
+            if entry.is_none() {
+                *entry = Some(TxRunSlot { slot, seq });
+                break;
+            }
+        }
+        let (elen, epayload) = {
+            let e = self.state.lm.tx.entry(seq);
+            (e.len as usize, e.payload)
+        };
+        let mut pv = Vec::<u8, MAX_PAYLOAD>::new();
+        // The entry length was bounded by MAX_PAYLOAD at enqueue time.
+        let _ = pv.extend_from_slice(&epayload[..elen]);
+        Packet::Data {
+            seq,
+            ack: self.state.lm.rx.ack(),
+            nack: nack_vec(nack_run_len, &self.state.lm.nack_for_peer),
+            payload: pv,
+        }
+    }
+
+    fn ack_packet(&self, nack_run_len: usize) -> Packet {
+        Packet::Ack {
+            ack: self.state.lm.rx.ack(),
+            nack: nack_vec(nack_run_len, &self.state.lm.nack_for_peer),
+        }
+    }
+
+    fn drop_packet(&self, nack_run_len: usize) -> Packet {
+        Packet::Drop {
+            seq: self.pending_drop.unwrap_or(0),
+            ack: self.state.lm.rx.ack(),
+            nack: nack_vec(nack_run_len, &self.state.lm.nack_for_peer),
+        }
+    }
+
+    fn beacon_packet(&self, step: u32, period: u16) -> Packet {
+        make_beacon(&self.state, &self.phy, step, period)
+    }
+
+    /// Enqueue a raw `frame` offer (or the pending typed-send payload).
+    /// Returns `true` when a raw offer found the window full.
+    fn enqueue_offer(
         &mut self,
         tx_payload: Option<&[u8]>,
-        rx_buf: &mut [u8],
-    ) -> Result<Option<usize>, Error<P::Error>> {
-        let ch = self.state.scheduler.current();
-        if self.last_channel != Some(ch) {
-            self.phy.set_channel(ch).await;
-            self.last_channel = Some(ch);
+    ) -> Result<bool, Error<P::Error>> {
+        let mut pending_buf = [0u8; MAX_PAYLOAD];
+        let mut pending_len = 0usize;
+        if self.pending_tx_len > 0 {
+            pending_len = self.pending_tx_len;
+            pending_buf[..pending_len].copy_from_slice(&self.pending_tx[..pending_len]);
         }
-
-        // The slot decision from the TX:RX ratio.
-        let (tx_n, rx_n) = self.state.tx_rx_ratio;
-        let period = tx_n as u16 + rx_n as u16;
-        let step = self.state.slot_step;
-        let is_tx = (step as u16 % period) < tx_n as u16;
-        self.state.slot_step = step.wrapping_add(1);
-
-        if is_tx {
-            // ---- the TX slot: the burst (or the plain transmit fallback) ----
-            // Every 64th TX slot is a Beacon even under load: it carries the
-            // RX-window advertisement the follower aligns to.
-            let outbound = if let Some(data) = tx_payload.filter(|_| self.state.epoch % 64 != 0) {
+        let offered: Option<&[u8]> = if pending_len > 0 {
+            Some(&pending_buf[..pending_len])
+        } else {
+            tx_payload
+        };
+        let mut rejected = false;
+        if let Some(data) = offered {
+            if self.state.lm.tx.is_full() {
+                if pending_len == 0 {
+                    self.window_full = self.window_full.wrapping_add(1);
+                    rejected = true;
+                }
+            } else {
+                let seq = self.state.lm.tx.tx_next;
                 let mut payload = Vec::<u8, MAX_PAYLOAD>::new();
                 if data.len() > payload.capacity() {
                     return Err(Error::BufferTooSmall);
                 }
-                payload.extend_from_slice(data).map_err(|_| Error::BufferTooSmall)?;
-                self.state.encrypt_payload(&mut self.phy, &mut payload, true)?;
-                Packet::Data {
-                    seq: self.state.tx_seq,
-                    payload,
+                payload
+                    .extend_from_slice(data)
+                    .map_err(|_| Error::BufferTooSmall)?;
+                self.state
+                    .encrypt_payload(&mut self.phy, &mut payload, seq, self.state.central)?;
+                self.state.lm.tx.enqueue(&payload);
+                self.offer_taken = pending_len == 0;
+                if pending_len > 0 {
+                    self.pending_tx_len = 0;
+                    self.send_done.signal(());
                 }
-            } else {
-                Packet::Beacon {
-                    epoch: self.state.epoch,
-                    channel_index: self.state.scheduler.index(),
-                    flags: (self.phy.rx_window_us() / 16).min(255) as u8,
-                    slot_us: self.phy.slot_period_us(),
-                    slot_phase: (step as u16 % period) as u8,
-                }
-            };
-            let sent_data = tx_payload.is_some() && !matches!(outbound, Packet::Beacon { .. });
-            let n = outbound
-                .to_bytes(&mut self.tx_buf)
-                .map_err(Error::<P::Error>::from)?;
+            }
+        }
+        Ok(rejected)
+    }
 
-            if self.in_burst {
-                match self.phy.transmit_burst_send(&self.tx_buf[..n]) {
-                    Ok(()) => {}
-                    Err(Error::Unsupported) => {
-                        self.phy.transmit(&self.tx_buf[..n]).await?;
-                        self.in_burst = false;
-                    }
-                    Err(e) => return Err(e),
-                }
-            } else {
-                match self.phy.transmit_burst_begin(&self.tx_buf[..n]) {
-                    Ok(()) => self.in_burst = true,
-                    Err(Error::Unsupported) => {
-                        self.phy.transmit(&self.tx_buf[..n]).await?;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            if sent_data {
-                self.state.tx_seq = self.state.tx_seq.wrapping_add(1);
-            }
-            self.state.epoch = self.state.epoch.wrapping_add(1);
-            Ok(None)
+    /// Pick the Data seq for this TX slot (retransmit first, then new data,
+    /// then the full-window fallback).
+    fn pick_data_seq(&self) -> Option<u16> {
+        let picked = self.state.lm.tx.pick();
+        if picked.is_some() {
+            picked
+        } else if self.state.lm.tx.is_full() {
+            self.state.lm.tx.pick_sent_for_blocked()
         } else {
-            // ---- the RX slot: the reverse listen ----
-            self.in_burst = false; // the turnaround ends the TX burst
-            let reply_len = match self
-                .phy
-                .receive(
-                    &mut self.rx_pkt_buf,
-                    Duration::from_micros(CENTRAL_REPLY_TIMEOUT_US),
-                )
-                .await?
-            {
-                Some(len) => len,
-                None => {
-                    self.state.on_miss(&mut self.consecutive_misses);
-                    self.state.epoch = self.state.epoch.wrapping_add(1);
-                    return Ok(None);
-                }
-            };
-
-            let reply = Packet::from_bytes(&self.rx_pkt_buf[..reply_len])
-                .map_err(|_| Error::InvalidPacket)?;
-
-            let mut received = None;
-            match reply {
-                Packet::Data { seq, mut payload } => {
-                    self.state.decrypt_payload(&mut self.phy, &mut payload, seq, false)?;
-                    if self.accept_seq(seq) {
-                        let len = payload.len();
-                        if len > rx_buf.len() {
-                            return Err(Error::BufferTooSmall);
-                        }
-                        rx_buf[..len].copy_from_slice(&payload);
-                        received = Some(len);
-                        self.state.rx_seq = seq;
-                    }
-                }
-                Packet::SlotRequest { min_slot_us } => {
-                    // Cadence negotiation happens exactly once. Both sides
-                    // start at the fallback period; the central picks
-                    // max(central_min, peripheral_min) and then the
-                    // peripheral follows that advertised cadence.
-                    if !self.cadence_negotiated {
-                        self.cadence_negotiated = true;
-                        let negotiated = self
-                            .phy
-                            .min_slot_period_us()
-                            .max(min_slot_us)
-                            .max(1);
-                        if negotiated != self.phy.slot_period_us() {
-                            self.phy.align_slot_period(negotiated);
-                        }
-                    }
-                }
-                _ => {}
-            }
-
-            // A healthy RX slot: form the connection + reset the streak.
-            self.state.on_rx(&mut self.consecutive_misses);
-            self.state.epoch = self.state.epoch.wrapping_add(1);
-            Ok(received)
+            None
         }
     }
 
-    /// Send a typed value: the postcard-serialize + the crypto + the radio.
-    /// The value is serialized into the TX buffer and handed to the frame;
-    /// the TX slots carry it, the RX slots ignore it (the ratio is the
-    /// frame's internal schedule).
-    pub async fn send<T: serde::Serialize + ?Sized>(
-        &mut self,
-        value: &T,
-    ) -> Result<(), Error<P::Error>> {
-        let mut buf = [0u8; MAX_PAYLOAD + 16];
-        let written = postcard::to_slice(value, &mut buf)
-            .map_err(Error::<P::Error>::from)?;
-        let n = written.len();
-        let mut rx = [0u8; MAX_PAYLOAD];
-        self.frame(Some(&buf[..n]), &mut rx).await?;
-        Ok(())
+    /// Mark a picked Data transmission; drop it after retry exhaustion.
+    fn mark_data_sent(&mut self, picked: Option<u16>) {
+        if let Some(seq) = picked {
+            let was_retransmit = self.state.lm.tx.entry(seq).sent;
+            if self.state.lm.tx.mark_sent(seq) {
+                self.state.lm.tx.drop(seq);
+                self.delivery_failures = self.delivery_failures.wrapping_add(1);
+                self.pending_drop = Some(seq);
+            } else if was_retransmit {
+                self.retransmits = self.retransmits.wrapping_add(1);
+            }
+        }
     }
 
-    /// Receive a typed value: the radio RX + the crypto + the
-    /// postcard-deserialize. Returns `None` when the slot had no frame.
-    pub async fn recv<T: serde::de::DeserializeOwned>(
-        &mut self,
-    ) -> Result<Option<T>, Error<P::Error>> {
-        let mut rx = [0u8; MAX_PAYLOAD];
-        let n = match self.frame(None, &mut rx).await? {
-            Some(n) => n,
-            None => return Ok(None),
-        };
-        let msg = postcard::from_bytes(&rx[..n]).map_err(Error::<P::Error>::from)?;
-        Ok(Some(msg))
+    /// Apply the peer's ACK/NACK carried by a received packet.
+    fn apply_ack_nack(&mut self, ack: u16, nack: &[u8]) {
+        self.state.lm.tx.on_ack(ack);
+        self.state
+            .lm
+            .tx
+            .on_nack_slots(nack, &self.state.lm.tx_run_slots);
+        if nack_nonzero(nack) {
+            self.nacks_recv = self.nacks_recv.wrapping_add(1);
+        }
     }
 
-    fn accept_seq(&self, seq: u8) -> bool {
-        self.state.accept_seq(seq)
-    }
-}
-
-/// Peripheral node.
-pub struct Peripheral<P: Phy> {
-    phy: P,
-    state: LinkState,
-    /// False until the central's beacon advertises a cadence >= our minimum
-    /// slot period. Until then this peripheral sends SlotRequest instead of
-    /// data in its TX slots, so a faster central can slow down.
-    cadence_ok: bool,
-    missed_frames: u8,
-    /// Last channel written to the phy (the phy is only re-tuned on change).
-    last_channel: Option<u8>,
-    /// Consecutive missed frames (the mirror of the central's adaptive-hop
-    /// trigger: both sides hop together after the same miss streak, so the
-    /// peripheral is not left listening on the old channel).
-    consecutive_misses: u8,
-    tx_buf: [u8; MAX_PAYLOAD + 16],
-    rx_pkt_buf: [u8; MAX_PAYLOAD + 16],
-}
-
-impl<P: Phy> Peripheral<P> {
-    /// Create a new peripheral.
-    pub async fn new(mut phy: P, cfg: Config) -> Result<Self, Error<P::Error>> {
-        phy.set_address(&cfg.address).await;
-        phy.flush().await;
-        let cadence_ok = phy.min_slot_period_us() == 0;
-        Ok(Self {
-            phy,
-            state: LinkState::new(&cfg),
-            cadence_ok,
-            missed_frames: 0,
-            last_channel: None,
-            consecutive_misses: 0,
-            tx_buf: [0u8; MAX_PAYLOAD + 16],
-            rx_pkt_buf: [0u8; MAX_PAYLOAD + 16],
-        })
+    /// Clear a pending Drop once the peer's cumulative ACK covers it.
+    fn clear_pending_drop(&mut self) {
+        if let Some(drop_seq) = self.pending_drop {
+            if !seq_gt(drop_seq, self.state.lm.tx.tx_acked) {
+                self.pending_drop = None;
+            }
+        }
     }
 
-    /// The current connection status (the hop gate).
-    pub fn status(&self) -> LinkStatus {
-        self.state.status
+    /// The local TX:RX ratio. The central's local ratio is
+    /// `Config::tx_rx_ratio`; the peripheral's local ratio is the reverse,
+    /// so both roles run exactly the same `tx then rx` data-plane rule and
+    /// the ratio is no longer a mirror special-case.
+    fn local_ratio(&self) -> (u8, u8) {
+        if self.state.central {
+            self.state.tx_rx_ratio
+        } else {
+            self.state.reverse_tx_rx_ratio
+        }
     }
 
-    /// Run one slot from the peripheral side (the mirror of the central's
-    /// ratio): the central's TX slots are our RX slots (the listen), the
-    /// central's RX slots are our TX slots (the reverse Data). No ack - the
-    /// seq window is the reliability.
-    pub async fn frame(
+    /// Advance epoch/bookkeeping shared by both roles.
+    fn advance_epoch(&mut self, hw_slot: u32) {
+        if hw_slot != 0 {
+            self.state.epoch = hw_slot.wrapping_add(1);
+        } else {
+            self.state.epoch = self.state.epoch.wrapping_add(1);
+        }
+    }
+
+    /// Run one slot (the symmetric data plane; role only affects the
+    /// acquisition packet and the beacon/SlotRequest sync branches).
+    async fn frame(
         &mut self,
         tx_payload: Option<&[u8]>,
         rx_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<P::Error>> {
+        self.offer_taken = false;
         let ch = self.state.scheduler.current();
         if self.last_channel != Some(ch) {
             self.phy.set_channel(ch).await;
             self.last_channel = Some(ch);
         }
 
-        // The mirrored slot decision.
-        let (tx_n, rx_n) = self.state.tx_rx_ratio;
-        let period = tx_n as u16 + rx_n as u16;
-        let central_is_tx = (self.state.slot_step as u16 % period) < tx_n as u16;
-        self.state.slot_step = self.state.slot_step.wrapping_add(1);
+        self.state.lm.tx.tick();
+        if !self.state.lm.tx.is_full() {
+            self.tx_space.signal(());
+        }
 
-        if central_is_tx {
-            // ---- the central's TX = our RX: the listen ----
-            let incoming_len = match self
+        let (c_tx, c_rx) = self.state.tx_rx_ratio;
+        let period = c_tx as u16 + c_rx as u16 + self.state.idle_slots as u16;
+        let hw_slot = self.phy.slot_count();
+        let phase = self.state.next_phase(hw_slot, period as u32);
+        if hw_slot != 0 {
+            // Stamp the op's target slot: the MPSL callback executes the
+            // op this frame publishes only in that exact slot (a late
+            // publish idles instead of running one slot off-phase).
+            self.phy.set_op_slot(hw_slot.wrapping_add(1));
+        }
+        if hw_slot == 0 {
+            self.state.slot_step = self.state.slot_step.wrapping_add(1);
+        }
+        let (local_tx, local_rx) = self.local_ratio();
+        let local_phase = self.to_local_phase(phase);
+        let central = self.state.central;
+        let central_is_tx = phase < c_tx as u32;
+        let acquiring =
+            !central && hw_slot != 0 && (!self.cadence_ok || !self.state.lm.rx.have);
+        let listen = central_is_tx || (acquiring && phase % 2 == 0);
+        let is_tx = if central {
+            local_phase < local_tx as u32
+        } else if acquiring {
+            !listen
+        } else {
+            local_phase < local_tx as u32
+        };
+        let active_end = local_tx as u32 + local_rx as u32;
+        if hw_slot != 0 {
+            // The first TX op of a run may execute one slot late: it still
+            // lands inside the peer's RX run. Any other late op would face
+            // a peer that has stopped listening (or transmit into its TX),
+            // so grace is 1 only here and only when the run continues.
+            self.phy.set_op_grace(if is_tx && local_phase == 0 && local_tx > 1 {
+                1
+            } else {
+                0
+            });
+        }
+
+        if is_tx {
+            let mut tx_payload = tx_payload;
+            let mut offer_rejected = false;
+
+            // Role-specific acquisition gating. Once both directions have
+            // traffic, the TX branch below is identical except for the
+            // central burst path.
+            let min_slot_us = self.phy.min_slot_period_us();
+            let slotrequest = !central
+                && min_slot_us > 0
+                && (!self.cadence_ok || !self.state.lm.rx.have);
+            let cadence_pending =
+                central && !self.cadence_negotiated && min_slot_us > 0;
+            let forced_beacon = central && (self.state.epoch % 64 == 0 || cadence_pending);
+
+            // Start of a new local TX run: clear the slot-position table.
+            if local_phase == 0 {
+                self.state.lm.tx_run_slots = [None; WINDOW_SIZE];
+            }
+
+            if slotrequest {
+                // Peripheral acquisition: this slot carries our minimum
+                // cadence instead of data, with the TX delay swept.
+                self.phy.set_tx_delay_sweep(true);
+                let outbound = Packet::SlotRequest { min_slot_us };
+                let n = self.encode_packet(&outbound)?;
+                // Acquisition SlotRequests stay on the plain path: they are
+                // isolated TX slots and must not inherit a half-open burst
+                // state from a previous acquisition attempt.
+                self.in_burst = false;
+                self.phy.transmit(&self.tx_buf[..n]).await?;
+                self.advance_epoch(hw_slot);
+                return Ok(None);
+            }
+            self.phy.set_tx_delay_sweep(false);
+
+            if central {
+                if forced_beacon {
+                    let outbound = self.beacon_packet(phase, period);
+                    let n = self.encode_packet(&outbound)?;
+                    self.transmit_outbound(n).await?;
+                } else {
+                    offer_rejected = self.enqueue_offer(tx_payload)?;
+                    let picked = self.pick_data_seq();
+                    let outbound = if let Some(drop_seq) = self.pending_drop {
+                        self.drop_packet(local_rx as usize)
+                    } else if let Some(seq) = picked {
+                        self.data_packet(seq, local_phase as u8, local_rx as usize)
+                    } else if self.state.lm.rx.have {
+                        self.ack_packet(local_rx as usize)
+                    } else {
+                        self.beacon_packet(phase, period)
+                    };
+                    let outbound_is_data = matches!(outbound, Packet::Data { .. });
+                    let n = self.encode_packet(&outbound)?;
+                    self.transmit_outbound(n).await?;
+                    if outbound_is_data {
+                        self.mark_data_sent(picked);
+                    }
+                }
+            } else {
+                offer_rejected = self.enqueue_offer(tx_payload)?;
+                let picked = self.pick_data_seq();
+                let outbound = if let Some(_) = self.pending_drop {
+                    Some(self.drop_packet(local_rx as usize))
+                } else if let Some(seq) = picked {
+                    Some(self.data_packet(seq, local_phase as u8, local_rx as usize))
+                } else if self.state.lm.rx.have {
+                    Some(self.ack_packet(local_rx as usize))
+                } else {
+                    None
+                };
+                if let Some(outbound) = outbound {
+                    let outbound_is_data = matches!(outbound, Packet::Data { .. });
+                    let n = self.encode_packet(&outbound)?;
+                    self.transmit_outbound(n).await?;
+                    if self.state.lm.nack_nonzero() {
+                        self.nack_sent = self.nack_sent.wrapping_add(1);
+                    }
+                    if outbound_is_data {
+                        self.mark_data_sent(picked);
+                    }
+                } else {
+                    self.phy.wait_slot().await;
+                }
+            }
+
+            self.advance_epoch(hw_slot);
+            if offer_rejected {
+                Err(Error::WindowFull)
+            } else {
+                Ok(None)
+            }
+        } else if local_phase >= active_end {
+            // ---- idle slot (the shared no-radio phase) ----
+            self.in_burst = false;
+            self.phy.wait_slot().await;
+            self.advance_epoch(hw_slot);
+            Ok(None)
+        } else {
+            // ---- RX slot (the shared listen path) ----
+            self.in_burst = false;
+            let slot_idx = (local_phase - local_tx as u32) as usize;
+            let rx_run_len = local_rx as usize;
+            let rx_run_end = active_end - 1;
+            if local_phase == local_tx as u32 {
+                self.state.lm.rx_run_mask = [0; NACK_BYTES];
+            }
+            let reply_len = match self
                 .phy
                 .receive(
                     &mut self.rx_pkt_buf,
@@ -531,110 +808,156 @@ impl<P: Phy> Peripheral<P> {
             {
                 Some(len) => len,
                 None => {
-                    self.missed_frames = self.missed_frames.saturating_add(1);
+                    if !central {
+                        self.missed_frames = self.missed_frames.saturating_add(1);
+                    }
                     self.state.on_miss(&mut self.consecutive_misses);
-                    return Ok(None);
+                    self.advance_epoch(hw_slot);
+                    if phase == rx_run_end {
+                        self.state.lm.nack_for_peer =
+                            nack_from_mask(rx_run_len, &self.state.lm.rx_run_mask);
+                        self.state.lm.rx_run_mask = [0; NACK_BYTES];
+                    }
+                    return deliver_rx(&mut self.state.lm.rx, rx_buf);
                 }
             };
 
-            let incoming = Packet::from_bytes(&self.rx_pkt_buf[..incoming_len])
+            let reply = Packet::from_bytes(&self.rx_pkt_buf[..reply_len])
                 .map_err(|_| Error::InvalidPacket)?;
-            self.missed_frames = 0;
+            if !central {
+                self.missed_frames = 0;
+            }
+            nack_set(&mut self.state.lm.rx_run_mask, slot_idx);
 
-            let mut received = None;
-            match incoming {
-                Packet::Data { seq, mut payload } => {
-                    self.state.decrypt_payload(&mut self.phy, &mut payload, seq, true)?;
-                    if self.accept_seq(seq) {
-                        let len = payload.len();
-                        if len > rx_buf.len() {
-                            return Err(Error::BufferTooSmall);
+            // Sync-only packets (SlotRequest/Beacon) prove a window exists
+            // but do NOT form a data link: enabling the adaptive hop on them
+            // can move the master away before the first Data ever lands.
+            let mut link_rx = false;
+            match reply {
+                Packet::Data {
+                    seq,
+                    ack,
+                    nack,
+                    mut payload,
+                } => {
+                    self.state
+                        .decrypt_payload(&mut self.phy, &mut payload, seq, central)?;
+                    self.apply_ack_nack(ack, &nack);
+                    if !central && self.state.status == LinkStatus::Disconnected
+                        && !self.state.lm.rx.in_window(seq)
+                    {
+                        self.state.lm.rx.resync(seq);
+                        self.resyncs = self.resyncs.wrapping_add(1);
+                    }
+                    link_rx = true;
+                    self.state.lm.rx.receive(seq, &payload);
+                }
+                Packet::Ack { ack, nack } => {
+                    link_rx = true;
+                    self.apply_ack_nack(ack, &nack);
+                }
+                Packet::Drop { seq, ack, nack } => {
+                    link_rx = true;
+                    self.state.lm.rx.skip_to(seq);
+                    self.apply_ack_nack(ack, &nack);
+                }
+                Packet::SlotRequest { min_slot_us } if central => {
+                    if !self.cadence_negotiated {
+                        self.cadence_negotiated = true;
+                        let negotiated = self.phy.min_slot_period_us().max(min_slot_us).max(1);
+                        if negotiated != self.phy.slot_period_us() {
+                            self.phy.align_slot_period(negotiated);
                         }
-                        rx_buf[..len].copy_from_slice(&payload);
-                        received = Some(len);
-                        self.state.rx_seq = seq;
                     }
                 }
-                Packet::Beacon { channel_index, flags, slot_us, slot_phase, .. } => {
-                    // The beacon is the hop authority; it also carries the
-                    // central's cadence and RX window: align to them at
-                    // runtime (to the poorer side's timing).
+                Packet::Beacon {
+                    channel_index,
+                    flags,
+                    slot_us,
+                    slot_phase,
+                    rx_en_offset,
+                    tx_en_offset,
+                    rx_ramp,
+                    tx_ramp,
+                    ..
+                } if !central => {
                     self.state.scheduler.sync(channel_index);
                     if flags > 0 {
                         self.phy.set_peer_rx_window(flags as u16 * 16);
+                    }
+                    if rx_en_offset > 0 {
+                        self.phy.set_peer_rx_en_offset(rx_en_offset);
+                    }
+                    if tx_en_offset > 0 {
+                        self.phy.set_peer_tx_en_offset(tx_en_offset);
+                    }
+                    if rx_ramp > 0 {
+                        self.phy.set_peer_rx_ramp(rx_ramp);
+                    }
+                    if tx_ramp > 0 {
+                        self.phy.set_peer_tx_ramp(tx_ramp);
                     }
                     if slot_us > 0 {
                         self.phy.align_slot_period(slot_us);
                     }
                     let min = self.phy.min_slot_period_us();
                     self.cadence_ok = min == 0 || slot_us >= min;
-                    // The slot phase: our next slot mirrors the central's
-                    // next (its TX/RX ratio decision), so our lone TX slot
-                    // lands on its lone RX slot.
-                    let period =
-                        self.state.tx_rx_ratio.0 as u16 + self.state.tx_rx_ratio.1 as u16;
-                    self.state.slot_step = ((slot_phase as u16 + 1) % period) as u8;
+                    // Re-anchor the mirror phase only while still acquiring.
+                    if !self.state.lm.rx.have {
+                        let p_hw_slot = self.phy.slot_count();
+                        if p_hw_slot != 0 {
+                            let beacon_phase = slot_phase as u32 % period as u32;
+                            self.state.slot_offset =
+                                (beacon_phase.wrapping_sub(p_hw_slot % period as u32))
+                                    % period as u32;
+                        } else {
+                            self.state.slot_step = (slot_phase as u32 + 1) % period as u32;
+                        }
+                    }
                 }
                 _ => {}
             }
-            self.state.on_rx(&mut self.consecutive_misses);
-            self.state.epoch = self.state.epoch.wrapping_add(1);
-            Ok(received)
-        } else {
-            // ---- the central's RX = our TX: the reverse Data ----
-            let min_slot_us = self.phy.min_slot_period_us();
-            if !self.cadence_ok && min_slot_us > 0 {
-                // Until the central acknowledges a cadence we can follow,
-                // this slot carries our minimum period instead of data.
-                let outbound = Packet::SlotRequest { min_slot_us };
-                let n = outbound
-                    .to_bytes(&mut self.tx_buf)
-                    .map_err(Error::<P::Error>::from)?;
-                self.phy.transmit(&self.tx_buf[..n]).await?;
-            } else if let Some(data) = tx_payload {
-                let mut payload = Vec::<u8, MAX_PAYLOAD>::new();
-                if data.len() > payload.capacity() {
-                    return Err(Error::BufferTooSmall);
-                }
-                payload.extend_from_slice(data).map_err(|_| Error::BufferTooSmall)?;
-                self.state.encrypt_payload(&mut self.phy, &mut payload, false)?;
-                let outbound = Packet::Data {
-                    seq: self.state.tx_seq,
-                    payload,
-                };
-                let n = outbound
-                    .to_bytes(&mut self.tx_buf)
-                    .map_err(Error::<P::Error>::from)?;
-                self.phy.transmit(&self.tx_buf[..n]).await?;
-                self.state.tx_seq = self.state.tx_seq.wrapping_add(1);
+
+            self.clear_pending_drop();
+            if link_rx {
+                self.state.on_rx(&mut self.consecutive_misses);
             } else {
-                // No payload and the cadence is already agreed: still pace
-                // this slot so the bare software slot grid stays time-aligned
-                // (the MPSL chain already paces itself; its wait_slot is a
-                // no-op).
-                self.phy.wait_slot().await;
+                self.consecutive_misses = 0;
             }
-            self.state.epoch = self.state.epoch.wrapping_add(1);
-            Ok(None)
+            self.advance_epoch(hw_slot);
+            if phase == rx_run_end {
+                self.state.lm.nack_for_peer =
+                    nack_from_mask(rx_run_len, &self.state.lm.rx_run_mask);
+                self.state.lm.rx_run_mask = [0; NACK_BYTES];
+            }
+            deliver_rx(&mut self.state.lm.rx, rx_buf)
         }
     }
 
-    /// Send a typed value (the peripheral's reverse Data).
-    pub async fn send<T: serde::Serialize + ?Sized>(
+    async fn send<T: serde::Serialize + ?Sized>(
         &mut self,
         value: &T,
     ) -> Result<(), Error<P::Error>> {
-        let mut buf = [0u8; MAX_PAYLOAD + 16];
-        let written = postcard::to_slice(value, &mut buf)
-            .map_err(Error::<P::Error>::from)?;
+        let mut buf = [0u8; MAX_PAYLOAD];
+        let written = postcard::to_slice(value, &mut buf).map_err(Error::<P::Error>::from)?;
         let n = written.len();
-        let mut rx = [0u8; MAX_PAYLOAD];
-        self.frame(Some(&buf[..n]), &mut rx).await?;
+        self.pending_tx[..n].copy_from_slice(&buf[..n]);
+        self.pending_tx_len = n;
+        self.send_done.reset();
+        self.send_done.wait().await;
         Ok(())
     }
 
-    /// Receive a typed value (the central's Data).
-    pub async fn recv<T: serde::de::DeserializeOwned>(
+    async fn wait_for_tx_space(&mut self) -> Result<(), Error<P::Error>> {
+        if !self.state.lm.tx.is_full() {
+            return Ok(());
+        }
+        self.tx_space.reset();
+        self.tx_space.wait().await;
+        Ok(())
+    }
+
+    async fn recv<T: serde::de::DeserializeOwned>(
         &mut self,
     ) -> Result<Option<T>, Error<P::Error>> {
         let mut rx = [0u8; MAX_PAYLOAD];
@@ -645,12 +968,571 @@ impl<P: Phy> Peripheral<P> {
         let msg = postcard::from_bytes(&rx[..n]).map_err(Error::<P::Error>::from)?;
         Ok(Some(msg))
     }
+}
 
-    fn handle_ack(&mut self, ack: u8) {
-        let _ = ack;
+/// Central node (the synchronization master).
+pub struct Central<P: Phy> {
+    core: LinkCore<P>,
+}
+
+impl<P: Phy> Central<P> {
+    /// Create a new central.
+    pub async fn new(phy: P, cfg: Config) -> Result<Self, Error<P::Error>> {
+        Ok(Self {
+            core: LinkCore::new(phy, cfg).await?,
+        })
     }
 
-    fn accept_seq(&self, seq: u8) -> bool {
-        self.state.accept_seq(seq)
+    pub fn status(&self) -> LinkStatus {
+        self.core.status()
+    }
+
+    pub fn delivery_failures(&self) -> u32 {
+        self.core.delivery_failures
+    }
+
+    pub fn window_full(&self) -> u32 {
+        self.core.window_full
+    }
+
+    pub fn tx_window_full(&self) -> bool {
+        self.core.tx_window_full()
+    }
+
+    /// True when the raw offer passed to the last `frame()` was enqueued
+    /// into the TX window (a TX slot with window space).
+    pub fn offer_taken(&self) -> bool {
+        self.core.offer_taken
+    }
+
+    /// In-flight (unacknowledged) Data entries in the TX window.
+    pub fn tx_inflight(&self) -> u8 {
+        self.core.tx_inflight()
+    }
+
+    /// Diagnostic: the link's next software slot phase (0..period-1).
+    pub fn slot_phase(&self) -> u32 {
+        self.core.link_phase()
+    }
+
+    /// Adjust the follower early TX margin at runtime (central is a no-op).
+    pub fn set_tx_phase_margin_us(&mut self, margin_us: i32) {
+        self.core.set_tx_phase_margin_us(margin_us);
+    }
+
+    pub fn retransmits(&self) -> u32 {
+        self.core.retransmits
+    }
+
+    pub fn nacks_recv(&self) -> u32 {
+        self.core.nacks_recv
+    }
+
+    pub async fn frame(
+        &mut self,
+        tx_payload: Option<&[u8]>,
+        rx_buf: &mut [u8],
+    ) -> Result<Option<usize>, Error<P::Error>> {
+        self.core.frame(tx_payload, rx_buf).await
+    }
+
+    pub async fn send<T: serde::Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), Error<P::Error>> {
+        self.core.send(value).await
+    }
+
+    pub async fn wait_for_tx_space(&mut self) -> Result<(), Error<P::Error>> {
+        self.core.wait_for_tx_space().await
+    }
+
+    pub async fn recv<T: serde::de::DeserializeOwned>(
+        &mut self,
+    ) -> Result<Option<T>, Error<P::Error>> {
+        self.core.recv().await
+    }
+}
+
+/// Peripheral node (the synchronization follower).
+pub struct Peripheral<P: Phy> {
+    core: LinkCore<P>,
+}
+
+impl<P: Phy> Peripheral<P> {
+    /// Create a new peripheral.
+    pub async fn new(phy: P, cfg: Config) -> Result<Self, Error<P::Error>> {
+        Ok(Self {
+            core: LinkCore::new(phy, cfg).await?,
+        })
+    }
+
+    pub fn status(&self) -> LinkStatus {
+        self.core.status()
+    }
+
+    pub fn delivery_failures(&self) -> u32 {
+        self.core.delivery_failures
+    }
+
+    pub fn window_full(&self) -> u32 {
+        self.core.window_full
+    }
+
+    pub fn tx_window_full(&self) -> bool {
+        self.core.tx_window_full()
+    }
+
+    /// True when the raw offer passed to the last `frame()` was enqueued
+    /// into the TX window (a TX slot with window space).
+    pub fn offer_taken(&self) -> bool {
+        self.core.offer_taken
+    }
+
+    /// In-flight (unacknowledged) Data entries in the TX window.
+    pub fn tx_inflight(&self) -> u8 {
+        self.core.tx_inflight()
+    }
+
+    /// Diagnostic: the link's next software slot phase (0..period-1).
+    pub fn slot_phase(&self) -> u32 {
+        self.core.link_phase()
+    }
+
+    /// Adjust the follower early TX margin at runtime (central is a no-op).
+    pub fn set_tx_phase_margin_us(&mut self, margin_us: i32) {
+        self.core.set_tx_phase_margin_us(margin_us);
+    }
+
+    pub fn retransmits(&self) -> u32 {
+        self.core.retransmits
+    }
+
+    pub fn resyncs(&self) -> u32 {
+        self.core.resyncs
+    }
+
+    pub fn nack_sent(&self) -> u32 {
+        self.core.nack_sent
+    }
+
+    pub fn rx_span(&self) -> u16 {
+        self.core
+            .state
+            .lm
+            .rx
+            .highest_seen
+            .wrapping_sub(self.core.state.lm.rx.next_expected)
+    }
+
+    pub async fn frame(
+        &mut self,
+        tx_payload: Option<&[u8]>,
+        rx_buf: &mut [u8],
+    ) -> Result<Option<usize>, Error<P::Error>> {
+        self.core.frame(tx_payload, rx_buf).await
+    }
+
+    pub async fn send<T: serde::Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), Error<P::Error>> {
+        self.core.send(value).await
+    }
+
+    pub async fn wait_for_tx_space(&mut self) -> Result<(), Error<P::Error>> {
+        self.core.wait_for_tx_space().await
+    }
+
+    pub async fn recv<T: serde::de::DeserializeOwned>(
+        &mut self,
+    ) -> Result<Option<T>, Error<P::Error>> {
+        self.core.recv().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Address, MAX_RETRIES, RETRY_TIMEOUT_SLOTS};
+    use crate::link_mgmt::TxWindow;
+
+    #[test]
+    fn local_phase_mapping_without_idle() {
+        let mut cfg = Config::new([0; 4], Address([0xE7; 5]), Role::Central)
+            .with_tx_rx_ratio(8, 2);
+        let central = LinkState::new(&cfg);
+        assert_eq!(central.local_phase_for(0), 0);
+        assert_eq!(central.local_phase_for(7), 7);
+        assert_eq!(central.local_phase_for(8), 8);
+        assert_eq!(central.local_phase_for(9), 9);
+
+        cfg.role = Role::Peripheral;
+        let peripheral = LinkState::new(&cfg);
+        assert_eq!(peripheral.local_phase_for(0), 2);
+        assert_eq!(peripheral.local_phase_for(7), 9);
+        assert_eq!(peripheral.local_phase_for(8), 0);
+        assert_eq!(peripheral.local_phase_for(9), 1);
+    }
+
+    #[test]
+    fn local_phase_mapping_with_idle() {
+        let mut cfg = Config::new([0; 4], Address([0xE7; 5]), Role::Central)
+            .with_tx_rx_idle(8, 4, 4);
+        let central = LinkState::new(&cfg);
+        assert_eq!(central.local_phase_for(0), 0);
+        assert_eq!(central.local_phase_for(11), 11);
+        assert_eq!(central.local_phase_for(12), 12);
+        assert_eq!(central.local_phase_for(15), 15);
+
+        cfg.role = Role::Peripheral;
+        let peripheral = LinkState::new(&cfg);
+        // central TX 0..7 -> peripheral RX 4..11
+        assert_eq!(peripheral.local_phase_for(0), 4);
+        assert_eq!(peripheral.local_phase_for(7), 11);
+        // central RX 8..11 -> peripheral TX 0..3
+        assert_eq!(peripheral.local_phase_for(8), 0);
+        assert_eq!(peripheral.local_phase_for(11), 3);
+        // idle is shared
+        assert_eq!(peripheral.local_phase_for(12), 12);
+        assert_eq!(peripheral.local_phase_for(15), 15);
+    }
+
+    #[test]
+    fn reverse_ratio_is_complement_or_normalized() {
+        let mut cfg = Config::new([0; 4], Address([0xE7; 5]), Role::Central);
+        cfg.tx_rx_ratio = (8, 2);
+        cfg.reverse_tx_rx_ratio = (3, 7);
+        let state = LinkState::new(&cfg);
+        assert_eq!(state.reverse_tx_rx_ratio, (2, 8));
+
+        cfg.reverse_tx_rx_ratio = (2, 8);
+        let state = LinkState::new(&cfg);
+        assert_eq!(state.reverse_tx_rx_ratio, (2, 8));
+    }
+
+    #[test]
+    fn config_capacity_api() {
+        let cfg = Config::new([0; 4], Address([0xE7; 5]), Role::Central)
+            .with_tx_rx_idle(8, 4, 4);
+        assert_eq!(cfg.period_slots(), 16);
+        assert_eq!(cfg.tx_slots_per_period(Role::Central), 8);
+        assert_eq!(cfg.tx_slots_per_period(Role::Peripheral), 4);
+    }
+
+    #[test]
+    fn config_builder_with_idle_keeps_complement() {
+        let cfg = Config::new([0; 4], Address([0xE7; 5]), Role::Central)
+            .with_tx_rx_idle(6, 2, 2);
+        assert_eq!(cfg.tx_rx_ratio, (6, 2));
+        assert_eq!(cfg.reverse_tx_rx_ratio, (2, 6));
+        assert_eq!(cfg.idle_slots, 2);
+    }
+
+    #[test]
+    fn config_builder_keeps_ratios_complementary() {
+        let cfg = Config::new([0; 4], Address([0xE7; 5]), Role::Central)
+            .with_tx_rx_ratio(5, 3);
+        assert_eq!(cfg.tx_rx_ratio, (5, 3));
+        assert_eq!(cfg.reverse_tx_rx_ratio, (3, 5));
+    }
+
+    #[test]
+    fn seq_gt_is_circular() {
+        assert!(seq_gt(1, 0));
+        assert!(!seq_gt(0, 1));
+        assert!(seq_gt(0, u16::MAX)); // wraps
+        assert!(!seq_gt(u16::MAX, 0));
+        assert!(!seq_gt(7, 7));
+    }
+
+    #[test]
+    fn zero_tx_rx_ratio_is_normalized() {
+        let mut cfg = Config::new(
+            [0xAB, 0xCD, 0xEF, 0x01],
+            Address([0xE7; 5]),
+            Role::Central,
+        );
+        cfg.tx_rx_ratio = (0, 0);
+        let state = LinkState::new(&cfg);
+        assert_eq!(state.tx_rx_ratio, (1, 1));
+    }
+
+    #[test]
+    fn tx_ack_frees_contiguous_prefix() {
+        let mut w = TxWindow::new();
+        for i in 0..8u16 {
+            w.enqueue(&[i as u8; 4]);
+        }
+        assert_eq!(w.inflight, 8);
+        w.on_ack(3); // ack 0,1,2,3
+        assert_eq!(w.inflight, 4);
+        assert!(!w.is_full());
+        // seq 4..7 still in flight
+        assert_eq!(w.pick(), Some(4));
+    }
+
+    #[test]
+    fn tx_blocked_window_picks_oldest_sent_for_fallback() {
+        let mut w = TxWindow::new();
+        for i in 0..(WINDOW_SIZE as u16) {
+            w.enqueue(&[i as u8; 4]);
+            w.mark_sent(i);
+        }
+        assert!(w.is_full());
+        assert_eq!(w.pick(), None); // no retransmit/unsent
+        assert_eq!(w.pick_sent_for_blocked(), Some(0));
+    }
+
+    #[test]
+    fn tx_window_full_after_hole_prevents_overwrite() {
+        let mut w = TxWindow::new();
+        for i in 0..(WINDOW_SIZE as u16) {
+            w.enqueue(&[i as u8; 4]);
+        }
+        w.on_ack(7);
+        // A delivery failure at seq 10 frees that slot but leaves
+        // 8, 9, 11..15 in flight. The window still has room for the next
+        // sequence numbers (16..23), but seq 24 would wrap onto seq 8's
+        // slot, so the window must report full before that happens.
+        w.drop(10);
+        assert_eq!(w.inflight, 7);
+        assert!(!w.is_full());
+        for _ in 0..8 {
+            w.enqueue(&[0u8; 4]); // seqs 16..23
+        }
+        assert_eq!(w.inflight, 15);
+        assert!(w.is_full());
+        assert_eq!(w.entry(8).seq, 8);
+        assert_eq!(w.entry(23).seq, 23);
+    }
+
+    #[test]
+    fn tx_ack_ignores_ack_beyond_enqueued_range() {
+        let mut w = TxWindow::new();
+        for i in 0..4u16 {
+            w.enqueue(&[i as u8; 4]);
+            w.mark_sent(i);
+        }
+        // A peer restart/resync can send an ACK far ahead of anything this
+        // node has enqueued. Accepting it would free in-flight entries the
+        // peer never received, so it must be ignored.
+        w.on_ack(999);
+        assert_eq!(w.tx_acked, u16::MAX);
+        assert_eq!(w.inflight, 4);
+        assert!(!w.is_full());
+        // A valid cumulative ACK still drains normally.
+        w.on_ack(3);
+        assert_eq!(w.inflight, 0);
+        assert_eq!(w.tx_acked, 3);
+    }
+
+    #[test]
+    fn tx_on_nack_slots_flags_by_slot_position() {
+        let mut w = TxWindow::new();
+        for i in 0..8u16 {
+            w.enqueue(&[i as u8; 4]);
+            w.mark_sent(i);
+        }
+        let mut slots = [None; WINDOW_SIZE];
+        slots[0] = Some(TxRunSlot { slot: 2, seq: 2 });
+        slots[1] = Some(TxRunSlot { slot: 4, seq: 4 });
+        let mut nack = [0u8; NACK_BYTES];
+        nack[0] = 0b0001_0100; // bits 2 and 4
+        w.on_nack_slots(&nack, &slots);
+        assert_eq!(w.pick(), Some(2));
+        w.mark_sent(2);
+        assert_eq!(w.pick(), Some(4));
+    }
+
+    #[test]
+    fn tx_on_nack_slots_ignores_bits_without_entries() {
+        let mut w = TxWindow::new();
+        for i in 0..4u16 {
+            w.enqueue(&[i as u8; 4]);
+            w.mark_sent(i);
+        }
+        // Slot 0 carried no Data in the last run, so NACK bit 0 must not
+        // flag seq 0 (which was sent in some earlier run).
+        let slots = [None; WINDOW_SIZE];
+        let mut nack = [0u8; NACK_BYTES];
+        nack[0] = 0b1;
+        w.on_nack_slots(&nack, &slots);
+        assert_eq!(w.pick(), None);
+    }
+
+    #[test]
+    fn tx_nack_flags_retransmit() {
+        let mut w = TxWindow::new();
+        for i in 0..8u16 {
+            w.enqueue(&[i as u8; 4]);
+        }
+        // ack up to 1, holes at 2 and 4 (bits 0 and 2 relative to ack=1)
+        w.on_ack(1);
+        w.on_nack(1, 0b101);
+        // the flagged retransmits are picked first, lowest seq first
+        assert_eq!(w.pick(), Some(2));
+        w.mark_sent(2);
+        assert_eq!(w.pick(), Some(4));
+    }
+
+    #[test]
+    fn tx_window_full_and_timeout() {
+        let mut w = TxWindow::new();
+        for i in 0..(WINDOW_SIZE as u16) {
+            w.enqueue(&[i as u8]);
+        }
+        assert!(w.is_full());
+        // mark all sent, then tick past the timeout: they get flagged
+        for i in 0..(WINDOW_SIZE as u16) {
+            assert!(!w.mark_sent(i));
+        }
+        for _ in 0..RETRY_TIMEOUT_SLOTS {
+            w.tick();
+        }
+        // the lowest seq is now flagged for retransmit
+        assert_eq!(w.pick(), Some(0));
+    }
+
+    #[test]
+    fn tx_retry_exhaustion_drops() {
+        let mut w = TxWindow::new();
+        w.enqueue(&[9u8; 2]);
+        assert!(!w.mark_sent(0)); // first send
+        for _ in 1..MAX_RETRIES {
+            assert!(!w.mark_sent(0)); // retransmits within budget
+        }
+        assert!(w.mark_sent(0)); // the MAX_RETRIES-th retransmit is exhausted
+        w.drop(0);
+        assert_eq!(w.inflight, 0);
+    }
+
+    #[test]
+    fn rx_in_order_deliver() {
+        let mut r = RxWindow::new();
+        assert!(r.receive(0, &[10, 11]));
+        assert_eq!(r.peek_len(), Some(2));
+        let e = r.pop_head().unwrap();
+        assert_eq!(e.len, 2);
+        assert_eq!(&e.payload[..2], &[10, 11]);
+        assert_eq!(r.ack(), 0);
+        assert_eq!(r.nack(), 0);
+    }
+
+    #[test]
+    fn one_ack_after_multi_slot_run_flags_retransmit() {
+        let mut tx = TxWindow::new();
+        let mut rx = RxWindow::new();
+
+        // One TX run sends eight packets; seq 2 is lost on the air.
+        for seq in 0..8u16 {
+            tx.enqueue(&[seq as u8; 4]);
+        }
+        for seq in 0..8u16 {
+            tx.mark_sent(seq);
+            if seq != 2 {
+                rx.receive(seq, &[seq as u8]);
+            }
+            // The link delivers at most one in-order payload per RX slot.
+            if rx.peek_len().is_some() {
+                rx.pop_head();
+            }
+        }
+
+        // The receiver then emits its single ACK/NACK for the whole run.
+        let ack = rx.ack();
+        let nack = rx.nack();
+        assert_eq!(ack, 1); // delivered 0 and 1
+        assert_eq!(nack, 0b1); // bit 0 = seq 2 is missing
+
+        tx.on_ack(ack);
+        tx.on_nack(ack, nack);
+        // The bitmap drives the retransmit: seq 2 is picked first.
+        assert_eq!(tx.pick(), Some(2));
+    }
+
+    #[test]
+    fn rx_out_of_order_nack_and_reorder() {
+        let mut r = RxWindow::new();
+        // seq 0 and 2 arrive, 1 missing
+        assert!(r.receive(0, &[0]));
+        assert!(r.receive(2, &[2]));
+        // nothing delivered yet: the ack is the "no ack" sentinel
+        assert_eq!(r.ack(), 0xFFFF);
+        assert_eq!(r.nack(), 0b10); // bit 1 = seq 1 missing
+                                    // deliver 0, then the head is 1 (not yet present)
+        assert_eq!(r.pop_head().unwrap().payload[0], 0);
+        assert_eq!(r.peek_len(), None);
+        assert_eq!(r.ack(), 0);
+        // seq 1 arrives: now 1 and 2 are contiguous
+        assert!(r.receive(1, &[1]));
+        assert_eq!(r.peek_len(), Some(1));
+        assert_eq!(r.pop_head().unwrap().payload[0], 1);
+        assert_eq!(r.pop_head().unwrap().payload[0], 2);
+        assert_eq!(r.ack(), 2);
+        assert_eq!(r.nack(), 0);
+    }
+
+    #[test]
+    fn rx_resync_rebaselines() {
+        let mut r = RxWindow::new();
+        r.resync(5000);
+        assert!(r.in_window(5000));
+        assert!(!r.in_window(0)); // far behind the new baseline
+        assert!(r.receive(5000, &[1]));
+        assert_eq!(r.peek_len(), Some(1));
+    }
+
+    /// Full ARQ loop (sender TxWindow + receiver RxWindow) over a 12.5%-lossy
+    /// channel: every packet must be delivered exactly once, in order.
+    #[test]
+    fn arq_recovers_loss_in_order() {
+        let mut tx = TxWindow::new();
+        let mut rx = RxWindow::new();
+        const TOTAL: u16 = 100;
+        let mut next_new: u16 = 0;
+        let mut delivered: Vec<u8, 128> = Vec::new();
+        let mut send_count: u32 = 0;
+
+        for _ in 0..100_000 {
+            // 1. generate a new packet (up to TOTAL, while the window has room)
+            if next_new < TOTAL && !tx.is_full() {
+                tx.enqueue(&[next_new as u8]);
+                next_new += 1;
+            }
+            tx.tick();
+
+            // 2. sender picks one packet and "transmits" it (12.5% lost)
+            if let Some(seq) = tx.pick() {
+                let payload = tx.entry(seq).payload[0];
+                let lost = send_count % 8 == 7;
+                if !lost {
+                    rx.receive(seq, &[payload]);
+                }
+                tx.mark_sent(seq);
+                send_count += 1;
+            }
+
+            // 3. receiver delivers in-order
+            while rx.peek_len().is_some() {
+                let e = rx.pop_head().unwrap();
+                delivered.push(e.payload[0]).ok();
+            }
+
+            // 4. feed the receiver's ACK/NACK back to the sender
+            let ack = rx.ack();
+            let nack = rx.nack();
+            tx.on_ack(ack);
+            tx.on_nack(ack, nack);
+
+            if delivered.len() >= TOTAL as usize {
+                break;
+            }
+        }
+
+        assert_eq!(delivered.len(), TOTAL as usize);
+        for (i, s) in delivered.iter().enumerate() {
+            assert_eq!(*s, i as u8);
+        }
     }
 }

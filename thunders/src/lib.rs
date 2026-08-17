@@ -2,19 +2,21 @@
 #![warn(missing_docs)]
 
 //! `thunders` — a small, `no_std`, async RF protocol stack for
-//! Nordic nRF and external transceivers, designed around a 1 ms
-//! superframe and `postcard` serialization.
+//! Nordic nRF radios, designed around a slot-based schedule and
+//! `postcard` serialization.
 
 pub mod config;
 pub mod error;
-pub mod ipc;
 pub mod link;
+pub mod link_mgmt;
 pub mod packet;
 pub mod phy;
 pub mod scheduler;
 pub mod security;
 
-pub use config::{Address, Config, DeviceId, Role, MAX_PAYLOAD};
+pub use config::{
+    Address, Config, DeviceId, Role, MAX_PAYLOAD, NACK_BYTES, RETRY_TIMEOUT_SLOTS, WINDOW_SIZE,
+};
 pub use error::Error;
 pub use link::{Central, LinkStatus, Peripheral};
 pub use packet::Packet;
