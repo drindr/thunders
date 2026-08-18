@@ -162,6 +162,41 @@ delay 扩至约 **229 µs**，完整覆盖 0–210 µs acquisition sweep。协�
 预算会把 sweep 钳到 ≤129 µs，因此无法触及需要的窗口，且实测更差，
 已回退。这个失败反过来验证了 grant 长度才是最终物理约束。
 
+#### 4c-6. 协商式短/长 phase cadence（500/600 µs）
+
+全600稳定但让不需要 follower delay 的 central-TX 相位也付出17%成本。
+现在两端先以全600采集，SlotRequest 上报 short/long capability；central
+收到**一颗**SR后确定profile并选择未来16个superframe后的phase-0绝对
+硬件slot作为生效点。生效前每个central TX slot都发commit beacon（8:2
+下约128次接收机会）。peripheral只有在两-beacon投票得到精确
+`slot_offset`后，才把central epoch翻译成本地apply slot并arm profile。
+
+callback按逻辑phase分别计算当前距离和下一grant：
+
+```text
+current = cadence(slot)
+next    = cadence(slot + 1)
+request.distance_us = current + one-shot PLL correction
+request.length_us   = next - 150
+```
+
+默认8:2 profile为：
+
+- central TX phases 0..7：short **500 µs**；
+- peripheral TX / reverse phases 8..9：long **600 µs**；
+- superframe：`8×500 + 2×600 = 5200 µs`，实测 **1922–1923 slots/s**，
+  比全600的1666/s提升 **15.4%**；
+- 长echo仍保留450 µs grant和约229 µs合法delay。
+
+曾A/B short=450：central达到2082/s，但5340 follower只能维持
+1820–1925/s，出现2/8 profile失步；因此能力协商必须使用**实测PHY下限**
+而非纯airtime预算。当前2M板广告500，1M LM20广告650；以后只有验证过
+的backend才可广告更短值。
+
+验证：52840→5340连续 **8/8**（最高tx=506/rx=505）；完整六个MPSL
+方向 **6/6**，forward loss 0–0.13%，rev_arq 0.12–0.38%，包括原弱点
+LM20↔5340。bare继续走原uniform cadence，不参与profile。
+
 ### 5. bench 计时从 central BENCH READY 开始
 
 `scripts/bench.sh run-pair`：

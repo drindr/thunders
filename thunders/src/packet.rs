@@ -47,6 +47,17 @@ pub enum Packet {
         rx_ramp: u8,
         /// The sender's measured TXEN -> READY ramp, in us.
         tx_ramp: u8,
+        /// Negotiated cadence-profile generation (0 = uniform fallback).
+        cadence_id: u8,
+        /// Cadence of central-TX short phases.
+        short_slot_us: u16,
+        /// Cadence of reverse/idle long phases.
+        long_slot_us: u16,
+        /// Number of leading central phases that use `short_slot_us`.
+        short_phases: u16,
+        /// Absolute central hardware slot where the profile takes effect
+        /// (0 = offer only, not armed yet).
+        cadence_apply_epoch: u32,
     },
     /// Data packet carrying a payload, plus the cumulative ACK and the
     /// NACK bitmap for the opposite direction (selective-repeat reliable
@@ -94,8 +105,13 @@ pub enum Packet {
     /// network advertises the minimum slot period it can sustain, and the
     /// central adopts `max(current, min_slot_us)`.
     SlotRequest {
-        /// The peripheral's minimum slot period in microseconds.
+        /// The peripheral's minimum uniform/long slot period in microseconds.
         min_slot_us: u16,
+        /// The peripheral's minimum short-phase period.
+        min_short_slot_us: u16,
+        /// Cadence handshake state: low 7 bits are the seen profile id;
+        /// bit 7 means the armed apply epoch was seen and scheduled.
+        cadence_ack: u8,
         /// The peripheral's cumulative RX ACK. An acquiring peripheral
         /// answers only with SlotRequests (no Data/Ack packets), so
         /// without this the central could never clear a pending_drop via
@@ -192,6 +208,11 @@ mod tests {
             tx_en_offset: 20,
             rx_ramp: 40,
             tx_ramp: 40,
+            cadence_id: 1,
+            short_slot_us: 450,
+            long_slot_us: 600,
+            short_phases: 8,
+            cadence_apply_epoch: 1024,
         };
         let mut buf = [0u8; 64];
         let n = pkt.to_bytes(&mut buf).unwrap();

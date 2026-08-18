@@ -88,13 +88,10 @@ struct LinkState {
     /// gap-shifted measurement cannot freeze the mirror at a wrong
     /// offset.
     beacon_anchor_pending: Option<u32>,
-    /// The previous beacon's (phase, catch_slot) for the differential
-    /// anchor update (which measures the count lag accumulated between
-    /// beacons - see the beacon arm).
-    beacon_anchor_prev: Option<(u32, u32)>,
-    /// True once the absolute first anchor was adopted (the differential
-    /// form then maintains it).
-    beacon_anchor_abs: bool,
+    /// True once the two-beacon vote adopted an absolute hardware-slot
+    /// mirror offset. Cadence profiles are not armed before this mapping is
+    /// known, because their apply epoch is expressed in central slot space.
+    beacon_anchor_ready: bool,
     /// The connection status (the hop gate).
     status: LinkStatus,
     /// Consecutive catches while Disconnected (the form-up streak).
@@ -136,8 +133,7 @@ impl LinkState {
             slot_step: 0,
             slot_offset: 0,
             beacon_anchor_pending: None,
-            beacon_anchor_prev: None,
-            beacon_anchor_abs: false,
+            beacon_anchor_ready: false,
             status: LinkStatus::Disconnected,
             connect_streak: 0,
             central: matches!(cfg.role, Role::Central),
@@ -314,21 +310,6 @@ impl LinkState {
     }
 }
 
-/// Build the beacon packet for a TX slot.
-fn make_beacon<P: Phy>(state: &LinkState, phy: &P, step: u32, period: u16) -> Packet {
-    Packet::Beacon {
-        epoch: state.epoch,
-        channel_index: state.scheduler.index(),
-        flags: (phy.rx_window_us() / 16).min(255) as u8,
-        slot_us: phy.slot_period_us(),
-        slot_phase: (step % period as u32) as u16,
-        rx_en_offset: phy.rx_en_offset_us(),
-        tx_en_offset: phy.tx_en_offset_us(),
-        rx_ramp: phy.rx_ramp_us(),
-        tx_ramp: phy.tx_ramp_us(),
-    }
-}
-
 /// Deliver one in-order payload from the reorder window into `rx_buf`.
 fn deliver_rx<P>(rx: &mut RxWindow, rx_buf: &mut [u8]) -> Result<Option<usize>, Error<P>> {
     if let Some(len) = rx.peek_len() {
@@ -355,9 +336,19 @@ struct LinkCore<P: Phy> {
     /// True after the first SlotRequest: cadence is negotiated once, then
     /// the central keeps that period and the peripheral follows it.
     cadence_negotiated: bool,
-    /// False until the central's beacon advertises a cadence >= our minimum
-    /// slot period. Peripheral-only; the central ignores this field.
+    /// False until the central's beacon advertises/schedules a cadence this
+    /// PHY can sustain. Peripheral-only; the central ignores this field.
     cadence_ok: bool,
+    /// Negotiated mixed-cadence profile. ID 0 keeps legacy uniform cadence;
+    /// ID 1 is the current short/long phase profile.
+    cadence_id: u8,
+    cadence_short_us: u16,
+    cadence_long_us: u16,
+    cadence_short_phases: u16,
+    cadence_apply_epoch: u32,
+    /// Peripheral handshake ACK: profile id, with bit 7 set after the armed
+    /// apply epoch has been received and scheduled.
+    cadence_ack: u8,
     /// Last channel written to the phy (the phy is only re-tuned on change).
     last_channel: Option<u8>,
     /// Consecutive missed replies (the adaptive-hop trigger).
@@ -409,9 +400,19 @@ impl<P: Phy> LinkCore<P> {
     async fn new(mut phy: P, cfg: Config) -> Result<Self, Error<P::Error>> {
         phy.set_address(&cfg.address).await;
         phy.flush().await;
+        let profiled = phy.op_pipelined();
+        let cadence_id = if profiled { 1 } else { 0 };
+        let cadence_short_us = phy.min_short_slot_period_us();
+        let cadence_long_us = phy.min_long_slot_period_us();
         Ok(Self {
             cadence_negotiated: false,
             cadence_ok: phy.min_slot_period_us() == 0,
+            cadence_id,
+            cadence_short_us,
+            cadence_long_us,
+            cadence_short_phases: cfg.tx_rx_ratio.0.max(1) as u16,
+            cadence_apply_epoch: 0,
+            cadence_ack: 0,
             last_channel: None,
             consecutive_misses: 0,
             missed_frames: 0,
@@ -538,8 +539,23 @@ impl<P: Phy> LinkCore<P> {
         }
     }
 
-    fn beacon_packet(&self, step: u32, period: u16) -> Packet {
-        make_beacon(&self.state, &self.phy, step, period)
+    fn beacon_packet(&self, step: u32, period: u16, beacon_epoch: u32) -> Packet {
+        Packet::Beacon {
+            epoch: beacon_epoch,
+            channel_index: self.state.scheduler.index(),
+            flags: (self.phy.rx_window_us() / 16).min(255) as u8,
+            slot_us: self.phy.slot_period_us(),
+            slot_phase: (step % period as u32) as u16,
+            rx_en_offset: self.phy.rx_en_offset_us(),
+            tx_en_offset: self.phy.tx_en_offset_us(),
+            rx_ramp: self.phy.rx_ramp_us(),
+            tx_ramp: self.phy.tx_ramp_us(),
+            cadence_id: self.cadence_id,
+            short_slot_us: self.cadence_short_us,
+            long_slot_us: self.cadence_long_us,
+            short_phases: self.cadence_short_phases,
+            cadence_apply_epoch: self.cadence_apply_epoch,
+        }
     }
 
     /// Enqueue a raw `frame` offer (or the pending typed-send payload).
@@ -692,7 +708,8 @@ impl<P: Phy> LinkCore<P> {
         let central_is_tx = phase < c_tx as u32;
         let acquiring =
             !central && hw_slot != 0 && (!self.cadence_ok || !self.state.lm.rx.have);
-        let listen = central_is_tx || (acquiring && phase % 2 == 0);
+        let listen = central_is_tx
+            || (acquiring && !self.state.beacon_anchor_ready && phase % 2 == 0);
         let is_tx = if central {
             local_phase < local_tx as u32
         } else if acquiring {
@@ -715,7 +732,11 @@ impl<P: Phy> LinkCore<P> {
                 && (!self.cadence_ok || !self.state.lm.rx.have);
             let cadence_pending =
                 central && !self.cadence_negotiated && min_slot_us > 0;
-            let forced_beacon = central && (self.state.epoch % 64 == 0 || cadence_pending);
+            let profile_countdown = self.cadence_id != 0
+                && self.cadence_apply_epoch != 0
+                && (self.state.epoch.wrapping_sub(self.cadence_apply_epoch) as i32) < 0;
+            let forced_beacon = central
+                && (self.state.epoch % 64 == 0 || cadence_pending || profile_countdown);
 
             // Start of a new local TX run: clear the slot-position table.
             if local_phase == 0 {
@@ -728,6 +749,8 @@ impl<P: Phy> LinkCore<P> {
                 self.phy.set_tx_delay_sweep(true);
                 let outbound = Packet::SlotRequest {
                     min_slot_us,
+                    min_short_slot_us: self.phy.min_short_slot_period_us(),
+                    cadence_ack: self.cadence_ack,
                     ack: self.state.lm.rx.ack(),
                 };
                 let n = self.encode_packet(&outbound)?;
@@ -741,7 +764,7 @@ impl<P: Phy> LinkCore<P> {
             }
             if central {
                 if forced_beacon {
-                    let outbound = self.beacon_packet(phase, period);
+                    let outbound = self.beacon_packet(phase, period, self.state.epoch);
                     let n = self.encode_packet(&outbound)?;
                     self.transmit_outbound(n).await?;
                 } else {
@@ -754,7 +777,7 @@ impl<P: Phy> LinkCore<P> {
                     } else if self.state.lm.rx.have {
                         self.ack_packet(local_rx as usize)
                     } else {
-                        self.beacon_packet(phase, period)
+                        self.beacon_packet(phase, period, self.state.epoch)
                     };
                     let outbound_is_data = matches!(outbound, Packet::Data { .. });
                     let n = self.encode_packet(&outbound)?;
@@ -945,24 +968,71 @@ impl<P: Phy> LinkCore<P> {
                 self.state.lm.rx.skip_to(seq);
                 self.apply_ack_nack(ack, &nack);
             }
-            Packet::SlotRequest { min_slot_us, ack } if central => {
-                // The acquiring peer's cumulative ACK: lets the central's
-                // TX window advance from the liveness traffic itself. An
-                // acquiring peer answers only with SlotRequests (no
-                // Data/Ack packets), so without the ACK a dropped Data
-                // left the central stuck sending Drop packets forever and
-                // no new Data ever (the pair deadlocked).
+            Packet::SlotRequest {
+                min_slot_us,
+                min_short_slot_us,
+                cadence_ack,
+                ack,
+            } if central => {
+                // The acquiring peer's cumulative ACK advances the central's
+                // TX window from liveness traffic itself.
                 self.apply_ack_nack(ack, &[0; NACK_BYTES]);
                 self.clear_pending_drop();
-                if !self.cadence_negotiated {
-                    self.cadence_negotiated = true;
-                    let negotiated = self.phy.min_slot_period_us().max(min_slot_us).max(1);
-                    if negotiated != self.phy.slot_period_us() {
-                        self.phy.align_slot_period(negotiated);
+
+                if self.cadence_id == 0 {
+                    // Legacy uniform-cadence negotiation (bare PHY).
+                    if !self.cadence_negotiated {
+                        self.cadence_negotiated = true;
+                        let negotiated = self.phy.min_slot_period_us().max(min_slot_us).max(1);
+                        if negotiated != self.phy.slot_period_us() {
+                            self.phy.align_slot_period(negotiated);
+                        }
                     }
+                } else {
+                    // Mixed MPSL capability negotiation: one received SR
+                    // supplies the peer floors; the central then commits a
+                    // far-future absolute boundary in repeated beacons.
+                    self.cadence_short_us = self
+                        .phy
+                        .min_short_slot_period_us()
+                        .max(min_short_slot_us);
+                    self.cadence_long_us =
+                        self.phy.min_long_slot_period_us().max(min_slot_us);
+                    // One successful reverse SlotRequest is enough to arm
+                    // the profile. The apply boundary is 16 superframes in
+                    // the future; until then every central TX slot carries
+                    // the armed beacon (~128 delivery opportunities at 8:2).
+                    // Waiting for a second/third SR acknowledgement made the
+                    // fragile acquisition path itself the handshake.
+                    if self.cadence_apply_epoch == 0 {
+                        let lead = period.saturating_mul(16).max(period);
+                        // Stay in the central hardware-slot coordinate. App
+                        // processing can lag the caught SlotRequest by a
+                        // complete slot; state.epoch would then arm a
+                        // different phase boundary than the beacon epoch the
+                        // peripheral translates.
+                        let candidate = catch_slot.wrapping_add(lead);
+                        let rem = candidate % period;
+                        self.cadence_apply_epoch = if rem == 0 {
+                            candidate
+                        } else {
+                            candidate.wrapping_add(period - rem)
+                        };
+                        self.phy.schedule_slot_profile(
+                            self.cadence_short_us,
+                            self.cadence_long_us,
+                            period as u16,
+                            self.cadence_short_phases,
+                            0,
+                            self.cadence_apply_epoch,
+                        );
+                        self.cadence_negotiated = true;
+                    }
+                    let _ = cadence_ack; // diagnostic/forward-compatible ACK
                 }
             }
             Packet::Beacon {
+                epoch: beacon_epoch,
                 channel_index,
                 flags,
                 slot_us,
@@ -971,7 +1041,11 @@ impl<P: Phy> LinkCore<P> {
                 tx_en_offset,
                 rx_ramp,
                 tx_ramp,
-                ..
+                cadence_id,
+                short_slot_us,
+                long_slot_us,
+                short_phases,
+                cadence_apply_epoch,
             } if !central => {
                 self.state.scheduler.sync(channel_index);
                 if flags > 0 {
@@ -989,11 +1063,16 @@ impl<P: Phy> LinkCore<P> {
                 if tx_ramp > 0 {
                     self.phy.set_peer_tx_ramp(tx_ramp);
                 }
-                if slot_us > 0 {
+                // Uniform 600-us acquisition alignment. Once an armed mixed
+                // profile has been scheduled, later beacons must not clear it
+                // by re-applying the uniform cadence.
+                if slot_us > 0 && self.cadence_ack & 0x80 == 0 {
                     self.phy.align_slot_period(slot_us);
                 }
                 let min = self.phy.min_slot_period_us();
-                self.cadence_ok = min == 0 || slot_us >= min;
+                if cadence_id == 0 {
+                    self.cadence_ok = min == 0 || slot_us >= min;
+                }
                 // Re-anchor the mirror phase only while still acquiring.
                 // The anchor is exact when the beacon's CATCH slot is used:
                 // processing can lag the catch by a whole slot (the 5 s
@@ -1010,11 +1089,56 @@ impl<P: Phy> LinkCore<P> {
                         if self.state.beacon_anchor_pending == Some(candidate) {
                             self.state.slot_offset = candidate;
                             self.state.beacon_anchor_pending = None;
+                            self.state.beacon_anchor_ready = true;
                         } else {
                             self.state.beacon_anchor_pending = Some(candidate);
                         }
                     } else {
                         self.state.slot_step = (slot_phase as u32 + 1) % period;
+                        self.state.beacon_anchor_ready = true;
+                    }
+                }
+
+                // Profile commit. Only after receiving the absolute armed
+                // epoch and adopting an exact two-beacon slot mapping does
+                // the peripheral schedule the switch and set the high ACK
+                // bit (diagnostic/forward-compatible confirmation).
+                if self.cadence_id != 0 && cadence_id == self.cadence_id {
+                    self.cadence_short_us = short_slot_us
+                        .max(self.phy.min_short_slot_period_us());
+                    self.cadence_long_us = long_slot_us
+                        .max(self.phy.min_long_slot_period_us());
+                    self.cadence_short_phases = short_phases.min(period as u16);
+                    // Once this generation's armed epoch was scheduled, keep
+                    // the high bit across later beacons. After the epoch is
+                    // in the past it is no longer schedulable, but clearing
+                    // the bit would make the next beacon call uniform
+                    // align_slot_period(600) and silently disable the active
+                    // mixed profile on the follower only.
+                    if self.cadence_ack & 0x80 == 0 {
+                        self.cadence_ack = cadence_id;
+                    }
+                    if cadence_apply_epoch != 0
+                        && catch_slot != 0
+                        && self.state.beacon_anchor_ready
+                        && (self.cadence_ack & 0x80 == 0
+                            || self.cadence_apply_epoch != cadence_apply_epoch)
+                    {
+                        let delta = cadence_apply_epoch.wrapping_sub(beacon_epoch) as i32;
+                        if delta > 0 {
+                            let local_apply = catch_slot.wrapping_add(delta as u32);
+                            self.phy.schedule_slot_profile(
+                                self.cadence_short_us,
+                                self.cadence_long_us,
+                                period as u16,
+                                self.cadence_short_phases,
+                                self.state.slot_offset as u16,
+                                local_apply,
+                            );
+                            self.cadence_apply_epoch = cadence_apply_epoch;
+                            self.cadence_ack = cadence_id | 0x80;
+                            self.cadence_ok = true;
+                        }
                     }
                 }
             }
@@ -1062,7 +1186,8 @@ impl<P: Phy> LinkCore<P> {
         let central = self.state.central;
         let central_is_tx = phase < c_tx as u32;
         let acquiring = !central && (!self.cadence_ok || !self.state.lm.rx.have);
-        let listen = central_is_tx || (acquiring && phase % 2 == 0);
+        let listen = central_is_tx
+            || (acquiring && !self.state.beacon_anchor_ready && phase % 2 == 0);
         let is_tx = if central {
             local_phase < local_tx as u32
         } else if acquiring {
@@ -1083,7 +1208,11 @@ impl<P: Phy> LinkCore<P> {
             let slotrequest =
                 !central && min_slot_us > 0 && (!self.cadence_ok || !self.state.lm.rx.have);
             let cadence_pending = central && !self.cadence_negotiated && min_slot_us > 0;
-            let forced_beacon = central && (target % 64 == 0 || cadence_pending);
+            let profile_countdown = self.cadence_id != 0
+                && self.cadence_apply_epoch != 0
+                && (target.wrapping_sub(self.cadence_apply_epoch) as i32) < 0;
+            let forced_beacon = central
+                && (target % 64 == 0 || cadence_pending || profile_countdown);
 
             // Start of a new local TX run: clear the slot-position table.
             if local_phase == 0 {
@@ -1096,6 +1225,8 @@ impl<P: Phy> LinkCore<P> {
                 self.phy.set_tx_delay_sweep(true);
                 let outbound = Packet::SlotRequest {
                     min_slot_us,
+                    min_short_slot_us: self.phy.min_short_slot_period_us(),
+                    cadence_ack: self.cadence_ack,
                     ack: self.state.lm.rx.ack(),
                 };
                 let n = self.encode_packet(&outbound)?;
@@ -1106,7 +1237,7 @@ impl<P: Phy> LinkCore<P> {
                 self.phy.set_tx_delay_sweep(false);
                 if central {
                     if forced_beacon {
-                        let outbound = self.beacon_packet(phase, period as u16);
+                        let outbound = self.beacon_packet(phase, period as u16, target);
                         let n = self.encode_packet(&outbound)?;
                         self.phy
                             .op_publish_tx(&self.tx_buf[..n], target, grace)
@@ -1121,7 +1252,7 @@ impl<P: Phy> LinkCore<P> {
                         } else if self.state.lm.rx.have {
                             self.ack_packet(local_rx as usize)
                         } else {
-                            self.beacon_packet(phase, period as u16)
+                            self.beacon_packet(phase, period as u16, target)
                         };
                         let outbound_is_data = matches!(outbound, Packet::Data { .. });
                         let n = self.encode_packet(&outbound)?;
@@ -1181,7 +1312,8 @@ impl<P: Phy> LinkCore<P> {
         let c_phase = self.state.next_phase(collect_slot.wrapping_sub(1), period);
         let c_local_phase = self.to_local_phase(c_phase);
         let c_central_is_tx = c_phase < c_tx as u32;
-        let c_listen = c_central_is_tx || (acquiring && c_phase % 2 == 0);
+        let c_listen = c_central_is_tx
+            || (acquiring && !self.state.beacon_anchor_ready && c_phase % 2 == 0);
         let c_is_tx = if central {
             c_local_phase < local_tx as u32
         } else if acquiring {

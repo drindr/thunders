@@ -571,6 +571,41 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         SLOT_US as u16
     }
 
+    fn min_short_slot_period_us(&self) -> u16 {
+        // Capability, not a theoretical airtime bound. A 450-us experiment
+        // left enough nominal RX budget but the 5340 follower's MPSL chain
+        // could sustain only 1820-1925 slots/s (central stayed at 2082/s),
+        // producing 2/8 deterministic desync failures. Current 2M boards
+        // therefore advertise their verified 500-us floor; a future backend
+        // may lower its const generic after hardware validation.
+        SLOT_US as u16
+    }
+
+    fn min_long_slot_period_us(&self) -> u16 {
+        (SLOT_US as u16).max(MPSL_FALLBACK_SLOT_US as u16)
+    }
+
+    fn schedule_slot_profile(
+        &mut self,
+        short_us: u16,
+        long_us: u16,
+        period: u16,
+        short_phases: u16,
+        phase_offset: u16,
+        apply_slot: u32,
+    ) {
+        let short = short_us.max(self.min_short_slot_period_us()) as u32;
+        let long = long_us.max(self.min_long_slot_period_us()) as u32;
+        let period = period.max(1) as u32;
+        self.state.profile_short_us = short.min(long);
+        self.state.profile_long_us = long;
+        self.state.profile_period = period;
+        self.state.profile_short_phases = (short_phases as u32).min(period);
+        self.state.profile_phase_offset = phase_offset as u32 % period;
+        self.state.profile_apply_slot = apply_slot;
+        self.state.profile_armed = true;
+    }
+
     fn fallback_slot_period_us(&self) -> u16 {
         MPSL_FALLBACK_SLOT_US as u16
     }
@@ -585,6 +620,9 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
             .max(MPSL_FALLBACK_SLOT_US as u16) as u32;
         self.state.slot_nominal = us;
         self.state.slot_distance = us;
+        // A uniform align is the acquisition/fallback mode. A negotiated
+        // phase profile is armed later with an absolute apply slot.
+        self.state.profile_armed = false;
         // Keep the MPSL inter-slot gap rule (>= 150 us) when the cadence
         // changes at runtime, and give the RX poll a usable budget.
         self.state.slot_len = us.saturating_sub(150);

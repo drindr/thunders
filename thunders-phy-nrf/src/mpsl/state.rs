@@ -81,6 +81,17 @@ pub struct MpslState {
     pub(crate) slot_nominal: u32,
     pub(crate) slot_len: u32,
     pub(crate) rx_poll: u32,
+    /// Pending negotiated phase profile. Until `profile_apply_slot`, the
+    /// uniform `slot_nominal` cadence remains in force. Afterwards central
+    /// phases `[0, profile_short_phases)` use `profile_short_us`, and all
+    /// remaining (reverse/idle) phases use `profile_long_us`.
+    pub(crate) profile_short_us: u32,
+    pub(crate) profile_long_us: u32,
+    pub(crate) profile_period: u32,
+    pub(crate) profile_short_phases: u32,
+    pub(crate) profile_phase_offset: u32,
+    pub(crate) profile_apply_slot: u32,
+    pub(crate) profile_armed: bool,
 
     // The phase-lock.
     pub(crate) slot_distance: u32,
@@ -254,6 +265,13 @@ impl MpslState {
             slot_nominal: 0,
             slot_len: 0,
             rx_poll: 0,
+            profile_short_us: 0,
+            profile_long_us: 0,
+            profile_period: 0,
+            profile_short_phases: 0,
+            profile_phase_offset: 0,
+            profile_apply_slot: 0,
+            profile_armed: false,
             slot_distance: 0,
             catch_poll_us: 0,
             addr_poll_us: 0,

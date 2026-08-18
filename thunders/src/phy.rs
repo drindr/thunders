@@ -129,11 +129,38 @@ pub trait Phy {
         0
     }
 
-    /// The minimum slot period this PHY can physically sustain, in us.
-    /// The central adopts `max(current, peer_min)` so a fast central cannot
-    /// starve a slower peripheral.
+    /// The minimum uniform slot period this PHY can physically sustain, in us.
     fn min_slot_period_us(&self) -> u16 {
         0
+    }
+
+    /// Minimum short-slot cadence supported by this PHY. A short slot carries
+    /// the central's fixed-position TX and the peripheral's locked RX; it does
+    /// not need the follower's long echo-placement delay.
+    fn min_short_slot_period_us(&self) -> u16 {
+        self.min_slot_period_us()
+    }
+
+    /// Minimum long-slot cadence supported by this PHY. Long slots carry the
+    /// follower's delayed Data echo and must include its complete placement
+    /// range.
+    fn min_long_slot_period_us(&self) -> u16 {
+        self.fallback_slot_period_us().max(self.min_slot_period_us())
+    }
+
+    /// Arm a phase-indexed short/long slot profile at absolute hardware slot
+    /// `apply_slot`. Phases `[0, short_phases)` use `short_us`; the remainder
+    /// use `long_us`. `phase_offset` maps the follower's hardware counter to
+    /// the central schedule. Backends without a hardware cadence ignore it.
+    fn schedule_slot_profile(
+        &mut self,
+        _short_us: u16,
+        _long_us: u16,
+        _period: u16,
+        _short_phases: u16,
+        _phase_offset: u16,
+        _apply_slot: u32,
+    ) {
     }
 
     /// The hardware slot counter, when the PHY has its own slot cadence

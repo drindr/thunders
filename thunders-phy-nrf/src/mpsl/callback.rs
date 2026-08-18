@@ -7,6 +7,31 @@ use super::{
     PLL_SWEEP_US, STATE,
 };
 
+#[inline(always)]
+fn slot_profile_due(slot: u32, apply: u32) -> bool {
+    slot.wrapping_sub(apply) as i32 >= 0
+}
+
+/// Negotiated period for hardware slot `slot`. Acquisition remains at the
+/// uniform safe cadence until the agreed absolute apply slot.
+#[inline(always)]
+fn nominal_for_slot(state: &MpslState, slot: u32) -> u32 {
+    if !state.profile_armed
+        || state.profile_period == 0
+        || !slot_profile_due(slot, state.profile_apply_slot)
+    {
+        return state.slot_nominal;
+    }
+    let phase = slot
+        .wrapping_add(state.profile_phase_offset)
+        % state.profile_period;
+    if phase < state.profile_short_phases {
+        state.profile_short_us
+    } else {
+        state.profile_long_us
+    }
+}
+
 /// MPSL timeslot callback: on START, run the pending TX/RX (the `Phy` trait's
 /// `transmit`/`receive` set the op), then chain the next NORMAL timeslot.
 pub unsafe extern "C" fn timeslot_cb(
@@ -32,6 +57,8 @@ pub unsafe extern "C" fn timeslot_cb(
         // op_kind smeared the peripheral's echoes into the central's TX
         // phases). No defmt here: MPSL timer-IRQ context.
         let slot = state.slot_count;
+        let current_nominal = nominal_for_slot(state, slot);
+        let next_nominal = nominal_for_slot(state, slot.wrapping_add(1));
         let on = (slot % 2) as usize;
         let mut exec: Option<usize> = None;
         if state.ops[on].seq != state.ops[on].done_seq {
@@ -90,7 +117,7 @@ pub unsafe extern "C" fn timeslot_cb(
                 // allows. A shorter slot also clamps the follower's echo TX
                 // delay (`max_delay = slot_len - (50 + air + 40)`), and on
                 // the LM20 the desired delay needs the full 350 us slot.
-                state.slot_len = state.slot_nominal.saturating_sub(150);
+                state.slot_len = current_nominal.saturating_sub(150);
                 if state.follower {
                     // The echo timing: with mirrored same-period grids the
                     // next-slot echo would otherwise land before the peer's
@@ -174,7 +201,7 @@ pub unsafe extern "C" fn timeslot_cb(
                     // a 100 us gap (nominal-100) lets the chain degrade and
                     // the app fall a slot behind - the 5340's half-rate
                     // RX polls).
-                    state.slot_len = state.slot_nominal.saturating_sub(150);
+                    state.slot_len = current_nominal.saturating_sub(150);
                     // The +2us/slot sweep is for acquisition: before the
                     // first beacon, and again when the phase is truly lost
                     // (500 straight misses). Between those, hold nominal:
@@ -182,9 +209,9 @@ pub unsafe extern "C" fn timeslot_cb(
                     // that walks the grid off the peer's window.
                     if state.follower
                         && (state.peer_rx_window_us == 0 || state.rx_misses >= 500)
-                        && state.slot_distance != state.slot_nominal + PLL_SWEEP_US
+                        && state.slot_distance != current_nominal + PLL_SWEEP_US
                     {
-                        state.slot_distance = state.slot_nominal + PLL_SWEEP_US;
+                        state.slot_distance = current_nominal + PLL_SWEEP_US;
                         // Re-calibrate from scratch after a real phase loss.
                         state.addr_target_us = 60;
                         state.calib_count = 0;
@@ -221,7 +248,7 @@ pub unsafe extern "C" fn timeslot_cb(
                 // cadence drift but its dist swings destabilized the LM20
                 // pairs (rx 1000+/window -> single digits), so it's reverted.
                 let corr = err * PLL_GAIN_NUM / PLL_GAIN_DEN;
-                let nominal = state.slot_nominal as i32;
+                let nominal = current_nominal as i32;
                 let new_dist = (nominal + corr).clamp(nominal - 20, nominal + 20) as u32;
                 if new_dist != state.slot_distance {
                     state.slot_distance = new_dist;
@@ -229,7 +256,10 @@ pub unsafe extern "C" fn timeslot_cb(
             }
         }
 
-        // Chain the next timeslot (the distance is the phase-lock's knob).
+        // Chain the next timeslot. Distance describes CURRENT-start to
+        // NEXT-start, while length is the grant of the NEXT slot; this
+        // distinction is what makes a phase-indexed cadence safe.
+        let next_len = next_nominal.saturating_sub(150);
         let req = state.next_req.assume_init_mut();
         *req = nrf_mpsl::raw::mpsl_timeslot_request_t {
             request_type: nrf_mpsl::raw::MPSL_TIMESLOT_REQ_TYPE_NORMAL as u8,
@@ -238,21 +268,24 @@ pub unsafe extern "C" fn timeslot_cb(
                     hfclk: nrf_mpsl::raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8,
                     priority: nrf_mpsl::raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8,
                     distance_us: state.slot_distance,
-                    length_us: state.slot_len,
+                    length_us: next_len,
                 },
             },
         };
         RET.callback_action = nrf_mpsl::raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
         RET.params.request.p_next = req;
         // The PLL's corrected distance is a ONE-SLOT phase step: re-base to
-        // nominal immediately or it persists as a frequency offset and the
-        // grid walks away between catches. (The acquisition sweep is the
-        // exception: it MEANS to walk.)
-        if state.slot_distance != state.slot_nominal + PLL_SWEEP_US
-            || (state.follower && state.rx_misses == 0)
-        {
-            state.slot_distance = state.slot_nominal;
-        }
+        // the NEXT phase's nominal immediately. The acquisition +2us sweep
+        // is the exception and follows the next phase's baseline.
+        let keep_sweep = state.follower
+            && state.rx_misses > 0
+            && state.slot_distance == current_nominal + PLL_SWEEP_US;
+        state.slot_distance = if keep_sweep {
+            next_nominal + PLL_SWEEP_US
+        } else {
+            next_nominal
+        };
+        state.slot_len = next_len;
         &mut RET as *mut _
     } else if signal == nrf_mpsl::raw::MPSL_TIMESLOT_SIGNAL_RADIO as u32 {
         RET.callback_action = nrf_mpsl::raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
