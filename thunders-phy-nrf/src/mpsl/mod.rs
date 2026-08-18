@@ -15,7 +15,7 @@ pub use state::{MpslState, Pkt};
 use embassy_time::Duration;
 use thunders::config::Address;
 use thunders::error::Error;
-use thunders::phy::Phy;
+use thunders::phy::{Phy, SlotProbeStats};
 
 use crate::radio_phy::RadioMode;
 
@@ -217,8 +217,7 @@ pub struct MpslRadioPhy<'d, const SLOT_US: u32, const RX_POLL: u32> {
     _mode: RadioMode,
 }
 
-impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_POLL>
-{
+impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_POLL> {
     /// Open the timeslot session and start the chained slots.
     ///
     /// MPSL must already be initialized; `state` must outlive the phy.
@@ -410,8 +409,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
     }
 }
 
-impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_US, RX_POLL>
-{
+impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_US, RX_POLL> {
     type Error = ();
 
     async fn set_channel(&mut self, ch: u8) {
@@ -585,6 +583,41 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         (SLOT_US as u16).max(MPSL_FALLBACK_SLOT_US as u16)
     }
 
+    fn min_probe_short_slot_period_us(&self) -> u16 {
+        // Production calibration may only search inside the backend's
+        // hardware-verified envelope. Testing below this value can change the
+        // two MPSL counters at different wall rates and destroy the epoch map.
+        self.min_short_slot_period_us()
+    }
+
+    fn schedule_probed_slot_profile(
+        &mut self,
+        short_us: u16,
+        long_us: u16,
+        period: u16,
+        short_phases: u16,
+        phase_offset: u16,
+        apply_slot: u32,
+    ) -> bool {
+        if short_us < self.min_probe_short_slot_period_us()
+            || long_us < self.min_long_slot_period_us()
+            || short_us > long_us
+            || period == 0
+        {
+            return false;
+        }
+        let period = period as u32;
+        self.state.profile_short_us = short_us as u32;
+        self.state.profile_long_us = long_us as u32;
+        self.state.profile_period = period;
+        self.state.profile_short_phases = (short_phases as u32).min(period);
+        self.state.profile_phase_offset = phase_offset as u32 % period;
+        self.state.profile_apply_slot = apply_slot;
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        self.state.profile_armed = true;
+        true
+    }
+
     fn schedule_slot_profile(
         &mut self,
         short_us: u16,
@@ -611,6 +644,51 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state.profile_armed = true;
     }
 
+    fn schedule_slot_probe(
+        &mut self,
+        short_us: u16,
+        long_us: u16,
+        period: u16,
+        short_phases: u16,
+        phase_offset: u16,
+        start_slot: u32,
+        end_slot: u32,
+    ) {
+        if end_slot.wrapping_sub(start_slot) as i32 <= 0 {
+            return;
+        }
+        let period = period.max(1) as u32;
+        self.state.probe_short_us = short_us as u32;
+        self.state.probe_long_us = long_us as u32;
+        self.state.probe_period = period;
+        self.state.probe_short_phases = (short_phases as u32).min(period);
+        self.state.probe_phase_offset = phase_offset as u32 % period;
+        self.state.probe_start_slot = start_slot;
+        self.state.probe_end_slot = end_slot;
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        self.state.probe_armed = true;
+    }
+
+    fn slot_probe_stats(&self) -> SlotProbeStats {
+        SlotProbeStats {
+            slots: self.state.slot_count,
+            clock_us: radio::cyc() / radio::CPU_MHZ,
+            completed: self
+                .state
+                .done_count
+                .load(core::sync::atomic::Ordering::Relaxed),
+            op_late: self.state.op_late,
+            address_events: self.state.addr_events,
+            crc_ok: self.state.crc_ok,
+            crc_bad_long: self.state.crc_bad_long,
+            tx_count: self.state.tx_count,
+        }
+    }
+
+    fn slot_profile_active(&self) -> bool {
+        self.state.active_profile_armed
+    }
+
     fn fallback_slot_period_us(&self) -> u16 {
         MPSL_FALLBACK_SLOT_US as u16
     }
@@ -620,12 +698,12 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         // the MPSL echo-placement floor.  Negotiation used to shrink the
         // 600-us acquisition cadence back to the boards' 500-us physical
         // minimum, recreating the too-short 350-us grant.
-        let us = us
-            .max(SLOT_US as u16)
-            .max(MPSL_FALLBACK_SLOT_US as u16) as u32;
+        let us = us.max(SLOT_US as u16).max(MPSL_FALLBACK_SLOT_US as u16) as u32;
         // Disarm first: an IRQ that preempts the uniform-field writes below
         // must keep using the old complete profile rather than a mixed state.
         self.state.profile_armed = false;
+        self.state.active_profile_armed = false;
+        self.state.probe_armed = false;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         self.state.slot_nominal = us;
         self.state.slot_distance = us;

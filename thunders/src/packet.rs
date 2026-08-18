@@ -5,6 +5,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{DeviceId, MAX_PAYLOAD, NACK_BYTES};
 
+/// API-triggered cadence-negotiation control stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CadenceStage {
+    /// A peripheral API asks the central to start negotiation.
+    Request,
+    /// The central proposes the contract and first candidate.
+    Offer,
+    /// The peripheral accepts the offered bounds.
+    Accept,
+    /// The central publishes a bounded probe interval.
+    Probe,
+    /// The peripheral has scheduled that exact probe interval.
+    Armed,
+    /// Probe metrics after automatic restoration of the active profile.
+    Report,
+    /// The central commits the selected stable profile.
+    Commit,
+    /// The peripheral scheduled the exact final apply epoch.
+    Applied,
+    /// Abort while retaining the previous stable profile.
+    Cancel,
+}
+
 /// A protocol packet.
 ///
 /// All variants are serialized with `postcard` and transmitted as raw
@@ -121,6 +145,68 @@ pub enum Packet {
         /// traffic itself.
         ack: u16,
     },
+    /// API-triggered cadence negotiation/probe control. It is repeated by
+    /// the state machine until the peer advances to the next stage and also
+    /// carries the normal cumulative ACK/NACK so negotiation cannot block
+    /// the data windows.
+    Cadence {
+        /// Normal cumulative data ACK.
+        ack: u16,
+        /// Normal selective NACK bitmap.
+        nack: Vec<u8, NACK_BYTES>,
+        /// Nonzero API negotiation generation.
+        generation: u8,
+        /// Negotiation state carried by this repeated control packet.
+        stage: CadenceStage,
+        /// Absolute sender hardware slot carrying this control packet.
+        epoch: u32,
+        /// Maximum central-to-peripheral application payload.
+        forward_payload: u8,
+        /// Maximum peripheral-to-central application payload.
+        reverse_payload: u8,
+        /// Candidate or committed central-TX period.
+        short_us: u16,
+        /// Candidate or committed reverse/idle period.
+        long_us: u16,
+        /// Lowest candidate the API permits.
+        min_slot_us: u16,
+        /// Candidate descent quantum.
+        step_us: u8,
+        /// Safety quanta added above the lowest passing candidate.
+        safety_steps: u8,
+        /// Central absolute probe/commit start epoch.
+        start_epoch: u32,
+        /// Central absolute exclusive probe end epoch.
+        end_epoch: u32,
+        /// Number of complete superframes in one probe.
+        probe_slots: u16,
+        /// Stable/reject result flags.
+        flags: u8,
+    },
+    /// Compact reverse negotiation response. Keeping Accept/Armed/Report/
+    /// Applied short is required for delayed follower TX placement inside the
+    /// 600-us reverse slot.
+    CadenceAck {
+        /// Active API negotiation generation.
+        generation: u8,
+        /// Response stage.
+        stage: CadenceStage,
+        /// Exact central start/apply epoch being acknowledged.
+        start_epoch: u32,
+        /// Exact central exclusive probe end epoch, or zero for commit ACK.
+        end_epoch: u32,
+        /// Stable/reject result flags.
+        flags: u8,
+    },
+    /// Compact worst-contract-length trial traffic. Its serialized size is
+    /// deliberately adjusted to the Data wire length; using the much larger
+    /// negotiation control header would falsely reject short-packet slots.
+    CadenceSample {
+        /// Active negotiation generation.
+        generation: u8,
+        /// Bytes used only to reach the requested worst-case wire length.
+        padding: Vec<u8, { MAX_PAYLOAD + 16 }>,
+    },
     /// Pairing request from a peripheral.
     PairingRequest {
         /// Device identifier.
@@ -194,6 +280,63 @@ mod tests {
         let n = pkt.to_bytes(&mut buf).unwrap();
         let decoded = Packet::from_bytes(&buf[..n]).unwrap();
         assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn round_trip_cadence_control_fits_phy_buffer() {
+        let mut nack = Vec::<u8, NACK_BYTES>::new();
+        nack.extend_from_slice(&[0x01, 0x80]).unwrap();
+        let pkt = Packet::Cadence {
+            ack: 123,
+            nack,
+            generation: 2,
+            stage: CadenceStage::Probe,
+            epoch: 100_000,
+            forward_payload: MAX_PAYLOAD as u8,
+            reverse_payload: MAX_PAYLOAD as u8,
+            short_us: 475,
+            long_us: 600,
+            min_slot_us: 450,
+            step_us: 25,
+            safety_steps: 1,
+            start_epoch: 100_080,
+            end_epoch: 100_160,
+            probe_slots: 8,
+            flags: 1,
+        };
+        let mut buf = [0u8; 64];
+        let n = pkt.to_bytes(&mut buf).unwrap();
+        assert!(n <= 64);
+        assert_eq!(pkt, Packet::from_bytes(&buf[..n]).unwrap());
+    }
+
+    #[test]
+    fn compact_cadence_ack_round_trip() {
+        let pkt = Packet::CadenceAck {
+            generation: 7,
+            stage: CadenceStage::Applied,
+            start_epoch: 0x1234_5678,
+            end_epoch: 0,
+            flags: 0,
+        };
+        let mut buf = [0u8; 16];
+        let n = pkt.to_bytes(&mut buf).unwrap();
+        assert!(n <= 16);
+        assert_eq!(pkt, Packet::from_bytes(&buf[..n]).unwrap());
+    }
+
+    #[test]
+    fn cadence_sample_matches_requested_wire_length() {
+        let mut padding = Vec::<u8, { MAX_PAYLOAD + 16 }>::new();
+        padding.resize(17, 0xA5).unwrap(); // 8-byte app + 12 overhead - 3 header
+        let pkt = Packet::CadenceSample {
+            generation: 1,
+            padding,
+        };
+        let mut buf = [0u8; 64];
+        let n = pkt.to_bytes(&mut buf).unwrap();
+        assert_eq!(n, 20);
+        assert_eq!(pkt, Packet::from_bytes(&buf[..n]).unwrap());
     }
 
     #[test]

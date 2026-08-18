@@ -4,6 +4,44 @@ use embassy_time::Duration;
 
 use crate::{config::Address, error::Error};
 
+/// Cumulative counters sampled around a bounded cadence probe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SlotProbeStats {
+    /// Hardware timeslot START count.
+    pub slots: u32,
+    /// Monotonic PHY-local microsecond clock (wrapping).
+    pub clock_us: u32,
+    /// Completed radio operations.
+    pub completed: u32,
+    /// Published operations that missed their target START.
+    pub op_late: u32,
+    /// Address-matched RX catches.
+    pub address_events: u32,
+    /// Good CRC decodes.
+    pub crc_ok: u32,
+    /// Bad CRCs on long frames.
+    pub crc_bad_long: u32,
+    /// Completed TX operations.
+    pub tx_count: u32,
+}
+
+impl SlotProbeStats {
+    /// Wrapping counter delta from `start` to `self`.
+    pub fn wrapping_delta(self, start: Self) -> Self {
+        Self {
+            slots: self.slots.wrapping_sub(start.slots),
+            clock_us: self.clock_us.wrapping_sub(start.clock_us),
+            completed: self.completed.wrapping_sub(start.completed),
+            op_late: self.op_late.wrapping_sub(start.op_late),
+            address_events: self.address_events.wrapping_sub(start.address_events),
+            crc_ok: self.crc_ok.wrapping_sub(start.crc_ok),
+            crc_bad_long: self.crc_bad_long.wrapping_sub(start.crc_bad_long),
+            tx_count: self.tx_count.wrapping_sub(start.tx_count),
+        }
+    }
+}
+
 /// Async interface to a raw radio transceiver.
 #[allow(async_fn_in_trait)]
 ///
@@ -145,7 +183,8 @@ pub trait Phy {
     /// follower's delayed Data echo and must include its complete placement
     /// range.
     fn min_long_slot_period_us(&self) -> u16 {
-        self.fallback_slot_period_us().max(self.min_slot_period_us())
+        self.fallback_slot_period_us()
+            .max(self.min_slot_period_us())
     }
 
     /// Arm a phase-indexed short/long slot profile at absolute hardware slot
@@ -161,6 +200,53 @@ pub trait Phy {
         _phase_offset: u16,
         _apply_slot: u32,
     ) {
+    }
+
+    /// Lowest slot period that may be tested by a bounded probe. It may be
+    /// lower than the already verified production floor, but must still fit
+    /// the PHY mode's theoretical grant/airtime constraints.
+    fn min_probe_short_slot_period_us(&self) -> u16 {
+        self.min_short_slot_period_us()
+    }
+
+    /// Commit a profile that both peers just measured successfully. Unlike
+    /// acquisition scheduling this must not silently clamp a value; return
+    /// false when the exact descriptor cannot be applied.
+    fn schedule_probed_slot_profile(
+        &mut self,
+        _short_us: u16,
+        _long_us: u16,
+        _period: u16,
+        _short_phases: u16,
+        _phase_offset: u16,
+        _apply_slot: u32,
+    ) -> bool {
+        false
+    }
+
+    /// Arm a bounded candidate profile. It automatically ceases at
+    /// `end_slot`, restoring the active stable profile without a control
+    /// packet, so a failed probe cannot strand the peers at different rates.
+    fn schedule_slot_probe(
+        &mut self,
+        _short_us: u16,
+        _long_us: u16,
+        _period: u16,
+        _short_phases: u16,
+        _phase_offset: u16,
+        _start_slot: u32,
+        _end_slot: u32,
+    ) {
+    }
+
+    /// Cumulative counters for cadence-probe evaluation.
+    fn slot_probe_stats(&self) -> SlotProbeStats {
+        SlotProbeStats::default()
+    }
+
+    /// True once the initial or final mixed profile crossed its apply epoch.
+    fn slot_profile_active(&self) -> bool {
+        false
     }
 
     /// The hardware slot counter, when the PHY has its own slot cadence

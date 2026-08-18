@@ -57,6 +57,9 @@ build_one() {
   if [ "$RADIO_MODE" = "1m" ]; then
     feats+=(--features radio-1m)
   fi
+  if [ "${CADENCE_PROBE:-0}" = "1" ] && [ "$backend" = "mpsl" ]; then
+    feats+=(--features cadence-probe)
+  fi
   case "$RATIO" in
     844) feats+=(--features ratio-8-4-4) ;;
     622) feats+=(--features ratio-6-2-2) ;;

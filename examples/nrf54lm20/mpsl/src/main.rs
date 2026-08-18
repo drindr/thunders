@@ -126,6 +126,10 @@ async fn main(spawner: Spawner) {
             let period = tx_n as u64 + rx_n as u64 + idle_n as u64;
             let mut central = Central::new(phy, cfg).await.unwrap();
             info!("link ready (Central)");
+            #[cfg(feature = "cadence-probe")]
+            let mut cadence_requested = false;
+            #[cfg(feature = "cadence-probe")]
+            let mut cadence_reported = false;
 
             let mut rx_buf = [0u8; 32];
             let mut frames: u64 = 0;
@@ -159,6 +163,26 @@ async fn main(spawner: Spawner) {
             info!("BENCH READY role=C ratio={},{}", tx_n, rx_n);
 
             loop {
+                #[cfg(feature = "cadence-probe")]
+                if !cadence_requested && central.status() == thunders::link::LinkStatus::Connected {
+                    let policy = thunders::CadenceProbePolicy::new(500, 25, 32, 0);
+                    if let Ok(generation) = central.negotiate_cadence(
+                        thunders::TrafficContract::new(8, 8),
+                        policy,
+                    ) {
+                        cadence_requested = true;
+                        info!("CADENCE REQUEST gen={}", generation);
+                    }
+                }
+                #[cfg(feature = "cadence-probe")]
+                if cadence_requested && !cadence_reported {
+                    if let thunders::CadenceNegotiationStatus::Stable(profile) =
+                        central.cadence_status()
+                    {
+                        cadence_reported = true;
+                        info!("CADENCE STABLE short={} long={}", profile.short_slot_us, profile.long_slot_us);
+                    }
+                }
                 // TX slots carry a fresh PING (seq per PING, beacons skipped),
                 // RX slots listen.
                 let mut p = [0x50u8, 0x49, 0x4E, 0x47, 0, 0, 0, 0];

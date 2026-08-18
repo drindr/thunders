@@ -2,34 +2,94 @@
 
 use super::radio;
 use super::state::{MpslState, OpKind};
-use super::{
-    MPSL_TX_TAIL_US, PLL_GAIN_DEN, PLL_GAIN_NUM, PLL_SWEEP_MISSES,
-    PLL_SWEEP_US, STATE,
-};
+use super::{MPSL_TX_TAIL_US, PLL_GAIN_DEN, PLL_GAIN_NUM, PLL_SWEEP_MISSES, PLL_SWEEP_US, STATE};
 
 #[inline(always)]
 fn slot_profile_due(slot: u32, apply: u32) -> bool {
     slot.wrapping_sub(apply) as i32 >= 0
 }
 
-/// Negotiated period for hardware slot `slot`. Acquisition remains at the
-/// uniform safe cadence until the agreed absolute apply slot.
+#[inline(always)]
+fn phase_nominal(
+    slot: u32,
+    short_us: u32,
+    long_us: u32,
+    period: u32,
+    short_phases: u32,
+    phase_offset: u32,
+) -> u32 {
+    if period == 0 {
+        return long_us;
+    }
+    let phase = slot.wrapping_add(phase_offset) % period;
+    if phase < short_phases {
+        short_us
+    } else {
+        long_us
+    }
+}
+
+#[inline(always)]
+fn slot_before(slot: u32, end: u32) -> bool {
+    (slot.wrapping_sub(end) as i32) < 0
+}
+
+/// Negotiated period for hardware slot `slot`: bounded probe overlay,
+/// pending commit after its apply epoch, current active profile, then the
+/// uniform acquisition fallback.
 #[inline(always)]
 fn nominal_for_slot(state: &MpslState, slot: u32) -> u32 {
-    if !state.profile_armed {
-        return state.slot_nominal;
-    }
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-    if state.profile_period == 0 || !slot_profile_due(slot, state.profile_apply_slot) {
-        return state.slot_nominal;
+    if state.probe_armed
+        && slot_profile_due(slot, state.probe_start_slot)
+        && slot_before(slot, state.probe_end_slot)
+    {
+        return phase_nominal(
+            slot,
+            state.probe_short_us,
+            state.probe_long_us,
+            state.probe_period,
+            state.probe_short_phases,
+            state.probe_phase_offset,
+        );
     }
-    let phase = slot
-        .wrapping_add(state.profile_phase_offset)
-        % state.profile_period;
-    if phase < state.profile_short_phases {
-        state.profile_short_us
-    } else {
-        state.profile_long_us
+    if state.profile_armed && slot_profile_due(slot, state.profile_apply_slot) {
+        return phase_nominal(
+            slot,
+            state.profile_short_us,
+            state.profile_long_us,
+            state.profile_period,
+            state.profile_short_phases,
+            state.profile_phase_offset,
+        );
+    }
+    if state.active_profile_armed {
+        return phase_nominal(
+            slot,
+            state.active_profile_short_us,
+            state.active_profile_long_us,
+            state.active_profile_period,
+            state.active_profile_short_phases,
+            state.active_profile_phase_offset,
+        );
+    }
+    state.slot_nominal
+}
+
+#[inline(always)]
+fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
+    if state.profile_armed && slot_profile_due(slot, state.profile_apply_slot) {
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+        state.active_profile_short_us = state.profile_short_us;
+        state.active_profile_long_us = state.profile_long_us;
+        state.active_profile_period = state.profile_period;
+        state.active_profile_short_phases = state.profile_short_phases;
+        state.active_profile_phase_offset = state.profile_phase_offset;
+        state.active_profile_armed = true;
+        state.profile_armed = false;
+    }
+    if state.probe_armed && slot_profile_due(slot, state.probe_end_slot) {
+        state.probe_armed = false;
     }
 }
 
@@ -58,6 +118,7 @@ pub unsafe extern "C" fn timeslot_cb(
         // op_kind smeared the peripheral's echoes into the central's TX
         // phases). No defmt here: MPSL timer-IRQ context.
         let slot = state.slot_count;
+        promote_profile_if_due(state, slot);
         let current_nominal = nominal_for_slot(state, slot);
         let next_nominal = nominal_for_slot(state, slot.wrapping_add(1));
         let on = (slot % 2) as usize;
@@ -101,7 +162,9 @@ pub unsafe extern "C" fn timeslot_cb(
         // Runs only for an RX op that actually executed in THIS slot: the
         // op kind is latched at START, not re-read after the work (the app
         // may have published the next op meanwhile).
-        let executed_kind = exec.map(|i| state.ops[i].kind).unwrap_or(OpKind::Idle as u8);
+        let executed_kind = exec
+            .map(|i| state.ops[i].kind)
+            .unwrap_or(OpKind::Idle as u8);
         if executed_kind == OpKind::Rx as u8 {
             let ei = exec.unwrap_or(0);
             if state.ops[ei].rx_ok {
@@ -131,7 +194,7 @@ pub unsafe extern "C" fn timeslot_cb(
                         && state.peer_rx_ramp_us > 0
                         && state.tx_ramp_us > 0
                     {
-                    // The frame being placed is the NEXT (pending) op -
+                        // The frame being placed is the NEXT (pending) op -
                         // a TX, published 2 slots ahead in the pipeline -
                         // whose length is known. The old code used the last
                         // RECEIVED frame's length: the echo (a ~19 B Data)
@@ -162,19 +225,15 @@ pub unsafe extern "C" fn timeslot_cb(
                         // Forward catch anchor: peer TX on-air at our slot
                         // start = own_rx + own_addr - address_anchor.
                         let forward_catch = own_rx + own_addr - state.air_prefix_us as i32;
-                        let delay = forward_catch
-                            - (peer_tx_en + peer_tx_ramp)
+                        let delay = forward_catch - (peer_tx_en + peer_tx_ramp)
                             + (peer_rx + peer_rx_ramp)
                             + (w - air) / 2
                             - setup
                             - own_tx_ramp;
                         // The TX op must fit the grant: setup + delay +
                         // own TX ramp + air + tail <= slot_len.
-                        let max_delay = state.slot_len as i32
-                            - setup
-                            - own_tx_ramp
-                            - air
-                            - MPSL_TX_TAIL_US;
+                        let max_delay =
+                            state.slot_len as i32 - setup - own_tx_ramp - air - MPSL_TX_TAIL_US;
                         // The peer-window fit (our-slot time): the frame
                         // must END before the peer's listen window ends, or
                         // its tail is clipped against the MPSL hard edge and
@@ -190,8 +249,7 @@ pub unsafe extern "C" fn timeslot_cb(
                         let peer_slot_start = forward_catch - (peer_tx_en + peer_tx_ramp);
                         let window_end = peer_slot_start + peer_rx + peer_rx_ramp + w;
                         let peer_fit = window_end - (setup + own_tx_ramp + air) - MPSL_TX_TAIL_US;
-                        state.tx_delay_us =
-                            delay.clamp(0, max_delay.min(peer_fit).max(0)) as u32;
+                        state.tx_delay_us = delay.clamp(0, max_delay.min(peer_fit).max(0)) as u32;
                     }
                 }
             } else {

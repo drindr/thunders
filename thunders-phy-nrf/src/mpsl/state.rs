@@ -81,10 +81,15 @@ pub struct MpslState {
     pub(crate) slot_nominal: u32,
     pub(crate) slot_len: u32,
     pub(crate) rx_poll: u32,
-    /// Pending negotiated phase profile. Until `profile_apply_slot`, the
-    /// uniform `slot_nominal` cadence remains in force. Afterwards central
-    /// phases `[0, profile_short_phases)` use `profile_short_us`, and all
-    /// remaining (reverse/idle) phases use `profile_long_us`.
+    /// Currently active negotiated phase profile. Before the first commit,
+    /// `active_profile_armed` is false and the uniform `slot_nominal` applies.
+    pub(crate) active_profile_short_us: u32,
+    pub(crate) active_profile_long_us: u32,
+    pub(crate) active_profile_period: u32,
+    pub(crate) active_profile_short_phases: u32,
+    pub(crate) active_profile_phase_offset: u32,
+    pub(crate) active_profile_armed: bool,
+    /// Pending profile, atomically promoted to active at `profile_apply_slot`.
     pub(crate) profile_short_us: u32,
     pub(crate) profile_long_us: u32,
     pub(crate) profile_period: u32,
@@ -92,6 +97,17 @@ pub struct MpslState {
     pub(crate) profile_phase_offset: u32,
     pub(crate) profile_apply_slot: u32,
     pub(crate) profile_armed: bool,
+    /// Bounded trial overlay. It applies only in `[probe_start_slot,
+    /// probe_end_slot)` and automatically falls back to the active profile,
+    /// even if every control packet is lost during the trial.
+    pub(crate) probe_short_us: u32,
+    pub(crate) probe_long_us: u32,
+    pub(crate) probe_period: u32,
+    pub(crate) probe_short_phases: u32,
+    pub(crate) probe_phase_offset: u32,
+    pub(crate) probe_start_slot: u32,
+    pub(crate) probe_end_slot: u32,
+    pub(crate) probe_armed: bool,
 
     // The phase-lock.
     pub(crate) slot_distance: u32,
@@ -265,6 +281,12 @@ impl MpslState {
             slot_nominal: 0,
             slot_len: 0,
             rx_poll: 0,
+            active_profile_short_us: 0,
+            active_profile_long_us: 0,
+            active_profile_period: 0,
+            active_profile_short_phases: 0,
+            active_profile_phase_offset: 0,
+            active_profile_armed: false,
             profile_short_us: 0,
             profile_long_us: 0,
             profile_period: 0,
@@ -272,6 +294,14 @@ impl MpslState {
             profile_phase_offset: 0,
             profile_apply_slot: 0,
             profile_armed: false,
+            probe_short_us: 0,
+            probe_long_us: 0,
+            probe_period: 0,
+            probe_short_phases: 0,
+            probe_phase_offset: 0,
+            probe_start_slot: 0,
+            probe_end_slot: 0,
+            probe_armed: false,
             slot_distance: 0,
             catch_poll_us: 0,
             addr_poll_us: 0,

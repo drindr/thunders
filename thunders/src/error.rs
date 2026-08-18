@@ -20,6 +20,8 @@ pub enum Error<P> {
     Unsupported,
     /// Encryption or decryption failure.
     Crypto(CryptoError),
+    /// Offered payload exceeds the active API-negotiated traffic contract.
+    PayloadExceedsCadenceProfile,
     /// The reliable TX window is full: the caller offered data faster than
     /// the link could deliver it. Backpressure — retry later (or lower the
     /// offered rate; reliable delivery needs spare channel capacity).

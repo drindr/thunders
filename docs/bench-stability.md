@@ -197,6 +197,52 @@ request.length_us   = next - 150
 方向 **6/6**，forward loss 0–0.13%，rev_arq 0.12–0.38%，包括原弱点
 LM20↔5340。bare继续走原uniform cadence，不参与profile。
 
+#### 4c-7. API触发的包长合同协商与有界稳定性Probe
+
+应用不会因某一颗包变长而自动修改slot。central或peripheral显式调用
+`negotiate_cadence(TrafficContract, CadenceProbePolicy)`后，正常`frame()`循环
+驱动以下状态机：
+
+```text
+Request（peripheral API时）→ Offer → Accept
+→ Probe(start,end) → Armed → Sample → Report
+→ Commit(apply_epoch) → Applied → 双方同epoch生效 → Data确认 → Stable
+```
+
+central仍是唯一的candidate和绝对epoch决策者。Probe发送紧凑的
+`CadenceSample`，其真实序列化wire长度匹配合同的最坏Data长度；同时采样两端的
+slot wall time、slot/发送/ADDRESS成功数、`op_late`、长帧CRC和ARQ delivery
+failure。搜索从当前稳定short向下按固定步长尝试；首次失败即停止，最终值为最低
+通过candidate加policy安全档，并且不超过原稳定值。
+
+生产API只允许candidate处于**双方backend已经过硬件验证的floor及以上**。曾尝试
+在线Probe 475/450；失败候选会让两颗芯片的MPSL硬件计数以不同wall rate前进，
+之后即使恢复相同slot period，原absolute epoch映射也已失效。全600在线恢复实验
+仍不能可靠修复这个计数差，因此低于验证floor的实验不会暴露给生产API。未来某
+backend离线验证并降低其floor后，同一协商/Probe状态机才会使用更短candidate。
+包长决定需要覆盖的最坏wire长度，但不能绕过芯片对的验证floor。
+
+最终profile生效后，超过对应方向合同长度的`frame()`发送明确返回
+`PayloadExceedsCadenceProfile`，不会自动扩slot或偷偷重协商。协商期间ARQ retry
+age被冻结，避免Probe占用slot导致应用数据超时；forward完整描述携带ACK/NACK，
+脆弱reverse方向改用短`CadenceAck`承载Accept/Armed/Report/Applied。
+
+最终切换使用两阶段arm：central持续发送未来Commit但不先切换；peripheral arm后
+持续发送精确`{generation, apply_epoch}` Applied；central收到后才arm。Applied
+若迟到越过epoch，central滚动到新的未来phase-0 epoch重新Commit。central生效并
+恢复正常Data/Ack后，peripheral才停止Applied并进入Stable。因此丢失整个Commit
+窗口只会延迟协商，不会形成单边profile。
+
+PHY保存`active + pending + probe overlay`三个profile层次；合法候选只在预先协商
+的`[probe_start, probe_end)`生效，结束后由MPSL callback自动恢复active profile。
+profile字段用release/acquire fence发布给MPSL IRQ。
+
+可选bench feature `cadence-probe`可由`CADENCE_PROBE=1 scripts/bench.sh build`
+启用。52840→5340、8B/8B合同在双方500 µs验证floor下完成Offer/Accept/Commit，
+最终仍为 **500/600 µs**；成功运行中central保持 **1922 slots/s**，peripheral
+约 **1887–1921 slots/s**，严格ping-pong仍完成逐包echo。采集期仍存在历史性的
+run-level启动波动，失败运行发生在API触发前的全600 acquisition，不属于合同状态机。
+
 ### 5. bench 计时从 central BENCH READY 开始
 
 `scripts/bench.sh run-pair`：
