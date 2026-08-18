@@ -65,6 +65,37 @@ impl CadenceProbePolicy {
     }
 }
 
+/// Safety policy for leaving an active short-payload cadence contract.
+///
+/// A zero threshold disables that trigger. Packet length is intentionally not
+/// part of this policy: oversized payloads continue to return an explicit
+/// error and never cause an automatic cadence change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CadenceExitPolicy {
+    /// Exit after this many new retry-exhausted deliveries under the active
+    /// contract. Zero disables the delivery-failure trigger.
+    pub delivery_failures: u16,
+    /// Exit after this many consecutive slots without a peer packet. Zero
+    /// disables the consecutive-loss trigger.
+    pub consecutive_misses: u8,
+}
+
+impl CadenceExitPolicy {
+    /// Create an automatic-exit policy.
+    pub const fn new(delivery_failures: u16, consecutive_misses: u8) -> Self {
+        Self {
+            delivery_failures,
+            consecutive_misses,
+        }
+    }
+
+    /// True when at least one automatic-exit trigger is enabled.
+    pub const fn is_enabled(self) -> bool {
+        self.delivery_failures != 0 || self.consecutive_misses != 0
+    }
+}
+
 impl Default for CadenceProbePolicy {
     /// Generic 2 Mbit search defaults. The Link API additionally clamps this
     /// policy to each negotiated backend's hardware-verified production
@@ -217,6 +248,9 @@ pub enum CadenceNegotiationStatus {
     Idle,
     /// Request/offer/accept or probe-arm messages are being exchanged.
     Negotiating,
+    /// The active traffic contract is being synchronously released and the
+    /// acquisition-safe profile restored.
+    Releasing,
     /// A bounded candidate profile is currently being exercised.
     Probing {
         /// Candidate profile under test.
@@ -512,6 +546,13 @@ mod tests {
         assert_eq!(policy.step_us, 25);
         assert_eq!(policy.probe_superframes, 8);
         assert_eq!(policy.safety_steps, 2);
+    }
+
+    #[test]
+    fn exit_policy_requires_an_enabled_trigger() {
+        assert!(!CadenceExitPolicy::default().is_enabled());
+        assert!(CadenceExitPolicy::new(2, 0).is_enabled());
+        assert!(CadenceExitPolicy::new(0, 3).is_enabled());
     }
 
     #[test]

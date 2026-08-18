@@ -237,8 +237,29 @@ PHY保存`active + pending + probe overlay`三个profile层次；合法候选只
 的`[probe_start, probe_end)`生效，结束后由MPSL callback自动恢复active profile。
 profile字段用release/acquire fence发布给MPSL IRQ。
 
+#### 4c-8. 退出短包合同
+
+central和peripheral都提供`exit_cadence()`。peripheral先发Release请求，central以
+采集阶段保存的`cadence_safe_profile`作为唯一权威目标，双方执行
+`Release → Accept → Commit → Applied`，到同一phase-0 epoch后才解除payload合同。
+在退出协商、失败或重试期间，原合同仍由独立的`cadence_active_contract`约束，不能
+借状态切换发送超长包。`cadence_status()`在流程中返回`Releasing`，完成后返回
+`Idle`；重复退出是幂等的并返回generation 0。
+
+`set_cadence_exit_policy(Some(CadenceExitPolicy::new(delivery_failures,
+consecutive_misses)))`可启用安全自动退出。任一非零阈值独立生效：从合同Stable时
+的基线开始累计retry耗尽的delivery failure，或统计连续无peer包slot。阈值只触发
+同一个Release协议，**包长永远不是自动退出/切换条件**；0表示禁用对应条件，`None`
+禁用全部自动退出。central会在4次miss时跳频并清计数，因此central侧连续miss阈值
+实际应设为1–3；更严重、较长时间的损失应使用delivery-failure阈值。
+
+退出完成generation及apply epoch继续由周期Beacon广告，peripheral即使丢失第一颗
+post-apply Data/Ack也能最终确认并解除合同，不会在idle或reverse-first业务中永久
+停留于Applied。
+
 可选bench feature `cadence-probe`可由`CADENCE_PROBE=1 scripts/bench.sh build`
-启用。52840→5340、8B/8B合同在双方500 µs验证floor下完成Offer/Accept/Commit，
+启用。示例在Stable 3秒后调用`exit_cadence()`，依次记录`CADENCE EXIT`和
+`CADENCE RELEASED`，同时验证退出后Data继续传输。52840→5340、8B/8B合同在双方500 µs验证floor下完成Offer/Accept/Commit，
 最终仍为 **500/600 µs**；成功运行中central保持 **1922 slots/s**，peripheral
 约 **1887–1921 slots/s**，严格ping-pong仍完成逐包echo。采集期仍存在历史性的
 run-level启动波动，失败运行发生在API触发前的全600 acquisition，不属于合同状态机。

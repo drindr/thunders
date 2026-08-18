@@ -16,8 +16,8 @@ pub mod scheduler;
 pub mod security;
 
 pub use cadence::{
-    CadenceError, CadenceNegotiationStatus, CadenceProbePolicy, CadenceProfile, CadenceSearch,
-    ProbeDecision, ProbeMetrics, TrafficContract,
+    CadenceError, CadenceExitPolicy, CadenceNegotiationStatus, CadenceProbePolicy, CadenceProfile,
+    CadenceSearch, ProbeDecision, ProbeMetrics, TrafficContract,
 };
 pub use config::{
     Address, Config, DeviceId, Role, MAX_PAYLOAD, NACK_BYTES, RETRY_TIMEOUT_SLOTS, WINDOW_SIZE,

@@ -13,7 +13,10 @@ pub enum CadenceStage {
     Request,
     /// The central proposes the contract and first candidate.
     Offer,
-    /// The peripheral accepts the offered bounds.
+    /// Either endpoint requests release of the active traffic contract. The
+    /// central repeats this as the authoritative safe-profile offer.
+    Release,
+    /// The peripheral accepts the offered bounds or release request.
     Accept,
     /// The central publishes a bounded probe interval.
     Probe,
@@ -308,6 +311,15 @@ mod tests {
         let n = pkt.to_bytes(&mut buf).unwrap();
         assert!(n <= 64);
         assert_eq!(pkt, Packet::from_bytes(&buf[..n]).unwrap());
+
+        let mut release = pkt.clone();
+        if let Packet::Cadence { stage, flags, .. } = &mut release {
+            *stage = CadenceStage::Release;
+            *flags = 4;
+        }
+        let n = release.to_bytes(&mut buf).unwrap();
+        assert!(n <= 64);
+        assert_eq!(release, Packet::from_bytes(&buf[..n]).unwrap());
     }
 
     #[test]

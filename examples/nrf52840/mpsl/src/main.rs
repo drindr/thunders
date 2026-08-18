@@ -123,6 +123,12 @@ async fn main(spawner: Spawner) {
             let mut cadence_requested = false;
             #[cfg(feature = "cadence-probe")]
             let mut cadence_reported = false;
+            #[cfg(feature = "cadence-probe")]
+            let mut cadence_stable_at: Option<Instant> = None;
+            #[cfg(feature = "cadence-probe")]
+            let mut cadence_exit_requested = false;
+            #[cfg(feature = "cadence-probe")]
+            let mut cadence_released = false;
 
             let mut rx_buf = [0u8; 32];
             let mut frames: u64 = 0;
@@ -173,8 +179,28 @@ async fn main(spawner: Spawner) {
                         central.cadence_status()
                     {
                         cadence_reported = true;
+                        cadence_stable_at = Some(Instant::now());
                         info!("CADENCE STABLE short={} long={}", profile.short_slot_us, profile.long_slot_us);
                     }
+                }
+                #[cfg(feature = "cadence-probe")]
+                if cadence_reported && !cadence_exit_requested {
+                    if let Some(at) = cadence_stable_at {
+                        if at.elapsed() >= embassy_time::Duration::from_secs(3) {
+                            if let Ok(generation) = central.exit_cadence() {
+                                cadence_exit_requested = true;
+                                info!("CADENCE EXIT gen={}", generation);
+                            }
+                        }
+                    }
+                }
+                #[cfg(feature = "cadence-probe")]
+                if cadence_exit_requested
+                    && !cadence_released
+                    && matches!(central.cadence_status(), thunders::CadenceNegotiationStatus::Idle)
+                {
+                    cadence_released = true;
+                    info!("CADENCE RELEASED");
                 }
                 // TX slots carry a fresh PING (seq per PING, beacons skipped),
                 // RX slots listen.

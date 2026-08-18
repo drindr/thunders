@@ -39,8 +39,8 @@ use heapless::Vec;
 
 use crate::{
     cadence::{
-        CadenceError, CadenceNegotiationStatus, CadenceProbePolicy, CadenceProfile, CadenceSearch,
-        ProbeDecision, ProbeMetrics, TrafficContract,
+        CadenceError, CadenceExitPolicy, CadenceNegotiationStatus, CadenceProbePolicy,
+        CadenceProfile, CadenceSearch, ProbeDecision, ProbeMetrics, TrafficContract,
     },
     config::{
         Config, Role, CENTRAL_REPLY_TIMEOUT_US, MAX_PAYLOAD, NACK_BYTES,
@@ -331,6 +331,17 @@ fn deliver_rx<P>(rx: &mut RxWindow, rx_buf: &mut [u8]) -> Result<Option<usize>, 
 const CADENCE_PROTOCOL_OVERHEAD: u16 = 12;
 const CADENCE_FLAG_STABLE: u8 = 1;
 const CADENCE_FLAG_REJECT: u8 = 2;
+const CADENCE_FLAG_RELEASE: u8 = 4;
+
+fn cadence_exit_triggered(policy: CadenceExitPolicy, failed: u32, misses: u8) -> bool {
+    (policy.delivery_failures != 0 && failed >= policy.delivery_failures as u32)
+        || (policy.consecutive_misses != 0 && misses >= policy.consecutive_misses)
+}
+
+fn cadence_generation_newer(candidate: u8, current: u8) -> bool {
+    let delta = candidate.wrapping_sub(current) & 0x7f;
+    delta != 0 && delta < 64
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CadenceRunStage {
@@ -367,6 +378,7 @@ struct CadenceRuntime {
     peer_metrics: Option<ProbeMetrics>,
     apply_epoch: u32,
     commit_changes_profile: bool,
+    releasing: bool,
     error: Option<CadenceError>,
 }
 
@@ -391,6 +403,7 @@ impl CadenceRuntime {
             peer_metrics: None,
             apply_epoch: 0,
             commit_changes_profile: false,
+            releasing: false,
             error: None,
         }
     }
@@ -423,6 +436,16 @@ struct LinkCore<P: Phy> {
     cadence_ack: u8,
     /// API-triggered traffic-contract negotiation and bounded probe state.
     cadence_runtime: CadenceRuntime,
+    /// Acquisition-negotiated profile used when releasing a short-payload
+    /// contract. API probes never overwrite this safety anchor.
+    cadence_safe_profile: CadenceProfile,
+    /// Contract currently enforced by the data plane. It remains active while
+    /// a replacement or release handshake is in flight.
+    cadence_active_contract: Option<TrafficContract>,
+    /// Optional severe-loss policy that requests a synchronized release.
+    cadence_exit_policy: Option<CadenceExitPolicy>,
+    /// Delivery-failure baseline captured when the active contract stabilized.
+    cadence_exit_failure_baseline: u32,
     /// Last channel written to the phy (the phy is only re-tuned on change).
     last_channel: Option<u8>,
     /// Consecutive missed replies (the adaptive-hop trigger).
@@ -495,6 +518,10 @@ impl<P: Phy> LinkCore<P> {
             cadence_apply_epoch: 0,
             cadence_ack: 0,
             cadence_runtime: CadenceRuntime::new(stable_profile),
+            cadence_safe_profile: stable_profile,
+            cadence_active_contract: None,
+            cadence_exit_policy: None,
+            cadence_exit_failure_baseline: 0,
             last_channel: None,
             consecutive_misses: 0,
             missed_frames: 0,
@@ -622,6 +649,9 @@ impl<P: Phy> LinkCore<P> {
     }
 
     fn cadence_status(&self) -> CadenceNegotiationStatus {
+        if self.cadence_runtime.releasing {
+            return CadenceNegotiationStatus::Releasing;
+        }
         match self.cadence_runtime.stage {
             CadenceRunStage::Idle => CadenceNegotiationStatus::Idle,
             CadenceRunStage::Probing => CadenceNegotiationStatus::Probing {
@@ -696,6 +726,74 @@ impl<P: Phy> LinkCore<P> {
             self.cadence_runtime.stage = CadenceRunStage::Request;
         }
         Ok(generation)
+    }
+
+    fn set_cadence_exit_policy(&mut self, policy: Option<CadenceExitPolicy>) {
+        self.cadence_exit_policy = policy.filter(|p| p.is_enabled());
+        self.cadence_exit_failure_baseline = self.delivery_failures;
+    }
+
+    fn request_cadence_exit(&mut self) -> Result<u8, CadenceError> {
+        if !self.phy.op_pipelined() {
+            return Err(CadenceError::Unsupported);
+        }
+        if self.cadence_runtime.stage == CadenceRunStage::Idle
+            || (self.cadence_runtime.stage == CadenceRunStage::Failed
+                && self.cadence_active_contract.is_none())
+        {
+            return Ok(0);
+        }
+        if !matches!(
+            self.cadence_runtime.stage,
+            CadenceRunStage::Stable | CadenceRunStage::Failed
+        ) {
+            return Err(CadenceError::Busy);
+        }
+        let active = self.cadence_runtime.stable;
+        let generation = (self.cadence_runtime.generation.wrapping_add(1) & 0x7f).max(1);
+        self.cadence_runtime = CadenceRuntime::new(active);
+        self.cadence_runtime.generation = generation;
+        self.cadence_runtime.releasing = true;
+        self.cadence_runtime.contract =
+            TrafficContract::new(MAX_PAYLOAD as u16, MAX_PAYLOAD as u16);
+        self.cadence_runtime.candidate = self.cadence_safe_profile;
+        self.cadence_id = generation;
+        self.cadence_ack = 0;
+        self.cadence_runtime.stage = if self.state.central {
+            CadenceRunStage::Offer
+        } else {
+            CadenceRunStage::Request
+        };
+        Ok(generation)
+    }
+
+    fn complete_cadence_apply(&mut self) {
+        if self.cadence_runtime.releasing {
+            self.cadence_active_contract = None;
+            self.cadence_runtime = CadenceRuntime::new(self.cadence_safe_profile);
+            // Keep the completed generation/apply descriptor in periodic
+            // beacons. A peripheral that lost the first post-apply packet can
+            // then finish release without re-arming or guessing a profile.
+            self.cadence_short_us = self.cadence_safe_profile.short_slot_us;
+            self.cadence_long_us = self.cadence_safe_profile.long_slot_us;
+            self.cadence_short_phases = self.cadence_safe_profile.forward_slots;
+            self.cadence_ack = self.cadence_id | 0x80;
+        } else {
+            self.cadence_active_contract = Some(self.cadence_runtime.contract);
+            self.cadence_runtime.stage = CadenceRunStage::Stable;
+            self.cadence_exit_failure_baseline = self.delivery_failures;
+        }
+    }
+
+    fn cadence_auto_exit_due(&self) -> bool {
+        let Some(policy) = self.cadence_exit_policy else {
+            return false;
+        };
+        let failed = self
+            .delivery_failures
+            .wrapping_sub(self.cadence_exit_failure_baseline);
+        let misses = self.consecutive_misses.max(self.missed_frames);
+        cadence_exit_triggered(policy, failed, misses)
     }
 
     fn align_future(slot: u32, period: u32, lead_periods: u32) -> u32 {
@@ -781,6 +879,9 @@ impl<P: Phy> LinkCore<P> {
     }
 
     fn cadence_tick(&mut self, slot: u32, period: u32) {
+        if self.cadence_runtime.stage == CadenceRunStage::Stable && self.cadence_auto_exit_due() {
+            let _ = self.request_cadence_exit();
+        }
         let in_probe_state = matches!(
             self.cadence_runtime.stage,
             CadenceRunStage::ProbePlan | CadenceRunStage::Armed | CadenceRunStage::Probing
@@ -867,7 +968,7 @@ impl<P: Phy> LinkCore<P> {
             && self.cadence_runtime.stage == CadenceRunStage::Applying
             && (slot.wrapping_sub(self.cadence_runtime.local_start) as i32) >= 0
         {
-            self.cadence_runtime.stage = CadenceRunStage::Stable;
+            self.complete_cadence_apply();
         }
     }
 
@@ -891,7 +992,13 @@ impl<P: Phy> LinkCore<P> {
             });
         }
         let stage = match (central, self.cadence_runtime.stage) {
+            (false, CadenceRunStage::Request) if self.cadence_runtime.releasing => {
+                CadenceStage::Release
+            }
             (false, CadenceRunStage::Request) => CadenceStage::Request,
+            (true, CadenceRunStage::Offer) if self.cadence_runtime.releasing => {
+                CadenceStage::Release
+            }
             (true, CadenceRunStage::Offer) => CadenceStage::Offer,
             (false, CadenceRunStage::Accept | CadenceRunStage::Failed) => CadenceStage::Accept,
             (true, CadenceRunStage::ProbePlan) => CadenceStage::Probe,
@@ -907,7 +1014,7 @@ impl<P: Phy> LinkCore<P> {
         } else {
             self.cadence_runtime.candidate
         };
-        let flags = if stage == CadenceStage::Accept
+        let mut flags = if stage == CadenceStage::Accept
             && self.cadence_runtime.error == Some(CadenceError::PeerRejected)
         {
             CADENCE_FLAG_REJECT
@@ -919,7 +1026,10 @@ impl<P: Phy> LinkCore<P> {
         } else {
             0
         };
-        if !central && stage != CadenceStage::Request {
+        if self.cadence_runtime.releasing {
+            flags |= CADENCE_FLAG_RELEASE;
+        }
+        if !central && !matches!(stage, CadenceStage::Request | CadenceStage::Release) {
             return Some(Packet::CadenceAck {
                 generation: self.cadence_runtime.generation,
                 stage,
@@ -995,11 +1105,11 @@ impl<P: Phy> LinkCore<P> {
         };
         let mut rejected = false;
         if let Some(data) = offered {
-            if self.cadence_runtime.stage == CadenceRunStage::Stable {
+            if let Some(contract) = self.cadence_active_contract {
                 let max_payload = if self.state.central {
-                    self.cadence_runtime.contract.forward_max_payload
+                    contract.forward_max_payload
                 } else {
-                    self.cadence_runtime.contract.reverse_max_payload
+                    contract.reverse_max_payload
                 } as usize;
                 if data.len() > max_payload {
                     return Err(Error::PayloadExceedsCadenceProfile);
@@ -1368,6 +1478,66 @@ impl<P: Phy> LinkCore<P> {
             return;
         }
         match (central, stage) {
+            (true, CadenceStage::Release)
+                if cadence_generation_newer(generation, self.cadence_runtime.generation)
+                    && matches!(
+                        self.cadence_runtime.stage,
+                        CadenceRunStage::Stable | CadenceRunStage::Failed
+                    ) =>
+            {
+                let active = self.cadence_runtime.stable;
+                self.cadence_runtime = CadenceRuntime::new(active);
+                self.cadence_runtime.generation = generation;
+                self.cadence_runtime.releasing = true;
+                self.cadence_runtime.contract =
+                    TrafficContract::new(MAX_PAYLOAD as u16, MAX_PAYLOAD as u16);
+                self.cadence_runtime.candidate = self.cadence_safe_profile;
+                self.cadence_id = generation;
+                self.cadence_ack = 0;
+                self.cadence_runtime.stage = CadenceRunStage::Offer;
+            }
+            (false, CadenceStage::Release)
+                if matches!(
+                    self.cadence_runtime.stage,
+                    CadenceRunStage::Stable
+                        | CadenceRunStage::Failed
+                        | CadenceRunStage::Request
+                        | CadenceRunStage::Accept
+                ) =>
+            {
+                if matches!(
+                    self.cadence_runtime.stage,
+                    CadenceRunStage::Stable | CadenceRunStage::Failed
+                ) && !cadence_generation_newer(generation, self.cadence_runtime.generation)
+                {
+                    return;
+                }
+                if short_us < self.phy.min_short_slot_period_us()
+                    || long_us < self.phy.min_long_slot_period_us()
+                    || long_us < short_us
+                {
+                    self.cadence_runtime.generation = generation;
+                    self.cadence_runtime.error = Some(CadenceError::PeerRejected);
+                    self.cadence_runtime.stage = CadenceRunStage::Failed;
+                    return;
+                }
+                let active = self.cadence_runtime.stable;
+                self.cadence_runtime = CadenceRuntime::new(active);
+                self.cadence_runtime.generation = generation;
+                self.cadence_runtime.releasing = true;
+                self.cadence_runtime.contract =
+                    TrafficContract::new(MAX_PAYLOAD as u16, MAX_PAYLOAD as u16);
+                self.cadence_runtime.candidate = CadenceProfile::new(
+                    short_us,
+                    long_us,
+                    active.forward_slots,
+                    active.reverse_slots,
+                    active.idle_slots,
+                );
+                self.cadence_id = generation;
+                self.cadence_ack = 0;
+                self.cadence_runtime.stage = CadenceRunStage::Accept;
+            }
             (true, CadenceStage::Request)
                 if matches!(
                     self.cadence_runtime.stage,
@@ -1450,6 +1620,8 @@ impl<P: Phy> LinkCore<P> {
                 if flags & CADENCE_FLAG_REJECT != 0 {
                     self.cadence_runtime.error = Some(CadenceError::PeerRejected);
                     self.cadence_runtime.stage = CadenceRunStage::Failed;
+                } else if self.cadence_runtime.releasing {
+                    self.start_final_commit(catch_slot, period, self.cadence_safe_profile);
                 } else if self
                     .cadence_runtime
                     .search
@@ -1529,6 +1701,9 @@ impl<P: Phy> LinkCore<P> {
                             | CadenceRunStage::Applying
                     ) =>
             {
+                self.cadence_runtime.releasing = flags & CADENCE_FLAG_RELEASE != 0;
+                self.cadence_runtime.contract =
+                    TrafficContract::new(forward_payload as u16, reverse_payload as u16);
                 let delta = start_epoch.wrapping_sub(epoch) as i32;
                 if delta > 0 {
                     let local_apply = catch_slot.wrapping_add(delta as u32);
@@ -1806,6 +1981,7 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_negotiated = true;
                         self.cadence_runtime.stable.short_slot_us = self.cadence_short_us;
                         self.cadence_runtime.stable.long_slot_us = self.cadence_long_us;
+                        self.cadence_safe_profile = self.cadence_runtime.stable;
                     }
                     let _ = cadence_ack; // diagnostic/forward-compatible ACK
                 }
@@ -1893,7 +2069,7 @@ impl<P: Phy> LinkCore<P> {
                     // proves the central received Applied and resumed its
                     // normal schedule. Periodic beacons make this idle-link
                     // completion repairable without re-arming the PHY.
-                    self.cadence_runtime.stage = CadenceRunStage::Stable;
+                    self.complete_cadence_apply();
                 }
                 if !api_descriptor && self.cadence_id != 0 && cadence_id == self.cadence_id {
                     self.cadence_short_us = short_slot_us.max(self.phy.min_short_slot_period_us());
@@ -1945,7 +2121,7 @@ impl<P: Phy> LinkCore<P> {
             // The central can send normal Data/Ack only after it received our
             // Applied and crossed the same epoch. This is the peripheral's
             // final confirmation, so it may stop repeating Applied now.
-            self.cadence_runtime.stage = CadenceRunStage::Stable;
+            self.complete_cadence_apply();
         }
 
         self.clear_pending_drop();
@@ -2293,6 +2469,19 @@ impl<P: Phy> Central<P> {
         self.core.request_cadence(contract, policy)
     }
 
+    /// Synchronously release the active traffic contract and restore the
+    /// acquisition-safe cadence profile. The normal `frame()` loop carries
+    /// the Release/Accept/Commit/Applied handshake.
+    pub fn exit_cadence(&mut self) -> Result<u8, CadenceError> {
+        self.core.request_cadence_exit()
+    }
+
+    /// Configure automatic safe release after severe loss. `None` disables
+    /// automatic release; packet length never triggers this policy.
+    pub fn set_cadence_exit_policy(&mut self, policy: Option<CadenceExitPolicy>) {
+        self.core.set_cadence_exit_policy(policy);
+    }
+
     /// Current API-triggered cadence negotiation state.
     pub fn cadence_status(&self) -> CadenceNegotiationStatus {
         self.core.cadence_status()
@@ -2426,6 +2615,18 @@ impl<P: Phy> Peripheral<P> {
         self.core.request_cadence(contract, policy)
     }
 
+    /// Ask the central to synchronously release the active traffic contract
+    /// and restore the acquisition-safe cadence profile.
+    pub fn exit_cadence(&mut self) -> Result<u8, CadenceError> {
+        self.core.request_cadence_exit()
+    }
+
+    /// Configure automatic safe release after severe loss. `None` disables
+    /// automatic release; packet length never triggers this policy.
+    pub fn set_cadence_exit_policy(&mut self, policy: Option<CadenceExitPolicy>) {
+        self.core.set_cadence_exit_policy(policy);
+    }
+
     /// Current cadence negotiation state driven by either peer's API request.
     pub fn cadence_status(&self) -> CadenceNegotiationStatus {
         self.core.cadence_status()
@@ -2462,6 +2663,24 @@ mod tests {
     use super::*;
     use crate::config::{Address, MAX_RETRIES, RETRY_TIMEOUT_SLOTS};
     use crate::link_mgmt::TxWindow;
+
+    #[test]
+    fn cadence_exit_thresholds_are_exact_and_independent() {
+        let policy = CadenceExitPolicy::new(2, 3);
+        assert!(!cadence_exit_triggered(policy, 1, 2));
+        assert!(cadence_exit_triggered(policy, 2, 0));
+        assert!(cadence_exit_triggered(policy, 0, 3));
+        assert!(!cadence_exit_triggered(CadenceExitPolicy::default(), 99, 99));
+    }
+
+    #[test]
+    fn cadence_generation_rejects_duplicates_and_stale_release() {
+        assert!(!cadence_generation_newer(7, 7));
+        assert!(cadence_generation_newer(8, 7));
+        assert!(!cadence_generation_newer(6, 7));
+        assert!(cadence_generation_newer(1, 127));
+        assert!(!cadence_generation_newer(127, 1));
+    }
 
     #[test]
     fn local_phase_mapping_without_idle() {
