@@ -137,15 +137,30 @@ SlotRequest 分支走正常的 `apply_ack_nack` + `clear_pending_drop`——
 窗口从存活流量本身就能推进，强制清除作为兜底保留。实测好 run 的
 PING 回显可达 tx=228/rx=222。
 
-（尝试过 ack-stall 触发的 echo delay sweep 自愈，实测更差已回退：
-死态下网格偏移把对端窗口推出了 sweep 位置的可达范围，且 slot 长度
-约束让 echo 无法在窗口需要的位置发射。）
+#### 4c-5. MPSL cadence floor：500 → 600 µs
 
-丢包后 central 的 `pending_drop` 只有收到覆盖该 seq 的 ACK 才会清
-除；而采集期的 peripheral 只回 SlotRequest（不带 ACK）——central
-永远卡在只发 Drop、不再发新 Data，对偶死锁。现在 central 收到
-SlotRequest 即**强制清 pending_drop**（对端存活证明）。实测该修复
-前失败的 run 里 central `txd=0`（整个窗口没发过一条 Data）。
+最后的 run-level 硬币翻转并不是随机 RF：500 µs cadence 扣除 MPSL
+要求的 150 µs inter-slot gap 后，grant 只有 350 µs。19 字节 Data echo
+扣除 setup、TX ramp、airtime 和 40 µs tail，只剩约 **129 µs** 合法
+delay；死态实测的 peer window 需要约 **150–180 µs**。短 SlotRequest
+仍可放入（所以看起来采集活着），长 echo 却在该 slot 内物理上无解，
+形成“SR 能到、Data echo 永远不到”的稳定死态。
+
+MPSL cadence floor 改为 **600 µs**：grant 变 450 µs，长 echo 的合法
+delay 扩至约 **229 µs**，完整覆盖 0–210 µs acquisition sweep。协商
+也不得再把 cadence 缩回板卡的 500 µs 物理下限。代价是 slot rate 从
+2000/s 降到约 1666/s（17%），换来连接确定性：
+
+- 52840→5340 连跑 8 次：**8/8 成功**，每次都有双向数据，最好
+  tx=636/rx=635；此前同样批次通常只有 1–3 次真成功；
+- 完整 6 个 MPSL 方向：**6/6 成功**，包含原已知死点 LM20↔5340；
+- 最弱的 5340↔LM20 再各跑 4 次：**8/8 成功**；
+- 合计本轮验证 **22/22 MPSL run 成功**，forward loss ≤0.15%，
+  rev_arq 0.04–0.75%。
+
+曾尝试 ack-stall 触发的 echo-delay sweep；500 µs 下长 echo 的 slot
+预算会把 sweep 钳到 ≤129 µs，因此无法触及需要的窗口，且实测更差，
+已回退。这个失败反过来验证了 grant 长度才是最终物理约束。
 
 ### 5. bench 计时从 central BENCH READY 开始
 

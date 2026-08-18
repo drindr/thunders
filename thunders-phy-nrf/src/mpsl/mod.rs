@@ -19,10 +19,17 @@ use thunders::phy::Phy;
 
 use crate::radio_phy::RadioMode;
 
-/// The fallback MPSL slot cadence used before negotiation completes.
-/// 500 us is the slowest board's physical minimum, so every board can start
-/// here and then renegotiate to `max(central_min, peripheral_min)`.
-pub const MPSL_FALLBACK_SLOT_US: u32 = 500;
+/// The MPSL slot cadence floor.
+///
+/// The physical board minimum is 500 us, but at that cadence the 350 us MPSL
+/// grant leaves only ~129 us of legal delay for a 19-byte Data echo after TX
+/// setup/ramp/airtime/tail.  Acquisition can measure a peer window that needs
+/// 150-180 us of follower delay, so the short SlotRequest still fits while the
+/// longer echo is physically impossible to place; the pair then remains in a
+/// run-level acquisition dead state.  A 600 us cadence gives a 450 us grant
+/// and ~229 us of legal delay, covering the complete 0-210 us acquisition
+/// sweep at a 17% cadence cost.
+pub const MPSL_FALLBACK_SLOT_US: u32 = 600;
 
 // The phase-lock (the proportional controller on the peripheral).
 pub(crate) const PLL_SWEEP_US: u32 = 2;
@@ -569,10 +576,13 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
     }
 
     fn align_slot_period(&mut self, us: u16) {
-        // Never adopt a cadence faster than this board's physical minimum;
-        // a central that advertised a shorter slot must slow down, not the
-        // peripheral starve.
-        let us = us.max(SLOT_US as u16) as u32;
+        // Never adopt a cadence faster than this board's physical minimum or
+        // the MPSL echo-placement floor.  Negotiation used to shrink the
+        // 600-us acquisition cadence back to the boards' 500-us physical
+        // minimum, recreating the too-short 350-us grant.
+        let us = us
+            .max(SLOT_US as u16)
+            .max(MPSL_FALLBACK_SLOT_US as u16) as u32;
         self.state.slot_nominal = us;
         self.state.slot_distance = us;
         // Keep the MPSL inter-slot gap rule (>= 150 us) when the cadence
