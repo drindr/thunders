@@ -96,6 +96,14 @@ pub enum Packet {
     SlotRequest {
         /// The peripheral's minimum slot period in microseconds.
         min_slot_us: u16,
+        /// The peripheral's cumulative RX ACK. An acquiring peripheral
+        /// answers only with SlotRequests (no Data/Ack packets), so
+        /// without this the central could never clear a pending_drop via
+        /// the normal ACK path - a dropped Data left it sending Drop
+        /// packets forever and no new Data ever (the pair deadlocked).
+        /// The ACK lets the central's window advance from the liveness
+        /// traffic itself.
+        ack: u16,
     },
     /// Pairing request from a peripheral.
     PairingRequest {

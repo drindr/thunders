@@ -103,8 +103,7 @@ pub unsafe extern "C" fn timeslot_cb(
                         && state.peer_rx_ramp_us > 0
                         && state.tx_ramp_us > 0
                     {
-                    {
-                        // The frame being placed is the NEXT (pending) op -
+                    // The frame being placed is the NEXT (pending) op -
                         // a TX, published 2 slots ahead in the pipeline -
                         // whose length is known. The old code used the last
                         // RECEIVED frame's length: the echo (a ~19 B Data)

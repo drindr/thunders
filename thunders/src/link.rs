@@ -726,7 +726,10 @@ impl<P: Phy> LinkCore<P> {
                 // Peripheral acquisition: this slot carries our minimum
                 // cadence instead of data, with the TX delay swept.
                 self.phy.set_tx_delay_sweep(true);
-                let outbound = Packet::SlotRequest { min_slot_us };
+                let outbound = Packet::SlotRequest {
+                    min_slot_us,
+                    ack: self.state.lm.rx.ack(),
+                };
                 let n = self.encode_packet(&outbound)?;
                 // Acquisition SlotRequests stay on the plain path: they are
                 // isolated TX slots and must not inherit a half-open burst
@@ -736,8 +739,6 @@ impl<P: Phy> LinkCore<P> {
                 self.advance_epoch(hw_slot);
                 return Ok(None);
             }
-            self.phy.set_tx_delay_sweep(false);
-
             if central {
                 if forced_beacon {
                     let outbound = self.beacon_packet(phase, period);
@@ -944,7 +945,15 @@ impl<P: Phy> LinkCore<P> {
                 self.state.lm.rx.skip_to(seq);
                 self.apply_ack_nack(ack, &nack);
             }
-            Packet::SlotRequest { min_slot_us } if central => {
+            Packet::SlotRequest { min_slot_us, ack } if central => {
+                // The acquiring peer's cumulative ACK: lets the central's
+                // TX window advance from the liveness traffic itself. An
+                // acquiring peer answers only with SlotRequests (no
+                // Data/Ack packets), so without the ACK a dropped Data
+                // left the central stuck sending Drop packets forever and
+                // no new Data ever (the pair deadlocked).
+                self.apply_ack_nack(ack, &[0; NACK_BYTES]);
+                self.clear_pending_drop();
                 if !self.cadence_negotiated {
                     self.cadence_negotiated = true;
                     let negotiated = self.phy.min_slot_period_us().max(min_slot_us).max(1);
@@ -952,14 +961,6 @@ impl<P: Phy> LinkCore<P> {
                         self.phy.align_slot_period(negotiated);
                     }
                 }
-                // A SlotRequest proves the reverse link lives (the peer is
-                // still transmitting to us). Without this, a dropped Data
-                // leaves the central stuck sending Drop packets forever:
-                // the acquiring peer answers only with SlotRequests (which
-                // carry no ACK), so pending_drop never clears (the ACK
-                // check can't fire) and no new Data is ever sent - the
-                // pair deadlocks. Force-clear on liveness proof.
-                self.pending_drop = None;
             }
             Packet::Beacon {
                 channel_index,
@@ -1093,7 +1094,10 @@ impl<P: Phy> LinkCore<P> {
                 // Peripheral acquisition: this slot carries our minimum
                 // cadence instead of data, with the TX delay swept.
                 self.phy.set_tx_delay_sweep(true);
-                let outbound = Packet::SlotRequest { min_slot_us };
+                let outbound = Packet::SlotRequest {
+                    min_slot_us,
+                    ack: self.state.lm.rx.ack(),
+                };
                 let n = self.encode_packet(&outbound)?;
                 self.phy
                     .op_publish_tx(&self.tx_buf[..n], target, grace)

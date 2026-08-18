@@ -128,7 +128,18 @@ op 的目标 slot，与处理延迟无关），且只有**连续两个 beacon �
 现在给 delay 加**对端窗口尾部钳位**（帧尾必须落在对端窗口内，宁可
 偏中心也要进窗），与 slot 内预算钳位取 min。
 
-#### 4c-4. 中央 drop 死锁（SlotRequest 视为存活证明）
+#### 4c-4. 中央 drop 死锁（SlotRequest 携带 ACK + 存活证明）
+
+采集期的 peripheral 只回 SlotRequest（原来不带 ACK）：central 丢包后
+的 `pending_drop` 永远等不到覆盖它的 ACK，只能靠强制清除。现在
+SlotRequest 携带 peripheral 的累计 ACK（`rx.ack()`），central 在
+SlotRequest 分支走正常的 `apply_ack_nack` + `clear_pending_drop`——
+窗口从存活流量本身就能推进，强制清除作为兜底保留。实测好 run 的
+PING 回显可达 tx=228/rx=222。
+
+（尝试过 ack-stall 触发的 echo delay sweep 自愈，实测更差已回退：
+死态下网格偏移把对端窗口推出了 sweep 位置的可达范围，且 slot 长度
+约束让 echo 无法在窗口需要的位置发射。）
 
 丢包后 central 的 `pending_drop` 只有收到覆盖该 seq 的 ACK 才会清
 除；而采集期的 peripheral 只回 SlotRequest（不带 ACK）——central
