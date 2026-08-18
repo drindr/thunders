@@ -16,10 +16,11 @@ fn slot_profile_due(slot: u32, apply: u32) -> bool {
 /// uniform safe cadence until the agreed absolute apply slot.
 #[inline(always)]
 fn nominal_for_slot(state: &MpslState, slot: u32) -> u32 {
-    if !state.profile_armed
-        || state.profile_period == 0
-        || !slot_profile_due(slot, state.profile_apply_slot)
-    {
+    if !state.profile_armed {
+        return state.slot_nominal;
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+    if state.profile_period == 0 || !slot_profile_due(slot, state.profile_apply_slot) {
         return state.slot_nominal;
     }
     let phase = slot

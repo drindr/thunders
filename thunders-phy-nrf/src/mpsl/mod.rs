@@ -603,6 +603,11 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state.profile_short_phases = (short_phases as u32).min(period);
         self.state.profile_phase_offset = phase_offset as u32 % period;
         self.state.profile_apply_slot = apply_slot;
+        // Same-core app -> MPSL IRQ publication: armed is written last. If
+        // the IRQ preempts any earlier write it still sees false and uses the
+        // uniform fallback; after true, the compiler fence guarantees the
+        // complete immutable profile is visible.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         self.state.profile_armed = true;
     }
 
@@ -618,11 +623,12 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         let us = us
             .max(SLOT_US as u16)
             .max(MPSL_FALLBACK_SLOT_US as u16) as u32;
+        // Disarm first: an IRQ that preempts the uniform-field writes below
+        // must keep using the old complete profile rather than a mixed state.
+        self.state.profile_armed = false;
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         self.state.slot_nominal = us;
         self.state.slot_distance = us;
-        // A uniform align is the acquisition/fallback mode. A negotiated
-        // phase profile is armed later with an absolute apply slot.
-        self.state.profile_armed = false;
         // Keep the MPSL inter-slot gap rule (>= 150 us) when the cadence
         // changes at runtime, and give the RX poll a usable budget.
         self.state.slot_len = us.saturating_sub(150);
