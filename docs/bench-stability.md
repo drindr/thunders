@@ -263,10 +263,11 @@ post-apply Data/Ack也能最终确认并解除合同，不会在idle或reverse-f
 
 可选bench feature `cadence-probe`可由`CADENCE_PROBE=1 scripts/bench.sh build`
 启用。示例在Stable 3秒后调用`exit_cadence()`，依次记录`CADENCE EXIT`和
-`CADENCE RELEASED`，同时验证退出后Data继续传输。52840→5340、8B/8B合同在双方500 µs验证floor下完成Offer/Accept/Commit，
-最终仍为 **500/600 µs**；成功运行中central保持 **1922 slots/s**，peripheral
-约 **1887–1921 slots/s**，严格ping-pong仍完成逐包echo。采集期仍存在历史性的
-run-level启动波动，失败运行发生在API触发前的全600 acquisition，不属于合同状态机。
+`CADENCE RELEASED`，同时验证退出后Data继续传输。最终六个MPSL方向
+（52840/5340/LM20互为central/peripheral）都观察到完整
+`STABLE → EXIT → RELEASED → post-release Data`；central均为 **1922 slots/s**，
+peripheral为 **1912–1922 slots/s**。其中52840→LM20因历史性的全600 acquisition
+波动在第二次启动通过，其余方向第一次通过；该启动波动发生于API调用之前。
 
 ### 5. bench 计时从 central BENCH READY 开始
 
