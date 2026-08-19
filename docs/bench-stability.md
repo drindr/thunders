@@ -227,16 +227,18 @@ superframe后永久拉开两颗MPSL硬件计数，每次试发只overlay一个�
 active profile；wall time由MPSL callback边界精确计量。至少7/8试发必须同时满足
 slot timing、TX完成、CRC正确接收、`op_late`和ARQ delivery条件。
 
-两轴搜索得到带`safety_steps`余量的pair后，还要把**完整最终profile**连续运行额外
-确认窗口；只有确认通过才进入两阶段Commit。确认失败或协议异常走同步Release，最迟
-在deadline后统一回到600µs acquisition，绝不提交未验证profile。本轮
-5340→52840 8B硬件追踪实际观察到`475/600 → 500/575 → 500/600确认`：前两项被在线
-测量淘汰，严格最终确认未通过后双方回到Idle/600，证明失败路径不会把候选误标为
-Stable；当前实验台的启动前acquisition仍有独立的间歇性空链路问题。fixed-wire改动后
-又以8B合同、已知安全500/600 anchor运行5340→52840五次：两次进入REQUEST/Probe，
-但仍未通过既有的最终cadence确认，因此没有把未提交codec误记为硬件Stable；fixed
-Data/Ack/Drop的字节级行为由plain/secure host测试覆盖，后续需在能完成Stable的台架上
-补充真实Data阶段吞吐矩阵。
+两轴搜索得到带`safety_steps`余量的pair后，还要把**完整最终profile**连续运行最多
+32个superframe。隔离候选已经要求对应方向真实wire包CRC正确；最终连续窗口进一步要求
+两端TX按计划完成、两个方向都至少出现一次ADDRESS重叠、无`op_late`且slot数完整。
+follower若恰好错过callback起始时间戳会得到`clock_us=0`，此时使用独立slot/TX/RX
+计数判定而不误杀。最终确认前保留64个稳定superframe的Probe/Armed lead，使PLL从边缘
+候选恢复。确认失败或协议异常走同步Release，最迟在deadline后统一回到600µs acquisition。
+
+8B合同、500/600已知安全anchor的52840→5340硬件run在第3次启动进入
+`CADENCE STABLE short=500 long=600`，随后fixed Data/Ack/Drop连续运行约80秒：slot rate
+保持1922/s，多数5秒窗ping往返丢失7–14%，累计达到`rxd=27363, txd=3308`，稳定窗内
+`delivery_failures=0`。这证明codec确实越过apply epoch并承载真实双向数据，而不只是
+host端字节测试；实验台仍存在协商前空链路及弱向启动波动。
 
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、

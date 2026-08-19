@@ -357,6 +357,33 @@ fn cadence_generation_newer(candidate: u8, current: u8) -> bool {
     delta != 0 && delta < 64
 }
 
+fn accept_legacy_data_plane(active_fixed: bool, grace: &mut u8) -> bool {
+    if !active_fixed {
+        return true;
+    }
+    if *grace == 0 {
+        return false;
+    }
+    *grace -= 1;
+    true
+}
+
+fn should_join_central_fallback(active_contract: bool, advertised_apply_epoch: u32) -> bool {
+    active_contract && advertised_apply_epoch == 0
+}
+
+fn probe_timing_bad(clock_us: u32, expected_us: u32) -> bool {
+    clock_us != 0 && clock_us.abs_diff(expected_us) > expected_us / 50 + 30
+}
+
+fn required_probe_rx(confirming: bool, expected_rx: u32) -> u32 {
+    if confirming {
+        u32::from(expected_rx != 0)
+    } else {
+        expected_rx.div_ceil(2)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CadenceRunStage {
     Idle,
@@ -733,16 +760,14 @@ impl<P: Phy> LinkCore<P> {
             return Err(Error::InvalidPacket);
         }
         let packet = Packet::from_bytes(buf).map_err(|_| Error::InvalidPacket)?;
-        if self.cadence_active_fixed_wire
-            && matches!(
-                packet,
-                Packet::Data { .. } | Packet::Ack { .. } | Packet::Drop { .. }
-            )
-        {
-            if self.fixed_legacy_rx_grace == 0 {
-                return Err(Error::InvalidPacket);
-            }
-            self.fixed_legacy_rx_grace -= 1;
+        if matches!(
+            packet,
+            Packet::Data { .. } | Packet::Ack { .. } | Packet::Drop { .. }
+        ) && !accept_legacy_data_plane(
+            self.cadence_active_fixed_wire,
+            &mut self.fixed_legacy_rx_grace,
+        ) {
+            return Err(Error::InvalidPacket);
         }
         Ok(packet)
     }
@@ -1054,7 +1079,16 @@ impl<P: Phy> LinkCore<P> {
     }
 
     fn start_probe_plan(&mut self, slot: u32, period: u32) {
-        let base = Self::align_future(slot, period, 8);
+        // Final confirmation gets a longer known-stable lead. Repeated Probe
+        // descriptors/Armed replies during this interval let the follower PLL
+        // recover from deliberately marginal isolated candidates before the
+        // continuous profile is judged.
+        let lead_periods = if self.cadence_runtime.confirming {
+            64
+        } else {
+            8
+        };
+        let base = Self::align_future(slot, period, lead_periods);
         let isolated = !self.cadence_runtime.confirming;
         // Forward candidates exercise one phase-0 interval. Reverse candidates
         // exercise one first-reverse-phase interval. Stable slots surround
@@ -1069,13 +1103,17 @@ impl<P: Phy> LinkCore<P> {
             base
         };
         let target_samples = if self.cadence_runtime.confirming {
-            self.cadence_runtime.policy.probe_superframes.min(4)
+            self.cadence_runtime.policy.probe_superframes.min(32)
         } else {
             self.cadence_runtime.policy.probe_superframes
         };
         let remaining =
             target_samples.saturating_sub(self.cadence_runtime.probe_completed_superframes);
-        let probe_samples = remaining.min(1).max(1);
+        let probe_samples = if self.cadence_runtime.confirming {
+            remaining.min(32).max(1)
+        } else {
+            remaining.min(1).max(1)
+        };
         self.cadence_runtime.probe_superframes_current = probe_samples;
         let end = if isolated {
             start.wrapping_add(1)
@@ -1130,10 +1168,27 @@ impl<P: Phy> LinkCore<P> {
             local.reverse_failures.saturating_add(peer.reverse_failures),
         );
         let target_superframes = if self.cadence_runtime.confirming {
-            self.cadence_runtime.policy.probe_superframes.min(4)
+            self.cadence_runtime.policy.probe_superframes.min(32)
         } else {
             self.cadence_runtime.policy.probe_superframes
         };
+        let candidate = self.cadence_runtime.candidate;
+        if self.cadence_runtime.confirming {
+            if burst.completed_superframes < target_superframes {
+                self.start_probe_plan(slot, period);
+                return;
+            }
+            self.cadence_runtime.confirming = false;
+            if burst.forward_failures == 0 && burst.reverse_failures == 0 {
+                self.start_final_commit(slot, period, candidate);
+            } else {
+                // Confirmation failure never commits a contract/profile. Use
+                // the synchronized release handshake so a reporting peer also
+                // leaves the failed generation before the 600us fallback.
+                self.start_failed_probe_release();
+            }
+            return;
+        }
         let burst_pass = burst.forward_failures == 0 && burst.reverse_failures == 0;
         self.cadence_runtime.probe_completed_superframes = self
             .cadence_runtime
@@ -1154,22 +1209,6 @@ impl<P: Phy> LinkCore<P> {
             self.cadence_runtime.probe_failed_bursts > target_superframes.saturating_div(8),
         );
         let combined = ProbeMetrics::new(target_superframes, failed, failed);
-        let candidate = self.cadence_runtime.candidate;
-        if self.cadence_runtime.confirming {
-            self.cadence_runtime.confirming = false;
-            if combined.completed_superframes >= target_superframes
-                && combined.forward_failures == 0
-                && combined.reverse_failures == 0
-            {
-                self.start_final_commit(slot, period, candidate);
-            } else {
-                // Confirmation failure never commits a contract/profile. Use
-                // the synchronized release handshake so a reporting peer also
-                // leaves the failed generation before the 600us fallback.
-                self.start_failed_probe_release();
-            }
-            return;
-        }
         let Some(search) = self.cadence_runtime.search.as_mut() else {
             return;
         };
@@ -1302,7 +1341,10 @@ impl<P: Phy> LinkCore<P> {
                     .superframe_us()
                     .saturating_mul(self.cadence_runtime.probe_superframes_current as u32)
             };
-            let timing_bad = delta.clock_us.abs_diff(expected) > expected / 50 + 30;
+            // A translated follower epoch can miss the exact callback START
+            // capture and report clock_us=0 even though slot count and traffic
+            // cover the complete window. Then those independent checks win.
+            let timing_bad = probe_timing_bad(delta.clock_us, expected);
             let (local_tx, local_rx) = if isolated {
                 let local_transmits = self.state.central != reverse_trial;
                 (u16::from(local_transmits), u16::from(!local_transmits))
@@ -1318,8 +1360,18 @@ impl<P: Phy> LinkCore<P> {
             // at least half the planned TX completions and RX address catches;
             // the latter still tolerates the measured ~28% weak reverse raw
             // loss before ARQ.
-            let samples_bad =
-                delta.tx_count < expected_tx.div_ceil(2) || delta.crc_ok < expected_rx.div_ceil(2);
+            // Isolated candidates must decode the exact worst-contract frame.
+            // Final-profile confirmation instead checks ADDRESS overlap across
+            // the continuous multi-superframe run: candidate CRC feasibility
+            // was already established per direction, while weak links can lose
+            // many payload CRCs without losing cadence synchronization.
+            let rx_observed = if self.cadence_runtime.confirming {
+                delta.address_events
+            } else {
+                delta.crc_ok
+            };
+            let required_rx = required_probe_rx(self.cadence_runtime.confirming, expected_rx);
+            let samples_bad = delta.tx_count < expected_tx.div_ceil(2) || rx_observed < required_rx;
             let expected_slots = if isolated {
                 1
             } else {
@@ -1329,11 +1381,10 @@ impl<P: Phy> LinkCore<P> {
                     * period
             };
             let slots_bad = delta.slots < expected_slots;
-            let local_bad = delta.op_late != 0
-                || timing_bad
-                || samples_bad
-                || slots_bad
-                || self.delivery_failures != self.cadence_runtime.delivery_failures_start;
+            let delivery_bad =
+                self.delivery_failures != self.cadence_runtime.delivery_failures_start;
+            let local_bad =
+                delta.op_late != 0 || timing_bad || samples_bad || slots_bad || delivery_bad;
             let completed = self.cadence_runtime.probe_superframes_current;
             self.cadence_runtime.local_metrics = Some(ProbeMetrics::new(
                 completed,
@@ -1836,7 +1887,16 @@ impl<P: Phy> LinkCore<P> {
         rx_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<P::Error>> {
         self.missed_frames = self.missed_frames.saturating_add(1);
-        self.state.on_miss(&mut self.consecutive_misses);
+        if matches!(
+            self.cadence_runtime.stage,
+            CadenceRunStage::Idle | CadenceRunStage::Stable
+        ) {
+            self.state.on_miss(&mut self.consecutive_misses);
+        }
+        // Negotiation deliberately substitutes control/Sample traffic for
+        // Data. Do not let candidate losses drive the central's adaptive hop
+        // while beacons are suppressed, or the peripheral cannot follow the
+        // channel change before final confirmation.
         let (local_tx, local_rx) = self.local_ratio();
         let rx_run_end = local_tx as u32 + local_rx as u32 - 1;
         if local_phase == rx_run_end {
@@ -2517,7 +2577,10 @@ impl<P: Phy> LinkCore<P> {
                 short_phases,
                 cadence_apply_epoch,
             } if !central => {
-                if self.cadence_active_contract.is_some() && cadence_apply_epoch == 0 {
+                if should_join_central_fallback(
+                    self.cadence_active_contract.is_some(),
+                    cadence_apply_epoch,
+                ) {
                     // An authoritative central reboot/fallback beacon joins the
                     // peripheral to postcard acquisition even if ordinary
                     // packets still arrive and therefore miss counters stay 0.
@@ -3204,6 +3267,36 @@ mod tests {
             99,
             99
         ));
+    }
+
+    #[test]
+    fn fixed_codec_legacy_grace_is_bounded() {
+        let mut grace = 2;
+        assert!(accept_legacy_data_plane(true, &mut grace));
+        assert!(accept_legacy_data_plane(true, &mut grace));
+        assert!(!accept_legacy_data_plane(true, &mut grace));
+        assert!(accept_legacy_data_plane(false, &mut grace));
+    }
+
+    #[test]
+    fn fallback_beacon_only_resets_an_active_contract() {
+        assert!(should_join_central_fallback(true, 0));
+        assert!(!should_join_central_fallback(true, 123));
+        assert!(!should_join_central_fallback(false, 0));
+    }
+
+    #[test]
+    fn probe_timing_uses_independent_checks_when_callback_stamp_is_missing() {
+        assert!(!probe_timing_bad(0, 20_800));
+        assert!(!probe_timing_bad(20_790, 20_800));
+        assert!(probe_timing_bad(22_000, 20_800));
+    }
+
+    #[test]
+    fn final_confirmation_requires_bidirectional_overlap() {
+        assert_eq!(required_probe_rx(true, 0), 0);
+        assert_eq!(required_probe_rx(true, 64), 1);
+        assert_eq!(required_probe_rx(false, 8), 4);
     }
 
     #[test]
