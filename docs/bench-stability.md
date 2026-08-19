@@ -269,6 +269,14 @@ LM20→52840、8B合同的两批各3次冷启动合计得到`successes=3/6`；�
 分开。测试时5340调试器临时
 离线，因此完整20次三板矩阵仍留给后续正式实验。
 
+Probe统计现改为MPSL callback在绝对`[start_slot,end_slot)`边界锁存slot、executed TX、
+ADDRESS/CRC、`op_late`和DWT时间，并通过odd/even sequence发布累计值；Link在安排Probe时
+提前保存累计baseline，不再依赖app线程恰好在单slot窗口内醒来。step=10硬件A/B中，central
+的490/600共32次全部精确为`slots=1, tx=1/1, clock=489–490/490`，原来的central零slot/
+错operation消失。follower仍有7/32次零slot、4/32次错operation；500/590的central则
+32/32次slot/time正确但CRC catch为0。由此可区分：central侧app采样竞态已消除，剩余问题
+是follower晚arm/phase边界以及reverse echo，而不是payload floor或静态phase公式。
+
 同轮审查修复了一个会污染吞吐结果的独立问题：depth-two pipeline在发布下一轮phase 0
 时保留上一轮slot→seq map：第一颗反馈在peer完成本轮NACK前已发布，仍映射R-1；最后
 反馈在本端发布下一轮phase 0并轮换map时映射刚完成的R。另确认当前

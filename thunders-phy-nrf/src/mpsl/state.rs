@@ -7,6 +7,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 
 use crate::radio_phy::RadioMode;
+use thunders::phy::SlotProbeStats;
 
 /// One fixed-size packet: [0] = length, [1..=len] = payload.
 pub type Pkt = [u8; 64];
@@ -108,9 +109,13 @@ pub struct MpslState {
     pub(crate) probe_start_slot: u32,
     pub(crate) probe_end_slot: u32,
     pub(crate) probe_armed: bool,
-    /// Exact callback-boundary timing for bounded empirical probes.
+    /// Exact callback-boundary counters for bounded empirical probes.
     pub(crate) probe_clock_start_cyc: u32,
-    pub(crate) probe_clock_us_total: u32,
+    pub(crate) probe_raw_start: SlotProbeStats,
+    pub(crate) probe_stats_total: SlotProbeStats,
+    pub(crate) probe_started: bool,
+    /// Odd while the callback publishes the multiword total, even when stable.
+    pub(crate) probe_stats_seq: AtomicU32,
 
     // The phase-lock.
     pub(crate) slot_distance: u32,
@@ -306,7 +311,10 @@ impl MpslState {
             probe_end_slot: 0,
             probe_armed: false,
             probe_clock_start_cyc: 0,
-            probe_clock_us_total: 0,
+            probe_raw_start: SlotProbeStats::default(),
+            probe_stats_total: SlotProbeStats::default(),
+            probe_started: false,
+            probe_stats_seq: AtomicU32::new(0),
             slot_distance: 0,
             catch_poll_us: 0,
             addr_poll_us: 0,

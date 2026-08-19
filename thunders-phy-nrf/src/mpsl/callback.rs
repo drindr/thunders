@@ -3,6 +3,8 @@
 use super::radio;
 use super::state::{MpslState, OpKind};
 use super::{MPSL_TX_TAIL_US, PLL_GAIN_DEN, PLL_GAIN_NUM, PLL_SWEEP_MISSES, PLL_SWEEP_US, STATE};
+use core::sync::atomic::Ordering;
+use thunders::phy::SlotProbeStats;
 
 #[inline(always)]
 fn slot_profile_due(slot: u32, apply: u32) -> bool {
@@ -77,9 +79,25 @@ fn nominal_for_slot(state: &MpslState, slot: u32) -> u32 {
 }
 
 #[inline(always)]
+fn raw_probe_stats(state: &MpslState) -> SlotProbeStats {
+    SlotProbeStats {
+        slots: state.slot_count,
+        clock_us: 0,
+        completed: state.done_count.load(Ordering::Relaxed),
+        op_late: state.op_late,
+        address_events: state.addr_events,
+        crc_ok: state.crc_ok,
+        crc_bad_long: state.crc_bad_long,
+        tx_count: state.tx_count,
+    }
+}
+
+#[inline(always)]
 fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
     if state.probe_armed && slot == state.probe_start_slot {
         state.probe_clock_start_cyc = state.last_start_cyc;
+        state.probe_raw_start = raw_probe_stats(state);
+        state.probe_started = true;
     }
     if state.profile_armed && slot_profile_due(slot, state.profile_apply_slot) {
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
@@ -92,11 +110,19 @@ fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
         state.profile_armed = false;
     }
     if state.probe_armed && slot_profile_due(slot, state.probe_end_slot) {
-        let elapsed = state
-            .last_start_cyc
-            .wrapping_sub(state.probe_clock_start_cyc)
-            / radio::CPU_MHZ;
-        state.probe_clock_us_total = state.probe_clock_us_total.wrapping_add(elapsed);
+        if state.probe_started {
+            let mut delta = raw_probe_stats(state).wrapping_delta(state.probe_raw_start);
+            delta.clock_us = state
+                .last_start_cyc
+                .wrapping_sub(state.probe_clock_start_cyc)
+                / radio::CPU_MHZ;
+            state.probe_stats_seq.fetch_add(1, Ordering::AcqRel);
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            state.probe_stats_total = state.probe_stats_total.wrapping_add(delta);
+            core::sync::atomic::compiler_fence(Ordering::Release);
+            state.probe_stats_seq.fetch_add(1, Ordering::Release);
+            state.probe_started = false;
+        }
         state.probe_armed = false;
     }
 }
@@ -114,7 +140,6 @@ pub unsafe extern "C" fn timeslot_cb(
         state.slot_count += 1;
         state.slot_start_done = state.done_count.load(core::sync::atomic::Ordering::Acquire);
         state.last_start_cyc = radio::cyc();
-        state.start_signal.signal(());
 
         // Consume the published op ONLY in the slot it was published for.
         // Ops live in a depth-2 parity ring (entry = target % 2) and the
@@ -127,6 +152,8 @@ pub unsafe extern "C" fn timeslot_cb(
         // phases). No defmt here: MPSL timer-IRQ context.
         let slot = state.slot_count;
         promote_profile_if_due(state, slot);
+        // Wake app context only after probe/profile boundary state is coherent.
+        state.start_signal.signal(());
         let current_nominal = nominal_for_slot(state, slot);
         let next_nominal = nominal_for_slot(state, slot.wrapping_add(1));
         let on = (slot % 2) as usize;

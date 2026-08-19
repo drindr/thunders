@@ -40,6 +40,20 @@ impl SlotProbeStats {
             tx_count: self.tx_count.wrapping_sub(start.tx_count),
         }
     }
+
+    /// Wrapping component-wise accumulation.
+    pub fn wrapping_add(self, delta: Self) -> Self {
+        Self {
+            slots: self.slots.wrapping_add(delta.slots),
+            clock_us: self.clock_us.wrapping_add(delta.clock_us),
+            completed: self.completed.wrapping_add(delta.completed),
+            op_late: self.op_late.wrapping_add(delta.op_late),
+            address_events: self.address_events.wrapping_add(delta.address_events),
+            crc_ok: self.crc_ok.wrapping_add(delta.crc_ok),
+            crc_bad_long: self.crc_bad_long.wrapping_add(delta.crc_bad_long),
+            tx_count: self.tx_count.wrapping_add(delta.tx_count),
+        }
+    }
 }
 
 /// Async interface to a raw radio transceiver.
@@ -317,5 +331,35 @@ pub trait Phy {
         _encrypt: bool,
     ) -> Result<(), Error<Self::Error>> {
         Err(Error::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SlotProbeStats;
+
+    #[test]
+    fn probe_stats_delta_and_accumulation_wrap() {
+        let start = SlotProbeStats {
+            slots: u32::MAX - 1,
+            tx_count: u32::MAX,
+            ..Default::default()
+        };
+        let end = SlotProbeStats {
+            slots: 1,
+            tx_count: 2,
+            ..Default::default()
+        };
+        let delta = end.wrapping_delta(start);
+        assert_eq!(delta.slots, 3);
+        assert_eq!(delta.tx_count, 3);
+
+        let total = SlotProbeStats {
+            slots: u32::MAX,
+            ..Default::default()
+        }
+        .wrapping_add(delta);
+        assert_eq!(total.slots, 2);
+        assert_eq!(total.tx_count, 3);
     }
 }

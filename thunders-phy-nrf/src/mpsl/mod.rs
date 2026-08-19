@@ -694,23 +694,31 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state.probe_phase_offset = phase_offset as u32 % period;
         self.state.probe_start_slot = start_slot;
         self.state.probe_end_slot = end_slot;
+        self.state.probe_started = false;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         self.state.probe_armed = true;
     }
 
     fn slot_probe_stats(&self) -> SlotProbeStats {
-        SlotProbeStats {
-            slots: self.state.slot_count,
-            clock_us: self.state.probe_clock_us_total,
-            completed: self
+        loop {
+            let before = self
                 .state
-                .done_count
-                .load(core::sync::atomic::Ordering::Relaxed),
-            op_late: self.state.op_late,
-            address_events: self.state.addr_events,
-            crc_ok: self.state.crc_ok,
-            crc_bad_long: self.state.crc_bad_long,
-            tx_count: self.state.tx_count,
+                .probe_stats_seq
+                .load(core::sync::atomic::Ordering::Acquire);
+            if before & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+            let stats = self.state.probe_stats_total;
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+            let after = self
+                .state
+                .probe_stats_seq
+                .load(core::sync::atomic::Ordering::Acquire);
+            if before == after {
+                return stats;
+            }
         }
     }
 
@@ -733,6 +741,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state.profile_armed = false;
         self.state.active_profile_armed = false;
         self.state.probe_armed = false;
+        self.state.probe_started = false;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         self.state.slot_nominal = us;
         self.state.slot_distance = us;

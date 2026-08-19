@@ -1174,6 +1174,8 @@ impl<P: Phy> LinkCore<P> {
         self.cadence_runtime.local_start = start;
         self.cadence_runtime.local_end = end;
         self.cadence_runtime.probe_started = false;
+        self.cadence_runtime.stats_start = self.phy.slot_probe_stats();
+        self.cadence_runtime.delivery_failures_start = self.delivery_failures;
         self.cadence_runtime.local_metrics = None;
         self.cadence_runtime.peer_metrics = None;
         let p = self.cadence_runtime.candidate;
@@ -1358,8 +1360,6 @@ impl<P: Phy> LinkCore<P> {
             && !self.cadence_runtime.probe_started
             && (slot.wrapping_sub(self.cadence_runtime.local_start) as i32) >= 0
         {
-            self.cadence_runtime.stats_start = self.phy.slot_probe_stats();
-            self.cadence_runtime.delivery_failures_start = self.delivery_failures;
             self.cadence_runtime.probe_started = true;
             if self.cadence_runtime.stage == CadenceRunStage::Armed {
                 self.cadence_runtime.stage = CadenceRunStage::Probing;
@@ -2254,6 +2254,8 @@ impl<P: Phy> LinkCore<P> {
                     self.cadence_runtime.local_start = local_start;
                     self.cadence_runtime.local_end = local_end;
                     self.cadence_runtime.probe_started = false;
+                    self.cadence_runtime.stats_start = self.phy.slot_probe_stats();
+                    self.cadence_runtime.delivery_failures_start = self.delivery_failures;
                     self.cadence_runtime.local_metrics = None;
                     self.cadence_runtime.candidate = CadenceProfile::new(
                         short_us,
