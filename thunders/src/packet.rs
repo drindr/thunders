@@ -186,9 +186,9 @@ pub enum Packet {
         /// Stable/reject result flags.
         flags: u8,
     },
-    /// Compact reverse negotiation response. Keeping Accept/Armed/Report/
-    /// Applied short is required for delayed follower TX placement inside the
-    /// 600-us reverse slot.
+    /// Compact negotiation response/control. Accept/Armed/Report/Applied must
+    /// fit delayed follower TX placement; Release/Commit must also fit the
+    /// currently active short-payload slot while restoring the safe profile.
     CadenceAck {
         /// Active API negotiation generation.
         generation: u8,
@@ -335,6 +335,19 @@ mod tests {
         let n = pkt.to_bytes(&mut buf).unwrap();
         assert!(n <= 16);
         assert_eq!(pkt, Packet::from_bytes(&buf[..n]).unwrap());
+
+        for stage in [CadenceStage::Release, CadenceStage::Commit] {
+            let control = Packet::CadenceAck {
+                generation: 8,
+                stage,
+                start_epoch: 0x2345_6789,
+                end_epoch: 0,
+                flags: 4,
+            };
+            let n = control.to_bytes(&mut buf).unwrap();
+            assert!(n <= 16);
+            assert_eq!(control, Packet::from_bytes(&buf[..n]).unwrap());
+        }
     }
 
     #[test]

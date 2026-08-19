@@ -379,6 +379,7 @@ struct CadenceRuntime {
     apply_epoch: u32,
     commit_changes_profile: bool,
     releasing: bool,
+    release_deadline: u32,
     error: Option<CadenceError>,
 }
 
@@ -404,6 +405,7 @@ impl CadenceRuntime {
             apply_epoch: 0,
             commit_changes_profile: false,
             releasing: false,
+            release_deadline: 0,
             error: None,
         }
     }
@@ -729,7 +731,14 @@ impl<P: Phy> LinkCore<P> {
     }
 
     fn set_cadence_exit_policy(&mut self, policy: Option<CadenceExitPolicy>) {
-        self.cadence_exit_policy = policy.filter(|p| p.is_enabled());
+        self.cadence_exit_policy = policy
+            .map(|mut p| {
+                if p.consecutive_misses > LINK_LOSS_THRESHOLD {
+                    p.consecutive_misses = LINK_LOSS_THRESHOLD;
+                }
+                p
+            })
+            .filter(|p| p.is_enabled());
         self.cadence_exit_failure_baseline = self.delivery_failures;
     }
 
@@ -783,6 +792,24 @@ impl<P: Phy> LinkCore<P> {
             self.cadence_runtime.stage = CadenceRunStage::Stable;
             self.cadence_exit_failure_baseline = self.delivery_failures;
         }
+    }
+
+    fn emergency_cadence_fallback(&mut self) {
+        let fallback = self.phy.fallback_slot_period_us().max(1);
+        self.phy.align_slot_period(fallback);
+        self.cadence_active_contract = None;
+        self.cadence_runtime = CadenceRuntime::new(self.cadence_safe_profile);
+        self.cadence_id = 1;
+        self.cadence_short_us = self.cadence_safe_profile.short_slot_us;
+        self.cadence_long_us = self.cadence_safe_profile.long_slot_us;
+        self.cadence_short_phases = self.cadence_safe_profile.forward_slots;
+        self.cadence_apply_epoch = 0;
+        self.cadence_ack = 0;
+        self.cadence_negotiated = false;
+        self.cadence_ok = false;
+        self.state.lm.rx.have = false;
+        self.consecutive_misses = 0;
+        self.missed_frames = 0;
     }
 
     fn cadence_auto_exit_due(&self) -> bool {
@@ -879,6 +906,21 @@ impl<P: Phy> LinkCore<P> {
     }
 
     fn cadence_tick(&mut self, slot: u32, period: u32) {
+        if self.cadence_runtime.releasing {
+            if self.cadence_runtime.release_deadline == 0 {
+                self.cadence_runtime.release_deadline =
+                    slot.wrapping_add(period.saturating_mul(256));
+            } else if (slot.wrapping_sub(self.cadence_runtime.release_deadline) as i32) >= 0 {
+                self.emergency_cadence_fallback();
+                return;
+            }
+        }
+        if self.missed_frames >= LINK_LOSS_THRESHOLD
+            && (self.cadence_active_contract.is_some() || self.cadence_runtime.releasing)
+        {
+            self.emergency_cadence_fallback();
+            return;
+        }
         if self.cadence_runtime.stage == CadenceRunStage::Stable && self.cadence_auto_exit_due() {
             let _ = self.request_cadence_exit();
         }
@@ -1029,7 +1071,24 @@ impl<P: Phy> LinkCore<P> {
         if self.cadence_runtime.releasing {
             flags |= CADENCE_FLAG_RELEASE;
         }
-        if !central && !matches!(stage, CadenceStage::Request | CadenceStage::Release) {
+        if self.cadence_runtime.releasing
+            && matches!(stage, CadenceStage::Release | CadenceStage::Commit)
+        {
+            return Some(Packet::CadenceAck {
+                generation: self.cadence_runtime.generation,
+                stage,
+                start_epoch: if stage == CadenceStage::Commit {
+                    self.cadence_runtime.apply_epoch
+                } else {
+                    0
+                },
+                // Compact Release/Commit uses this field for the sender slot
+                // so the follower can translate the absolute apply epoch.
+                end_epoch: epoch,
+                flags,
+            });
+        }
+        if !central && stage != CadenceStage::Request {
             return Some(Packet::CadenceAck {
                 generation: self.cadence_runtime.generation,
                 stage,
@@ -1416,10 +1475,7 @@ impl<P: Phy> LinkCore<P> {
         local_phase: u32,
         rx_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<P::Error>> {
-        let central = self.state.central;
-        if !central {
-            self.missed_frames = self.missed_frames.saturating_add(1);
-        }
+        self.missed_frames = self.missed_frames.saturating_add(1);
         self.state.on_miss(&mut self.consecutive_misses);
         let (local_tx, local_rx) = self.local_ratio();
         let rx_run_end = local_tx as u32 + local_rx as u32 - 1;
@@ -1512,9 +1568,10 @@ impl<P: Phy> LinkCore<P> {
                 {
                     return;
                 }
-                if short_us < self.phy.min_short_slot_period_us()
-                    || long_us < self.phy.min_long_slot_period_us()
-                    || long_us < short_us
+                let safe = self.cadence_safe_profile;
+                if safe.short_slot_us < self.phy.min_short_slot_period_us()
+                    || safe.long_slot_us < self.phy.min_long_slot_period_us()
+                    || safe.long_slot_us < safe.short_slot_us
                 {
                     self.cadence_runtime.generation = generation;
                     self.cadence_runtime.error = Some(CadenceError::PeerRejected);
@@ -1527,13 +1584,7 @@ impl<P: Phy> LinkCore<P> {
                 self.cadence_runtime.releasing = true;
                 self.cadence_runtime.contract =
                     TrafficContract::new(MAX_PAYLOAD as u16, MAX_PAYLOAD as u16);
-                self.cadence_runtime.candidate = CadenceProfile::new(
-                    short_us,
-                    long_us,
-                    active.forward_slots,
-                    active.reverse_slots,
-                    active.idle_slots,
-                );
+                self.cadence_runtime.candidate = safe;
                 self.cadence_id = generation;
                 self.cadence_ack = 0;
                 self.cadence_runtime.stage = CadenceRunStage::Accept;
@@ -1801,9 +1852,7 @@ impl<P: Phy> LinkCore<P> {
         rx_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<P::Error>> {
         let central = self.state.central;
-        if !central {
-            self.missed_frames = 0;
-        }
+        self.missed_frames = 0;
         let (local_tx, local_rx) = self.local_ratio();
         let active_end = local_tx as u32 + local_rx as u32;
         let slot_idx = (local_phase - local_tx as u32) as usize;
@@ -1896,10 +1945,17 @@ impl<P: Phy> LinkCore<P> {
                 flags,
             } => {
                 link_rx = true;
+                let sender_epoch = if flags & CADENCE_FLAG_RELEASE != 0
+                    && matches!(stage, CadenceStage::Release | CadenceStage::Commit)
+                {
+                    end_epoch
+                } else {
+                    catch_slot
+                };
                 self.handle_cadence_control(
                     generation,
                     stage,
-                    catch_slot,
+                    sender_epoch,
                     self.cadence_runtime.contract.forward_max_payload as u8,
                     self.cadence_runtime.contract.reverse_max_payload as u8,
                     self.cadence_runtime.candidate.short_slot_us,
@@ -1929,6 +1985,15 @@ impl<P: Phy> LinkCore<P> {
                 cadence_ack,
                 ack,
             } if central => {
+                if cadence_ack == 0
+                    && (self.cadence_active_contract.is_some()
+                        || self.cadence_runtime.releasing)
+                {
+                    // The peer independently entered uniform acquisition
+                    // fallback after severe loss. Join it before processing
+                    // this SlotRequest so both counters regain one wall rate.
+                    self.emergency_cadence_fallback();
+                }
                 // The acquiring peer's cumulative ACK advances the central's
                 // TX window from liveness traffic itself.
                 self.apply_ack_nack(ack, &[0; NACK_BYTES]);
@@ -2106,6 +2171,7 @@ impl<P: Phy> LinkCore<P> {
                             self.cadence_ok = true;
                             self.cadence_runtime.stable.short_slot_us = self.cadence_short_us;
                             self.cadence_runtime.stable.long_slot_us = self.cadence_long_us;
+                            self.cadence_safe_profile = self.cadence_runtime.stable;
                         }
                     }
                 }

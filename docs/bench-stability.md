@@ -250,12 +250,16 @@ central和peripheral都提供`exit_cadence()`。peripheral先发Release请求，
 consecutive_misses)))`可启用安全自动退出。任一非零阈值独立生效：从合同Stable时
 的基线开始累计retry耗尽的delivery failure，或统计连续无peer包slot。阈值只触发
 同一个Release协议，**包长永远不是自动退出/切换条件**；0表示禁用对应条件，`None`
-禁用全部自动退出。central会在4次miss时跳频并清计数，因此central侧连续miss阈值
-实际应设为1–3；更严重、较长时间的损失应使用delivery-failure阈值。
+禁用全部自动退出。两端另有跨跳频累计的16-slot失联安全线，用户配置的大于16的
+`consecutive_misses`会收敛为16；更长期、允许中间偶尔成功收包的劣化应使用
+`delivery_failures`阈值。
 
+Release/Commit/Applied都使用不超过16B的紧凑控制，保证退出消息能装进当前短slot。
 退出完成generation及apply epoch继续由周期Beacon广告，peripheral即使丢失第一颗
 post-apply Data/Ack也能最终确认并解除合同，不会在idle或reverse-first业务中永久
-停留于Applied。
+停留于Applied。若整个握手单向失联或超过256 superframe，节点撤销profile overlay、
+回到统一600µs acquisition并清除合同；peer收到`cadence_ack=0`的SlotRequest后也进入
+相同fallback，再由原有Beacon/SlotRequest流程协商并提交采集阶段的安全profile。
 
 可选bench feature `cadence-probe`可由`CADENCE_PROBE=1 scripts/bench.sh build`
 启用。示例在Stable 3秒后调用`exit_cadence()`，依次记录`CADENCE EXIT`和
