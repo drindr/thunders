@@ -251,7 +251,8 @@ pub unsafe extern "C" fn timeslot_cb(
                         // (the reverse dead state).
                         let next = 1 - ei;
                         let pending_len = state.ops[next].tx_buf[0] as usize;
-                        let pending_is_next_tx = state.ops[next].kind == OpKind::Tx as u8
+                        let pending_is_next_tx = state.ops[next].seq != state.ops[next].done_seq
+                            && state.ops[next].kind == OpKind::Tx as u8
                             && state.ops[next].target == slot.wrapping_add(1)
                             && pending_len > 0;
                         let air = if pending_is_next_tx {
