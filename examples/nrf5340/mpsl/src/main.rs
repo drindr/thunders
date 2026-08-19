@@ -41,6 +41,35 @@ const ROLE: Role = Role::Peripheral;
 #[cfg(not(feature = "peripheral"))]
 const ROLE: Role = Role::Central;
 
+#[cfg(feature = "payload-1")]
+const BENCH_PAYLOAD_LEN: usize = 1;
+#[cfg(feature = "payload-4")]
+const BENCH_PAYLOAD_LEN: usize = 4;
+#[cfg(feature = "payload-16")]
+const BENCH_PAYLOAD_LEN: usize = 16;
+#[cfg(feature = "payload-32")]
+const BENCH_PAYLOAD_LEN: usize = 32;
+#[cfg(not(any(feature = "payload-1", feature = "payload-4", feature = "payload-16", feature = "payload-32")))]
+const BENCH_PAYLOAD_LEN: usize = 8;
+
+fn is_ping(payload: &[u8]) -> bool {
+    payload.len() == BENCH_PAYLOAD_LEN
+        && if BENCH_PAYLOAD_LEN >= 4 {
+            payload[..4] == *b"PING"
+        } else {
+            payload[0] == b'P'
+        }
+}
+
+fn is_fill(payload: &[u8]) -> bool {
+    payload.len() == BENCH_PAYLOAD_LEN
+        && if BENCH_PAYLOAD_LEN >= 4 {
+            payload[..4] == *b"FILL"
+        } else {
+            payload[0] == b'F'
+        }
+}
+
 /// Frame counter readable from the debugger (RTT-independent health check).
 static FRAME_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -188,14 +217,14 @@ async fn main(spawner: Spawner) {
             // delivery_failures() at the window start, for the ping-pong pacing.
             let mut df_base: u32 = 0;
             let mut report_at = Instant::now();
-            info!("BENCH READY role=C ratio={},{}", tx_n, rx_n);
+            info!("BENCH READY role=C ratio={},{} payload={}B", tx_n, rx_n, BENCH_PAYLOAD_LEN);
 
             loop {
                 #[cfg(feature = "cadence-probe")]
                 if !cadence_requested && central.status() == thunders::link::LinkStatus::Connected {
                     let policy = thunders::CadenceProbePolicy::new(500, 25, 32, 0);
                     if let Ok(generation) = central.negotiate_cadence(
-                        thunders::TrafficContract::new(8, 8),
+                        thunders::TrafficContract::new(BENCH_PAYLOAD_LEN as u16, BENCH_PAYLOAD_LEN as u16),
                         policy,
                     ) {
                         cadence_requested = true;
@@ -213,7 +242,7 @@ async fn main(spawner: Spawner) {
                     }
                 }
                 #[cfg(feature = "cadence-probe")]
-                if cadence_reported && !cadence_exit_requested {
+                if !cfg!(feature = "cadence-hold") && cadence_reported && !cadence_exit_requested {
                     if let Some(at) = cadence_stable_at {
                         if at.elapsed() >= embassy_time::Duration::from_secs(3) {
                             if let Ok(generation) = central.exit_cadence() {
@@ -233,7 +262,10 @@ async fn main(spawner: Spawner) {
                 }
                 // TX slots carry a fresh PING (seq per PING, beacons skipped),
                 // RX slots listen.
-                let mut p = [0x50u8, 0x49, 0x4E, 0x47, 0, 0, 0, 0];
+                let mut p = [b'P'; 32];
+                if BENCH_PAYLOAD_LEN >= 4 {
+                    p[..4].copy_from_slice(b"PING");
+                }
                 let slot = thunders_phy_nrf::mpsl::mpsl_slot_count().wrapping_add(1);
                 let tx_phase = (slot % period as u32) < tx_n as u32 && slot % 64 != 0;
                 if tx_phase {
@@ -251,8 +283,10 @@ async fn main(spawner: Spawner) {
                     ping_tx += 1;
                     ping_seq = ping_seq.wrapping_add(1);
                     t_ping_tx = Instant::now();
-                    p[4..].copy_from_slice(&ping_seq.to_le_bytes());
-                    Some(&p)
+                    if BENCH_PAYLOAD_LEN >= 8 {
+                        p[4..8].copy_from_slice(&ping_seq.to_le_bytes());
+                    }
+                    Some(&p[..BENCH_PAYLOAD_LEN])
                 } else {
                     None
                 };
@@ -265,28 +299,28 @@ async fn main(spawner: Spawner) {
                             mailbox().put_rx(&rx_buf[..n]);
                             ipc.event1.trigger();
                         }
-                        if n >= 8 && rx_buf[..4] == *b"FILL" {
+                        if is_fill(&rx_buf[..n]) {
                             fill_rx += 1;
                         }
-                        if n >= 8 && rx_buf[..4] == *b"PING" {
+                        if is_ping(&rx_buf[..n]) {
                             // The echo of the last PING arrived on an RX slot:
                             // the RTT is measured from that PING's TX slot.
                             echo_rx += 1;
-                            let seq = u32::from_le_bytes([rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7]]);
-                            let gap = seq.wrapping_sub(last_echo_seq);
-                            // Only forward movement rebaselines: a backward
-                            // jump is a resync/restart artifact, and
-                            // accepting it would re-count the catch-up span
-                            // as fresh loss.
-                            if echo_rx == 1 || gap < 1_000_000 {
-                                if echo_rx > 1 {
-                                    if gap == 0 {
-                                        dup += 1;
-                                    } else if gap > 1 {
-                                        rev_lost += (gap - 1) as u64;
+                            if BENCH_PAYLOAD_LEN >= 8 {
+                                let seq = u32::from_le_bytes([
+                                    rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7],
+                                ]);
+                                let gap = seq.wrapping_sub(last_echo_seq);
+                                if echo_rx == 1 || gap < 1_000_000 {
+                                    if echo_rx > 1 {
+                                        if gap == 0 {
+                                            dup += 1;
+                                        } else if gap > 1 {
+                                            rev_lost += (gap - 1) as u64;
+                                        }
                                     }
+                                    last_echo_seq = seq;
                                 }
-                                last_echo_seq = seq;
                             }
                             let rtt = t_ping_tx.elapsed().as_micros() as u32;
                             rtt_sum += rtt as u64;
@@ -328,9 +362,10 @@ async fn main(spawner: Spawner) {
                     } else {
                         0
                     };
-                    // Payload throughput: 8 B per PING + 8 B per reverse
-                    // packet.
-                    let bw = (ping_tx + rev_rx) * 8 * 1_000_000 / elapsed.max(1);
+                    // Payload throughput: configured bytes per PING plus
+                    // configured bytes per reverse packet.
+                    let bw = (ping_tx + rev_rx) * BENCH_PAYLOAD_LEN as u64 * 1_000_000
+                        / elapsed.max(1);
                     let (ra, rmin, rmax) = if echo_rx > 0 {
                         (rtt_sum / echo_rx, rtt_min, rtt_max)
                     } else {
@@ -377,7 +412,10 @@ async fn main(spawner: Spawner) {
             // once (tracked via offer_taken), the FILL prefix uses an
             // independent seq space.
             #[cfg(not(feature = "host"))]
-            let mut fill = *b"FILL\0\0\0\0";
+            let mut fill = [b'F'; 32];
+            if BENCH_PAYLOAD_LEN >= 4 {
+                fill[..4].copy_from_slice(b"FILL");
+            }
             #[cfg(not(feature = "host"))]
             let mut fill_seq = 0u32;
             let mut frames: u64 = 0;
@@ -388,7 +426,7 @@ async fn main(spawner: Spawner) {
             let mut report_at = Instant::now();
             #[cfg(feature = "host")]
             let mut ipc_tx = [0u8; MAX_PAYLOAD];
-            info!("BENCH READY role=P ratio={},{}", tx_n, rx_n);
+            info!("BENCH READY role=P ratio={},{} payload={}B", tx_n, rx_n, BENCH_PAYLOAD_LEN);
 
             loop {
                 let t_frame = Instant::now();
@@ -416,8 +454,10 @@ async fn main(spawner: Spawner) {
                     if offered_echo {
                         Some(&echo[..echo_len])
                     } else if peripheral.tx_inflight() < 8 {
-                        fill[4..].copy_from_slice(&fill_seq.to_le_bytes());
-                        Some(&fill)
+                        if BENCH_PAYLOAD_LEN >= 8 {
+                            fill[4..8].copy_from_slice(&fill_seq.to_le_bytes());
+                        }
+                        Some(&fill[..BENCH_PAYLOAD_LEN])
                     } else {
                         None
                     }
@@ -430,19 +470,19 @@ async fn main(spawner: Spawner) {
                             mailbox().put_rx(&rx_buf[..n]);
                             ipc.event1.trigger();
                         }
-                        if n >= 8 && rx_buf[..4] == *b"PING" {
-                            let seq =
-                                u32::from_le_bytes([rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7]]);
-                            if rx_ok > 1 {
-                                let gap = seq.wrapping_sub(last_seq);
-                                // A gap beyond ~1 M seqs is a peer restart,
-                                // not a loss burst (a 5 s window holds at
-                                // most ~35 k).
-                                if gap > 1 && gap < 1_000_000 {
-                                    fwd_lost += (gap - 1) as u64;
+                        if is_ping(&rx_buf[..n]) {
+                            if BENCH_PAYLOAD_LEN >= 8 {
+                                let seq = u32::from_le_bytes([
+                                    rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7],
+                                ]);
+                                if rx_ok > 1 {
+                                    let gap = seq.wrapping_sub(last_seq);
+                                    if gap > 1 && gap < 1_000_000 {
+                                        fwd_lost += (gap - 1) as u64;
+                                    }
                                 }
+                                last_seq = seq;
                             }
-                            last_seq = seq;
                             rx_ok += 1;
                             // The previous echo never reached the TX window
                             // (persistent backpressure): an app-layer loss.
@@ -481,7 +521,7 @@ async fn main(spawner: Spawner) {
                     } else {
                         0
                     };
-                    info!("BENCH P slots={} rx={} lost={} floss={}% rate={}/s busy={}us ow={} rxd={} txd={}", frames, rx_ok, fwd_lost, floss, rate, avg_busy, ow, peripheral.rx_data(), peripheral.tx_data());
+                    info!("BENCH P slots={} rx={} lost={} floss={}% rate={}/s busy={}us ow={} rxd={} txd={} df={} retx={}", frames, rx_ok, fwd_lost, floss, rate, avg_busy, ow, peripheral.rx_data(), peripheral.tx_data(), peripheral.delivery_failures(), peripheral.retransmits());
                     let pll = thunders_phy_nrf::mpsl::mpsl_pll_snapshot();
                     let rssi = thunders_phy_nrf::mpsl::mpsl_rssi();
                     info!("PLL dist={} catch={} w={} peerw={} addr={} ai={} txc={} d8={} mis={} crcok={} crcbad={} target={} calib={} rssi={} rxo={} rxr={} txo={} txr={} prxo={} prxr={} ptxo={} ptxr={} hdr={:?} end={} got_end={} sl={} crc={} infl={} lai={} len={} crcbadl={} txs={} txl={} txp={:?} txph={:?} rxph={:?} rsum={} rcnt={} rmax={} late={} grc={} pub={} cn={} cl={} cc={} ce={} off={} hwp={}", pll.distance_us, pll.catch_poll_us, pll.rx_window_us, pll.peer_rx_window_us, pll.addr_events, pll.addr_poll_us, pll.tx_count, pll.tx_delay_us, pll.rx_misses, pll.crc_ok, pll.crc_bad, pll.addr_target_us, pll.calib_count, rssi, pll.rx_en_offset_us, pll.rx_ramp_us, pll.tx_en_offset_us, pll.tx_ramp_us, pll.peer_rx_en_offset_us, pll.peer_rx_ramp_us, pll.peer_tx_en_offset_us, pll.peer_tx_ramp_us, pll.last_rx_hdr, pll.last_rx_end_us, pll.last_rx_got_end, pll.last_rx_slot_len, pll.last_rx_crc, pll.last_rx_in_flight, pll.last_rx_addr_us, pll.last_rx_len, pll.crc_bad_long, pll.tx_short, pll.tx_long, pll.tx_long_phase, pll.tx_phase_all, pll.rx_phase_all, pll.rssi_catch_sum, pll.rssi_catch_cnt, pll.rssi_catch_max, pll.op_late, pll.op_grace_used, pll.op_publish_max_us, pll.coll_noop, pll.coll_late, pll.coll_catch, pll.coll_empty, peripheral.slot_offset(), peripheral.hw_phase());

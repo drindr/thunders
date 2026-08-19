@@ -18,7 +18,7 @@ Metrics:
   rev_raw%  reverse radio hit rate miss = the central's RX slots with no echo
   rev_arq%  reverse delivery loss after ARQ = the central's echo-seq gaps
   rtt        app-level round trip: PING TX slot -> echo RX (~1 slot period)
-  bw         payload throughput: 8 B per PING + 8 B per echo, both ways
+  bw         firmware-reported payload throughput for the configured length
   c-rate     the central's slot rate
 """
 
@@ -145,7 +145,9 @@ def summarize_c(windows):
     rtt_min = min(w[7] for w in base) if rx else 0
     rtt_max = max(w[8] for w in base) if rx else 0
     elapsed = n * WINDOW_US
-    bw = (tx + rx + fill) * 8 * 1_000_000 / elapsed if elapsed else 0.0
+    # Firmware logs the configured payload-aware bandwidth; do not assume the
+    # historical fixed 8-byte PING when parsing payload-sweep runs.
+    bw = sum(w[5] for w in base) / n if n else 0.0
     rate = slots * 1_000_000 / elapsed if elapsed else 0.0
     return (n, rev_raw, rev_arq, rtt_avg, rtt_min, rtt_max, bw, rate, dup, rev_lost)
 
@@ -176,12 +178,13 @@ def main():
     # experiment logs (e.g. *-sr-*) stay on disk but must not pollute the
     # table.
     canonical = {
-        f"{c}-{p}-{backend}{mode_suffix}{ratio_suffix}"
+        f"{c}-{p}-{backend}{mode_suffix}{ratio_suffix}{payload_suffix}"
         for c in ("52840", "5340", "lm20")
         for p in ("52840", "5340", "lm20")
         for backend in ("bare", "mpsl")
         for mode_suffix in ("", "-1m")
         for ratio_suffix in ("", "-r844", "-r622", "-r422")
+        for payload_suffix in ("", "-p1", "-p4", "-p8", "-p16", "-p32")
         if c != p
     }
     cfiles = [

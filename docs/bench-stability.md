@@ -269,6 +269,37 @@ post-apply Data/Ack也能最终确认并解除合同，不会在idle或reverse-f
 peripheral为 **1912–1922 slots/s**。其中52840→LM20因历史性的全600 acquisition
 波动在第二次启动通过，其余方向第一次通过；该启动波动发生于API调用之前。
 
+### 4.2 fast cadence短包长度扫描
+
+`scripts/bench_payload_sweep.sh 25`依次构建并测试1/4/8/16/32B应用payload，
+覆盖三个芯片互为central/peripheral的六个MPSL方向。扫描设置`CADENCE_PROBE=1`
+和`CADENCE_HOLD=1`：只有日志出现`CADENCE STABLE`才接纳该次运行，且整个25秒
+窗口保持已协商profile，不在3秒后调用退出API。日志以`-p1`…`-p32`区分，
+`scripts/bench_payload_parse.py bench/logs`生成汇总表。
+
+吞吐是两个方向成功交付的应用payload字节总和；`raw loss`是reverse RX slot未收到
+应用包的比例；`df`及`retx`是两端链路层累计delivery failure和重传计数之和。8B以上payload
+内含32-bit应用sequence，因此可额外计算双向ARQ后应用丢包；1B/4B没有足够空间容纳
+该sequence，表中相应两列显示`n/a`，不能误写为0%。所有长度都使用相同的饱和
+PING/echo+FILL流量模型，因而吞吐可直接比较。
+
+25秒实测聚合结果（每个长度六个方向，丢弃第一个5秒warmup窗口）：
+
+| payload | central slot/s | peripheral slot/s | 平均吞吐 B/s | 范围 B/s | reverse空slot | RTT中位数 | df合计 | 重传合计 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1B | 1835 | 1823 | 273 | 98–440 | 36.8% | 17175µs | 0 | 56 |
+| 4B | 1836 | 1826 | 1049 | 286–1755 | 40.3% | 12173µs | 0 | 46 |
+| 8B | 1846 | 1833 | 2201 | 1353–3251 | 36.7% | 15340µs | 0 | 72 |
+| 16B | 1833 | 1818 | 4373 | 1348–6868 | 37.6% | 13120µs | 0 | 56 |
+| 32B | 1827 | 1814 | 5085 | 1689–13245 | 62.3% | 105441µs | 49 | 3186 |
+
+结果表明已验证的500/600µs cadence floor决定slot rate，1–16B间包长几乎不改变
+slot频率，吞吐基本随payload线性增加。**16B是本轮可靠性优先的最佳点**：相比8B
+平均吞吐约翻倍，六方向df仍为0且双向总重传仅56。32B虽然平均吞吐继续增加，但跨芯片
+方向出现明显退化：reverse空slot升至62.3%、RTT中位数约105ms、双向累计3186次重传且
+49次delivery failure；因此不能把32B作为当前fast profile的稳定短包上限。逐方向原始
+表可由上述parser从保留的`-p*`日志重新生成。
+
 ### 5. bench 计时从 central BENCH READY 开始
 
 `scripts/bench.sh run-pair`：

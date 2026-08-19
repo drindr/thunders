@@ -27,6 +27,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RADIO_MODE="${THUNDERS_RADIO_MODE:-2m}"
 # Optional asymmetric schedules: THUNDERS_RATIO=844|622|422.
 RATIO="${THUNDERS_RATIO:-}"
+PAYLOAD_BYTES="${THUNDERS_BENCH_PAYLOAD_BYTES:-8}"
+PAYLOAD_SUFFIX="${THUNDERS_BENCH_PAYLOAD_SUFFIX:-0}"
 BIN="$ROOT/bench/bin"
 LOGS="$ROOT/bench/logs"
 mkdir -p "$BIN" "$LOGS"
@@ -60,6 +62,19 @@ build_one() {
   if [ "${CADENCE_PROBE:-0}" = "1" ] && [ "$backend" = "mpsl" ]; then
     feats+=(--features cadence-probe)
   fi
+  if [ "${CADENCE_HOLD:-0}" = "1" ] && [ "$backend" = "mpsl" ]; then
+    feats+=(--features cadence-hold)
+  fi
+  if [ "$backend" = "mpsl" ]; then
+    case "$PAYLOAD_BYTES" in
+      1) feats+=(--features payload-1) ;;
+      4) feats+=(--features payload-4) ;;
+      8) ;;
+      16) feats+=(--features payload-16) ;;
+      32) feats+=(--features payload-32) ;;
+      *) echo "unsupported THUNDERS_BENCH_PAYLOAD_BYTES=$PAYLOAD_BYTES (use 1,4,8,16,32)" >&2; exit 2 ;;
+    esac
+  fi
   case "$RATIO" in
     844) feats+=(--features ratio-8-4-4) ;;
     622) feats+=(--features ratio-6-2-2) ;;
@@ -84,6 +99,13 @@ build_all() {
   done
 }
 
+build_mpsl() {
+  for board in "${BOARDS[@]}"; do
+    build_one "$board" mpsl central
+    build_one "$board" mpsl peripheral
+  done
+}
+
 run_pair() {
   local c=$1 p=$2 backend=$3 secs=${4:-30}
   local mode_suffix=""
@@ -94,7 +116,11 @@ run_pair() {
   if [ -n "$RATIO" ]; then
     ratio_suffix="-r$RATIO"
   fi
-  local run="${c}-${p}-${backend}${mode_suffix}${ratio_suffix}"
+  local payload_suffix=""
+  if [ "$PAYLOAD_SUFFIX" = "1" ]; then
+    payload_suffix="-p${PAYLOAD_BYTES}"
+  fi
+  local run="${c}-${p}-${backend}${mode_suffix}${ratio_suffix}${payload_suffix}"
   local celf="$BIN/$c-$backend-central.elf" pelf="$BIN/$p-$backend-peripheral.elf"
   [ -f "$celf" ] || { echo "missing $celf - run 'scripts/bench.sh build'"; exit 1; }
   [ -f "$pelf" ] || { echo "missing $pelf"; exit 1; }
@@ -185,6 +211,12 @@ run_pair() {
       sleep 2
       continue
     fi
+    if [ "${CADENCE_PROBE:-0}" = "1" ] && \
+       ! grep -q "CADENCE STABLE" "$LOGS/$run.central.log" 2>/dev/null; then
+      echo "detected cadence negotiation failure, retrying"
+      sleep 2
+      continue
+    fi
     # BENCH READY is not enough: an acquisition race can leave both sides
     # printing empty windows for the whole run. A valid matrix row must have
     # delivered at least one payload in each direction.
@@ -210,6 +242,14 @@ run_all() {
   done
 }
 
+run_mpsl() {
+  local secs=${1:-30}
+  local pairs=("52840 5340" "52840 lm20" "5340 52840" "5340 lm20" "lm20 52840" "lm20 5340")
+  for pair in "${pairs[@]}"; do
+    run_pair $pair mpsl "$secs" || echo "run $pair mpsl failed - continuing matrix" >&2
+  done
+}
+
 probe_check() {
   echo "== probe check =="
   local list
@@ -224,7 +264,9 @@ probe_check() {
 
 case "${1:-}" in
   build) build_all ;;
+  build-mpsl) build_mpsl ;;
   run) probe_check || exit 1; run_all "${2:-30}" ;;
+  run-mpsl) probe_check || exit 1; run_mpsl "${2:-30}" ;;
   run-pair) [ $# -ge 4 ] || { echo "usage: $0 run-pair C P BACKEND [SECS]"; exit 1; }; probe_check || exit 1; run_pair "$2" "$3" "$4" "${5:-30}" ;;
-  *) echo "usage: $0 {build|run [SECS]|run-pair C P BACKEND [SECS]}"; exit 1 ;;
+  *) echo "usage: $0 {build|build-mpsl|run [SECS]|run-mpsl [SECS]|run-pair C P BACKEND [SECS]}"; exit 1 ;;
 esac
