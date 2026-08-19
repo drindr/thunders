@@ -209,10 +209,15 @@ Request（peripheral API时）→ Offer → Accept
 → Commit(apply_epoch) → Applied → 双方同epoch生效 → Data确认 → Stable
 ```
 
-central仍是唯一的candidate和绝对epoch决策者。双方先用实际方向wire长度
-`payload + 12B protocol overhead`计算仅用于排除不可能值的PHY feasibility floor，
-peripheral把本地forward/reverse floor复用Accept的两个epoch字段返回，central取
-两端最大值；12B只适用于当前非secure wire格式，启用额外认证tag前必须相应扩展。
+central仍是唯一的candidate和绝对epoch决策者。合同中的forward/reverse payload是
+**精确长度**而非上限；提交后Data采用固定wire格式
+`marker(1)+seq(2)+ack(2)+NACK bitmap+payload`。NACK字节数由已知slot比例推导为
+`ceil(peer_tx_slots/8)`，payload和NACK都不再逐包携带Vec长度。secure模式的4B/16B
+认证tag也直接计入payload wire长度，因此PHY feasibility floor使用真实方向长度
+`5+nack_bytes+encrypted_payload_len`，不再固定估算`+12B`。fixed-wire能力通过
+Offer/Accept flag回显；旧peer不回显时双方继续使用postcard数据面及其精确最坏长度，
+不会在同一generation误切codec。peripheral把本地forward/reverse floor复用Accept的
+两个epoch字段返回，central取两端最大值。
 **该公式不是最终slot选择**，500µs也不再是Probe硬下限。
 
 搜索分两轴进行：先固定已知稳定long，下降forward/short；确定通过值后再固定它，
@@ -227,11 +232,20 @@ slot timing、TX完成、CRC正确接收、`op_late`和ARQ delivery条件。
 在deadline后统一回到600µs acquisition，绝不提交未验证profile。本轮
 5340→52840 8B硬件追踪实际观察到`475/600 → 500/575 → 500/600确认`：前两项被在线
 测量淘汰，严格最终确认未通过后双方回到Idle/600，证明失败路径不会把候选误标为
-Stable；当前实验台的启动前acquisition仍有独立的间歇性空链路问题。
+Stable；当前实验台的启动前acquisition仍有独立的间歇性空链路问题。fixed-wire改动后
+又以8B合同、已知安全500/600 anchor运行5340→52840五次：两次进入REQUEST/Probe，
+但仍未通过既有的最终cadence确认，因此没有把未提交codec误记为硬件Stable；fixed
+Data/Ack/Drop的字节级行为由plain/secure host测试覆盖，后续需在能完成Stable的台架上
+补充真实Data阶段吞吐矩阵。
 
-最终profile生效后，超过对应方向合同长度的`frame()`发送明确返回
-`PayloadExceedsCadenceProfile`，不会自动扩slot或偷偷重协商。协商期间ARQ retry
-age被冻结，避免Probe占用slot导致应用数据超时；forward完整描述携带ACK/NACK，
+最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
+对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
+自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收
+新的应用offer；apply边界最多容忍two-slot pipeline已发布的2颗旧postcard数据包，随后
+fixed-active节点严格拒绝postcard Data/Ack/Drop，但始终接受postcard控制。任一端进入
+600µs emergency fallback时，central以`apply_epoch=0`的权威Beacon通知peripheral一起
+清除fixed codec，避免普通包仍能收到时形成单向codec分裂。协商期间ARQ retry age被冻结，
+避免Probe占用slot导致应用数据超时；forward完整描述携带ACK/NACK，
 脆弱reverse方向改用短`CadenceAck`承载Accept/Armed/Report/Applied。
 
 最终切换使用两阶段arm：central持续发送未来Commit但不先切换；peripheral arm后

@@ -8,26 +8,26 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The application traffic that a cadence profile must carry.
+/// Fixed application payload lengths used by a negotiated cadence profile.
 ///
-/// Payload lengths are application bytes only. `CadenceSearch` adds its
-/// configured protocol overhead when reporting the wire lengths that a probe
-/// must exercise.
+/// Once committed, every Data packet in each direction has exactly the
+/// corresponding length. This lets the negotiated compact codec omit both the
+/// payload and NACK vector lengths from every slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TrafficContract {
-    /// Largest forward (central-to-peripheral) application payload in bytes.
-    pub forward_max_payload: u16,
-    /// Largest reverse (peripheral-to-central) application payload in bytes.
-    pub reverse_max_payload: u16,
+    /// Exact forward (central-to-peripheral) application payload bytes.
+    pub forward_payload_len: u16,
+    /// Exact reverse (peripheral-to-central) application payload bytes.
+    pub reverse_payload_len: u16,
 }
 
 impl TrafficContract {
-    /// Create a traffic contract from forward and reverse payload limits.
-    pub const fn new(forward_max_payload: u16, reverse_max_payload: u16) -> Self {
+    /// Create a fixed-length directional traffic contract.
+    pub const fn new(forward_payload_len: u16, reverse_payload_len: u16) -> Self {
         Self {
-            forward_max_payload,
-            reverse_max_payload,
+            forward_payload_len,
+            reverse_payload_len,
         }
     }
 }
@@ -315,7 +315,8 @@ pub struct CadenceSearch {
     stable_profile: CadenceProfile,
     traffic: TrafficContract,
     policy: CadenceProbePolicy,
-    protocol_overhead: u16,
+    forward_wire_len: u16,
+    reverse_wire_len: u16,
     forward_floor_us: u16,
     reverse_floor_us: u16,
     axis: SearchAxis,
@@ -332,21 +333,28 @@ pub struct CadenceSearch {
 impl CadenceSearch {
     /// Create a planner from a known-stable profile.
     ///
-    /// `protocol_overhead` is the number of wire bytes added to each
-    /// application payload (for example framing, CRC, and protocol headers).
-    /// It is deliberately independent of [`TrafficContract`]'s application
-    /// payload limits.
+    /// `protocol_overhead` is the number of wire bytes added to each fixed
+    /// application payload (for example framing and ARQ headers).
     pub fn new(
         stable_profile: CadenceProfile,
         traffic: TrafficContract,
         policy: CadenceProbePolicy,
         protocol_overhead: u16,
     ) -> Result<Self, CadenceError> {
-        Self::new_with_floors(
+        let forward_wire_len = traffic
+            .forward_payload_len
+            .checked_add(protocol_overhead)
+            .ok_or(CadenceError::WireLengthOverflow)?;
+        let reverse_wire_len = traffic
+            .reverse_payload_len
+            .checked_add(protocol_overhead)
+            .ok_or(CadenceError::WireLengthOverflow)?;
+        Self::new_with_wire_lengths_and_floors(
             stable_profile,
             traffic,
             policy,
-            protocol_overhead,
+            forward_wire_len,
+            reverse_wire_len,
             policy.min_slot_us,
             stable_profile.long_slot_us,
         )
@@ -366,6 +374,35 @@ impl CadenceSearch {
         forward_floor_us: u16,
         reverse_floor_us: u16,
     ) -> Result<Self, CadenceError> {
+        let forward_wire_len = traffic
+            .forward_payload_len
+            .checked_add(protocol_overhead)
+            .ok_or(CadenceError::WireLengthOverflow)?;
+        let reverse_wire_len = traffic
+            .reverse_payload_len
+            .checked_add(protocol_overhead)
+            .ok_or(CadenceError::WireLengthOverflow)?;
+        Self::new_with_wire_lengths_and_floors(
+            stable_profile,
+            traffic,
+            policy,
+            forward_wire_len,
+            reverse_wire_len,
+            forward_floor_us,
+            reverse_floor_us,
+        )
+    }
+
+    /// Create a search using exact directional Data wire lengths.
+    pub fn new_with_wire_lengths_and_floors(
+        stable_profile: CadenceProfile,
+        traffic: TrafficContract,
+        policy: CadenceProbePolicy,
+        forward_wire_len: u16,
+        reverse_wire_len: u16,
+        forward_floor_us: u16,
+        reverse_floor_us: u16,
+    ) -> Result<Self, CadenceError> {
         stable_profile.validate()?;
         if policy.min_slot_us == 0
             || policy.step_us == 0
@@ -378,14 +415,11 @@ impl CadenceSearch {
             return Err(CadenceError::InvalidPolicy);
         }
 
-        traffic
-            .forward_max_payload
-            .checked_add(protocol_overhead)
-            .ok_or(CadenceError::WireLengthOverflow)?;
-        traffic
-            .reverse_max_payload
-            .checked_add(protocol_overhead)
-            .ok_or(CadenceError::WireLengthOverflow)?;
+        if forward_wire_len < traffic.forward_payload_len
+            || reverse_wire_len < traffic.reverse_payload_len
+        {
+            return Err(CadenceError::WireLengthOverflow);
+        }
 
         let first_forward = first_lower_candidate_from(
             stable_profile.short_slot_us,
@@ -409,7 +443,8 @@ impl CadenceSearch {
             stable_profile,
             traffic,
             policy,
-            protocol_overhead,
+            forward_wire_len,
+            reverse_wire_len,
             forward_floor_us,
             reverse_floor_us,
             axis,
@@ -439,19 +474,25 @@ impl CadenceSearch {
         self.policy
     }
 
-    /// Protocol overhead added to each application payload, in bytes.
+    /// Common directional overhead when both fixed wire formats have it.
     pub const fn protocol_overhead(&self) -> u16 {
-        self.protocol_overhead
+        let forward = self
+            .forward_wire_len
+            .saturating_sub(self.traffic.forward_payload_len);
+        let reverse = self
+            .reverse_wire_len
+            .saturating_sub(self.traffic.reverse_payload_len);
+        if forward == reverse { forward } else { 0 }
     }
 
-    /// Maximum forward wire length exercised by the probes, in bytes.
+    /// Exact forward wire length exercised by the probes, in bytes.
     pub const fn forward_wire_len(&self) -> u16 {
-        self.traffic.forward_max_payload + self.protocol_overhead
+        self.forward_wire_len
     }
 
-    /// Maximum reverse wire length exercised by the probes, in bytes.
+    /// Exact reverse wire length exercised by the probes, in bytes.
     pub const fn reverse_wire_len(&self) -> u16 {
-        self.traffic.reverse_max_payload + self.protocol_overhead
+        self.reverse_wire_len
     }
 
     /// Maximum forward and reverse wire lengths exercised by the probes.
@@ -719,6 +760,22 @@ mod tests {
         assert_eq!(planner.forward_wire_len(), 45);
         assert_eq!(planner.reverse_wire_len(), 37);
         assert_eq!(planner.wire_lengths(), (45, 37));
+    }
+
+    #[test]
+    fn planner_accepts_exact_directional_wire_lengths() {
+        let planner = CadenceSearch::new_with_wire_lengths_and_floors(
+            stable(),
+            traffic(),
+            CadenceProbePolicy::new(400, 25, 8, 1),
+            38,
+            31,
+            400,
+            450,
+        )
+        .unwrap();
+        assert_eq!(planner.wire_lengths(), (38, 31));
+        assert_eq!(planner.protocol_overhead(), 0);
     }
 
     #[test]

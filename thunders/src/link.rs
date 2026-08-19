@@ -50,7 +50,7 @@ use crate::{
     link_mgmt::{
         LinkMgmt, RxWindow, TxRunSlot, nack_from_mask, nack_nonzero, nack_set, nack_vec, seq_gt,
     },
-    packet::{CadenceStage, Packet},
+    packet::{CadenceStage, FIXED_DATA_HEADER_LEN, Packet},
     phy::{Phy, SlotProbeStats},
     scheduler::Scheduler,
 };
@@ -211,6 +211,19 @@ impl LinkState {
         *streak = 0;
     }
 
+    /// Ciphertext bytes carried by the fixed Data codec for an application
+    /// payload of `len` bytes.
+    fn wire_payload_len(&self, len: usize) -> Option<usize> {
+        #[cfg(feature = "secure")]
+        let tag = self.cipher.as_ref().map_or(0, |cipher| match cipher.mode {
+            CipherMode::ChaCha => TAG_LEN,
+            CipherMode::Ccm => 4,
+        });
+        #[cfg(not(feature = "secure"))]
+        let tag = 0;
+        len.checked_add(tag).filter(|&n| n <= MAX_PAYLOAD)
+    }
+
     /// Encrypt a `Data` payload in place before transmission.
     ///
     /// `sender_central` is `true` when *this* node is encrypting the
@@ -328,11 +341,11 @@ fn deliver_rx<P>(rx: &mut RxWindow, rx_buf: &mut [u8]) -> Result<Option<usize>, 
     Ok(None)
 }
 
-const CADENCE_PROTOCOL_OVERHEAD: u16 = 12;
 const CADENCE_FLAG_STABLE: u8 = 1;
 const CADENCE_FLAG_REJECT: u8 = 2;
 const CADENCE_FLAG_RELEASE: u8 = 4;
 const CADENCE_FLAG_CONFIRM: u8 = 8;
+const CADENCE_FLAG_FIXED_WIRE: u8 = 16;
 
 fn cadence_exit_triggered(policy: CadenceExitPolicy, failed: u32, misses: u8) -> bool {
     (policy.delivery_failures != 0 && failed >= policy.delivery_failures as u32)
@@ -365,6 +378,7 @@ struct CadenceRuntime {
     generation: u8,
     search: Option<CadenceSearch>,
     contract: TrafficContract,
+    fixed_wire: bool,
     policy: CadenceProbePolicy,
     candidate: CadenceProfile,
     stable: CadenceProfile,
@@ -397,6 +411,7 @@ impl CadenceRuntime {
             generation: 0,
             search: None,
             contract: TrafficContract::new(0, 0),
+            fixed_wire: false,
             policy: CadenceProbePolicy::default(),
             candidate: stable,
             stable,
@@ -457,6 +472,11 @@ struct LinkCore<P: Phy> {
     /// Contract currently enforced by the data plane. It remains active while
     /// a replacement or release handshake is in flight.
     cadence_active_contract: Option<TrafficContract>,
+    /// Whether the active contract uses the negotiated fixed data codec.
+    cadence_active_fixed_wire: bool,
+    /// Remaining old-postcard data-plane packets tolerated after an epoch
+    /// switch, covering operations published by the two-slot pipeline.
+    fixed_legacy_rx_grace: u8,
     /// Optional severe-loss policy that requests a synchronized release.
     cadence_exit_policy: Option<CadenceExitPolicy>,
     /// Delivery-failure baseline captured when the active contract stabilized.
@@ -535,6 +555,8 @@ impl<P: Phy> LinkCore<P> {
             cadence_runtime: CadenceRuntime::new(stable_profile),
             cadence_safe_profile: stable_profile,
             cadence_active_contract: None,
+            cadence_active_fixed_wire: false,
+            fixed_legacy_rx_grace: 0,
             cadence_exit_policy: None,
             cadence_exit_failure_baseline: 0,
             last_channel: None,
@@ -618,10 +640,111 @@ impl<P: Phy> LinkCore<P> {
         Ok(())
     }
 
-    /// Serialize `pkt` into the shared TX buffer; returns the byte length.
+    fn nack_bytes_for_slots(slots: u8) -> usize {
+        (slots as usize).div_ceil(8).min(NACK_BYTES)
+    }
+
+    fn fixed_nack_is_canonical(&self, packet: &Packet) -> bool {
+        let slots = self.local_ratio().0 as usize;
+        let rem = slots % 8;
+        if rem == 0 {
+            return true;
+        }
+        let nack = match packet {
+            Packet::Data { nack, .. } | Packet::Ack { nack, .. } | Packet::Drop { nack, .. } => {
+                nack
+            }
+            _ => return true,
+        };
+        nack.last()
+            .is_some_and(|last| *last & !((1u8 << rem) - 1) == 0)
+    }
+
+    fn fixed_codec_lengths(
+        &self,
+        contract: TrafficContract,
+        outgoing: bool,
+    ) -> Option<(usize, usize)> {
+        let (app_len, nack_slots) = if outgoing {
+            let app = if self.state.central {
+                contract.forward_payload_len
+            } else {
+                contract.reverse_payload_len
+            };
+            (app, self.local_ratio().1)
+        } else {
+            let app = if self.state.central {
+                contract.reverse_payload_len
+            } else {
+                contract.forward_payload_len
+            };
+            (app, self.local_ratio().0)
+        };
+        Some((
+            self.state.wire_payload_len(app_len as usize)?,
+            Self::nack_bytes_for_slots(nack_slots),
+        ))
+    }
+
+    /// Serialize `pkt` into the shared TX buffer; negotiated data-plane
+    /// packets use the fixed codec, while all control packets remain postcard.
     fn encode_packet(&mut self, pkt: &Packet) -> Result<usize, Error<P::Error>> {
+        if matches!(
+            pkt,
+            Packet::Data { .. } | Packet::Ack { .. } | Packet::Drop { .. }
+        ) {
+            if let Some(contract) = self
+                .cadence_active_contract
+                .filter(|_| self.cadence_active_fixed_wire)
+            {
+                let (payload_len, nack_len) = self
+                    .fixed_codec_lengths(contract, true)
+                    .ok_or(Error::BufferTooSmall)?;
+                return pkt
+                    .to_fixed_bytes(payload_len, nack_len, &mut self.tx_buf)
+                    .map_err(|_| Error::InvalidPacket);
+            }
+        }
         pkt.to_bytes(&mut self.tx_buf)
             .map_err(Error::<P::Error>::from)
+    }
+
+    fn decode_packet(&mut self, buf: &[u8]) -> Result<Packet, Error<P::Error>> {
+        let active = self
+            .cadence_active_contract
+            .filter(|_| self.cadence_active_fixed_wire);
+        let pending = (self.cadence_runtime.fixed_wire
+            && matches!(
+                self.cadence_runtime.stage,
+                CadenceRunStage::Applying | CadenceRunStage::Stable
+            ))
+        .then_some(self.cadence_runtime.contract);
+        for contract in [active, pending].into_iter().flatten() {
+            if let Some((payload_len, nack_len)) = self.fixed_codec_lengths(contract, false) {
+                if let Ok(packet) = Packet::from_fixed_bytes(buf, payload_len, nack_len) {
+                    if self.fixed_nack_is_canonical(&packet) {
+                        return Ok(packet);
+                    }
+                    return Err(Error::InvalidPacket);
+                }
+            }
+        }
+        if Packet::has_fixed_marker(buf) {
+            return Err(Error::InvalidPacket);
+        }
+        let packet = Packet::from_bytes(buf).map_err(|_| Error::InvalidPacket)?;
+        if self.cadence_active_fixed_wire
+            && matches!(
+                packet,
+                Packet::Data { .. } | Packet::Ack { .. } | Packet::Drop { .. }
+            )
+        {
+            if self.fixed_legacy_rx_grace == 0 {
+                return Err(Error::InvalidPacket);
+            }
+            self.fixed_legacy_rx_grace -= 1;
+        }
+        Ok(packet)
     }
 
     /// Build the outbound `Packet::Data` for `seq` and record the slot
@@ -689,19 +812,47 @@ impl<P: Phy> LinkCore<P> {
         }
     }
 
+    fn data_wire_lengths(
+        &self,
+        contract: TrafficContract,
+        fixed_wire: bool,
+    ) -> Result<(u16, u16), CadenceError> {
+        let forward_payload = self
+            .state
+            .wire_payload_len(contract.forward_payload_len as usize)
+            .ok_or(CadenceError::PayloadTooLarge)?;
+        let reverse_payload = self
+            .state
+            .wire_payload_len(contract.reverse_payload_len as usize)
+            .ok_or(CadenceError::PayloadTooLarge)?;
+        let (forward_slots, reverse_slots) = self.state.tx_rx_ratio;
+        let data_header = if fixed_wire {
+            FIXED_DATA_HEADER_LEN
+        } else {
+            // Postcard Data: enum + two Vec lengths + worst-case u16 varints.
+            9
+        };
+        let forward = data_header
+            .checked_add(Self::nack_bytes_for_slots(reverse_slots))
+            .and_then(|n| n.checked_add(forward_payload))
+            .ok_or(CadenceError::WireLengthOverflow)?;
+        let reverse = data_header
+            .checked_add(Self::nack_bytes_for_slots(forward_slots))
+            .and_then(|n| n.checked_add(reverse_payload))
+            .ok_or(CadenceError::WireLengthOverflow)?;
+        if forward > 63 || reverse > 63 {
+            return Err(CadenceError::WireLengthOverflow);
+        }
+        Ok((forward as u16, reverse as u16))
+    }
+
     fn cadence_local_probe_floors(
         &self,
         contract: TrafficContract,
         policy: CadenceProbePolicy,
+        fixed_wire: bool,
     ) -> Result<(u16, u16), CadenceError> {
-        let forward_wire = contract
-            .forward_max_payload
-            .checked_add(CADENCE_PROTOCOL_OVERHEAD)
-            .ok_or(CadenceError::WireLengthOverflow)?;
-        let reverse_wire = contract
-            .reverse_max_payload
-            .checked_add(CADENCE_PROTOCOL_OVERHEAD)
-            .ok_or(CadenceError::WireLengthOverflow)?;
+        let (forward_wire, reverse_wire) = self.data_wire_lengths(contract, fixed_wire)?;
         Ok((
             policy
                 .min_slot_us
@@ -734,10 +885,15 @@ impl<P: Phy> LinkCore<P> {
         {
             return Err(CadenceError::InvalidPolicy);
         }
-        if contract.forward_max_payload as usize > MAX_PAYLOAD
-            || contract.reverse_max_payload as usize > MAX_PAYLOAD
+        if contract.forward_payload_len as usize > MAX_PAYLOAD
+            || contract.reverse_payload_len as usize > MAX_PAYLOAD
+            || self.data_wire_lengths(contract, true).is_err()
         {
             return Err(CadenceError::PayloadTooLarge);
+        }
+        if self.state.lm.tx.inflight != 0 || self.pending_drop.is_some() || self.pending_tx_len != 0
+        {
+            return Err(CadenceError::Busy);
         }
         if !matches!(
             self.cadence_runtime.stage,
@@ -747,7 +903,7 @@ impl<P: Phy> LinkCore<P> {
         }
         let stable = self.cadence_runtime.stable;
         let (local_short_floor, local_long_floor) =
-            self.cadence_local_probe_floors(contract, policy)?;
+            self.cadence_local_probe_floors(contract, policy, true)?;
         if local_short_floor > stable.short_slot_us || local_long_floor > stable.long_slot_us {
             return Err(CadenceError::InvalidPolicy);
         }
@@ -757,6 +913,7 @@ impl<P: Phy> LinkCore<P> {
         self.cadence_id = generation;
         self.cadence_ack = 0;
         self.cadence_runtime.contract = contract;
+        self.cadence_runtime.fixed_wire = true;
         self.cadence_runtime.policy = policy;
         self.cadence_runtime.candidate = stable;
         self.cadence_runtime.probe_floor_short_us = local_short_floor;
@@ -823,6 +980,8 @@ impl<P: Phy> LinkCore<P> {
     fn complete_cadence_apply(&mut self) {
         if self.cadence_runtime.releasing {
             self.cadence_active_contract = None;
+            self.cadence_active_fixed_wire = false;
+            self.fixed_legacy_rx_grace = 0;
             self.cadence_runtime = CadenceRuntime::new(self.cadence_safe_profile);
             // Keep the completed generation/apply descriptor in periodic
             // beacons. A peripheral that lost the first post-apply packet can
@@ -833,6 +992,8 @@ impl<P: Phy> LinkCore<P> {
             self.cadence_ack = self.cadence_id | 0x80;
         } else {
             self.cadence_active_contract = Some(self.cadence_runtime.contract);
+            self.cadence_active_fixed_wire = self.cadence_runtime.fixed_wire;
+            self.fixed_legacy_rx_grace = u8::from(self.cadence_runtime.fixed_wire) * 2;
             self.cadence_runtime.stage = CadenceRunStage::Stable;
             self.cadence_exit_failure_baseline = self.delivery_failures;
         }
@@ -856,6 +1017,7 @@ impl<P: Phy> LinkCore<P> {
         let fallback = self.phy.fallback_slot_period_us().max(1);
         self.phy.align_slot_period(fallback);
         self.cadence_active_contract = None;
+        self.cadence_active_fixed_wire = false;
         self.cadence_runtime = CadenceRuntime::new(self.cadence_safe_profile);
         self.cadence_id = 1;
         self.cadence_short_us = self.cadence_safe_profile.short_slot_us;
@@ -1206,13 +1368,14 @@ impl<P: Phy> LinkCore<P> {
             // CadenceSample postcard overhead is 3 bytes (variant,
             // generation, Vec length). Match the planner's worst Data wire
             // length instead of adding the large negotiation-control header.
-            let app_len = if central {
-                self.cadence_runtime.contract.forward_max_payload
-            } else {
-                self.cadence_runtime.contract.reverse_max_payload
-            } as usize;
-            let target_wire = app_len.saturating_add(CADENCE_PROTOCOL_OVERHEAD as usize);
-            let mut padding = Vec::<u8, { MAX_PAYLOAD + 16 }>::new();
+            let (forward_wire, reverse_wire) = self
+                .data_wire_lengths(
+                    self.cadence_runtime.contract,
+                    self.cadence_runtime.fixed_wire,
+                )
+                .unwrap_or((MAX_PAYLOAD as u16, MAX_PAYLOAD as u16));
+            let target_wire = if central { forward_wire } else { reverse_wire } as usize;
+            let mut padding = Vec::<u8, { MAX_PAYLOAD + 32 }>::new();
             let _ = padding.resize(target_wire.saturating_sub(3), 0xA5);
             return Some(Packet::CadenceSample {
                 generation: self.cadence_runtime.generation,
@@ -1260,6 +1423,9 @@ impl<P: Phy> LinkCore<P> {
         if stage == CadenceStage::Probe && self.cadence_runtime.confirming {
             flags |= CADENCE_FLAG_CONFIRM;
         }
+        if self.cadence_runtime.fixed_wire && !self.cadence_runtime.releasing {
+            flags |= CADENCE_FLAG_FIXED_WIRE;
+        }
         if self.cadence_runtime.releasing
             && matches!(stage, CadenceStage::Release | CadenceStage::Commit)
         {
@@ -1300,8 +1466,8 @@ impl<P: Phy> LinkCore<P> {
             generation: self.cadence_runtime.generation,
             stage,
             epoch,
-            forward_payload: self.cadence_runtime.contract.forward_max_payload as u8,
-            reverse_payload: self.cadence_runtime.contract.reverse_max_payload as u8,
+            forward_payload: self.cadence_runtime.contract.forward_payload_len as u8,
+            reverse_payload: self.cadence_runtime.contract.reverse_payload_len as u8,
             short_us: wire_profile.short_slot_us,
             long_us: wire_profile.long_slot_us,
             min_slot_us: self.cadence_runtime.policy.min_slot_us,
@@ -1358,12 +1524,12 @@ impl<P: Phy> LinkCore<P> {
         let mut rejected = false;
         if let Some(data) = offered {
             if let Some(contract) = self.cadence_active_contract {
-                let max_payload = if self.state.central {
-                    contract.forward_max_payload
+                let payload_len = if self.state.central {
+                    contract.forward_payload_len
                 } else {
-                    contract.reverse_max_payload
+                    contract.reverse_payload_len
                 } as usize;
-                if data.len() > max_payload {
+                if data.len() != payload_len {
                     return Err(Error::PayloadExceedsCadenceProfile);
                 }
             }
@@ -1644,8 +1810,9 @@ impl<P: Phy> LinkCore<P> {
                 }
             };
 
-            let reply = Packet::from_bytes(&self.rx_pkt_buf[..reply_len])
-                .map_err(|_| Error::InvalidPacket)?;
+            let mut encoded = [0u8; MAX_PAYLOAD + 32];
+            encoded[..reply_len].copy_from_slice(&self.rx_pkt_buf[..reply_len]);
+            let reply = self.decode_packet(&encoded[..reply_len])?;
             let out = self
                 .handle_rx_packet(
                     reply,
@@ -1789,7 +1956,9 @@ impl<P: Phy> LinkCore<P> {
                 if matches!(
                     self.cadence_runtime.stage,
                     CadenceRunStage::Idle | CadenceRunStage::Stable | CadenceRunStage::Failed
-                ) =>
+                ) && self.state.lm.tx.inflight == 0
+                    && self.pending_drop.is_none()
+                    && self.pending_tx_len == 0 =>
             {
                 let contract = TrafficContract::new(forward_payload as u16, reverse_payload as u16);
                 let policy = CadenceProbePolicy::new(
@@ -1799,7 +1968,8 @@ impl<P: Phy> LinkCore<P> {
                     safety_steps as u16,
                 );
                 let stable = self.cadence_runtime.stable;
-                match self.cadence_local_probe_floors(contract, policy) {
+                let fixed_wire = flags & CADENCE_FLAG_FIXED_WIRE != 0;
+                match self.cadence_local_probe_floors(contract, policy, fixed_wire) {
                     Ok((short_floor, long_floor))
                         if short_floor <= stable.short_slot_us
                             && long_floor <= stable.long_slot_us =>
@@ -1809,6 +1979,7 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_id = generation;
                         self.cadence_ack = 0;
                         self.cadence_runtime.contract = contract;
+                        self.cadence_runtime.fixed_wire = fixed_wire;
                         self.cadence_runtime.policy = policy;
                         self.cadence_runtime.candidate = stable;
                         self.cadence_runtime.probe_floor_short_us = short_floor;
@@ -1829,7 +2000,9 @@ impl<P: Phy> LinkCore<P> {
                         | CadenceRunStage::Stable
                         | CadenceRunStage::Failed
                         | CadenceRunStage::Accept
-                ) =>
+                ) && self.state.lm.tx.inflight == 0
+                    && self.pending_drop.is_none()
+                    && self.pending_tx_len == 0 =>
             {
                 let contract = TrafficContract::new(forward_payload as u16, reverse_payload as u16);
                 let policy = CadenceProbePolicy::new(
@@ -1838,7 +2011,8 @@ impl<P: Phy> LinkCore<P> {
                     probe_slots,
                     safety_steps as u16,
                 );
-                let floors = self.cadence_local_probe_floors(contract, policy);
+                let fixed_wire = flags & CADENCE_FLAG_FIXED_WIRE != 0;
+                let floors = self.cadence_local_probe_floors(contract, policy, fixed_wire);
                 if forward_payload as usize > MAX_PAYLOAD
                     || reverse_payload as usize > MAX_PAYLOAD
                     || long_us < short_us
@@ -1858,6 +2032,7 @@ impl<P: Phy> LinkCore<P> {
                 self.cadence_id = generation;
                 self.cadence_ack = 0;
                 self.cadence_runtime.contract = contract;
+                self.cadence_runtime.fixed_wire = fixed_wire;
                 self.cadence_runtime.policy = policy;
                 self.cadence_runtime.probe_floor_short_us = short_floor;
                 self.cadence_runtime.probe_floor_long_us = long_floor;
@@ -1885,22 +2060,36 @@ impl<P: Phy> LinkCore<P> {
                 } else if self.cadence_runtime.releasing {
                     self.start_final_commit(catch_slot, period, self.cadence_safe_profile);
                 } else {
-                    let short_floor = self
-                        .cadence_runtime
-                        .probe_floor_short_us
-                        .max(start_epoch.min(u16::MAX as u32) as u16);
-                    let long_floor = self
-                        .cadence_runtime
-                        .probe_floor_long_us
-                        .max(end_epoch.min(u16::MAX as u32) as u16);
-                    match CadenceSearch::new_with_floors(
-                        self.cadence_runtime.stable,
+                    self.cadence_runtime.fixed_wire &= flags & CADENCE_FLAG_FIXED_WIRE != 0;
+                    let local_floors = self.cadence_local_probe_floors(
                         self.cadence_runtime.contract,
                         self.cadence_runtime.policy,
-                        CADENCE_PROTOCOL_OVERHEAD,
-                        short_floor,
-                        long_floor,
-                    ) {
+                        self.cadence_runtime.fixed_wire,
+                    );
+                    let (local_short, local_long) = match local_floors {
+                        Ok(floors) => floors,
+                        Err(_) => {
+                            self.start_failed_probe_release();
+                            return;
+                        }
+                    };
+                    let short_floor = local_short.max(start_epoch.min(u16::MAX as u32) as u16);
+                    let long_floor = local_long.max(end_epoch.min(u16::MAX as u32) as u16);
+                    let wire_lengths = self.data_wire_lengths(
+                        self.cadence_runtime.contract,
+                        self.cadence_runtime.fixed_wire,
+                    );
+                    match wire_lengths.and_then(|(forward_wire, reverse_wire)| {
+                        CadenceSearch::new_with_wire_lengths_and_floors(
+                            self.cadence_runtime.stable,
+                            self.cadence_runtime.contract,
+                            self.cadence_runtime.policy,
+                            forward_wire,
+                            reverse_wire,
+                            short_floor,
+                            long_floor,
+                        )
+                    }) {
                         Ok(search) => {
                             self.cadence_runtime.probe_floor_short_us = short_floor;
                             self.cadence_runtime.probe_floor_long_us = long_floor;
@@ -2218,8 +2407,8 @@ impl<P: Phy> LinkCore<P> {
                     generation,
                     stage,
                     sender_epoch,
-                    self.cadence_runtime.contract.forward_max_payload as u8,
-                    self.cadence_runtime.contract.reverse_max_payload as u8,
+                    self.cadence_runtime.contract.forward_payload_len as u8,
+                    self.cadence_runtime.contract.reverse_payload_len as u8,
                     self.cadence_runtime.candidate.short_slot_us,
                     self.cadence_runtime.candidate.long_slot_us,
                     self.cadence_runtime.policy.min_slot_us,
@@ -2328,6 +2517,12 @@ impl<P: Phy> LinkCore<P> {
                 short_phases,
                 cadence_apply_epoch,
             } if !central => {
+                if self.cadence_active_contract.is_some() && cadence_apply_epoch == 0 {
+                    // An authoritative central reboot/fallback beacon joins the
+                    // peripheral to postcard acquisition even if ordinary
+                    // packets still arrive and therefore miss counters stay 0.
+                    self.emergency_cadence_fallback();
+                }
                 self.state.scheduler.sync(channel_index);
                 if flags > 0 {
                     self.phy.set_peer_rx_window(flags as u16 * 16);
@@ -2581,20 +2776,24 @@ impl<P: Phy> LinkCore<P> {
                         }
                     }
                 } else {
-                    offer_rejected = self.enqueue_offer(tx_payload)?;
-                    let picked = self.pick_data_seq();
-                    let outbound =
-                        if let Some(control) = self.cadence_packet(target, local_rx as usize) {
-                            Some(control)
-                        } else if self.pending_drop.is_some() {
-                            Some(self.drop_packet(local_rx as usize))
-                        } else if let Some(seq) = picked {
-                            Some(self.data_packet(seq, local_phase as u8, local_rx as usize))
-                        } else if self.state.lm.rx.have {
-                            Some(self.ack_packet(local_rx as usize))
-                        } else {
-                            None
-                        };
+                    let control = self.cadence_packet(target, local_rx as usize);
+                    let picked = if control.is_none() {
+                        offer_rejected = self.enqueue_offer(tx_payload)?;
+                        self.pick_data_seq()
+                    } else {
+                        None
+                    };
+                    let outbound = if let Some(control) = control {
+                        Some(control)
+                    } else if self.pending_drop.is_some() {
+                        Some(self.drop_packet(local_rx as usize))
+                    } else if let Some(seq) = picked {
+                        Some(self.data_packet(seq, local_phase as u8, local_rx as usize))
+                    } else if self.state.lm.rx.have {
+                        Some(self.ack_packet(local_rx as usize))
+                    } else {
+                        None
+                    };
                     if let Some(outbound) = outbound {
                         let outbound_is_data = matches!(outbound, Packet::Data { .. });
                         let n = self.encode_packet(&outbound)?;
@@ -2651,7 +2850,9 @@ impl<P: Phy> LinkCore<P> {
                 };
                 let n = len.min(buf.len() - 1);
                 buf.copy_within(1..1 + n, 0);
-                let reply = Packet::from_bytes(&buf[..n]).map_err(|_| Error::InvalidPacket)?;
+                let mut encoded = [0u8; MAX_PAYLOAD + 32];
+                encoded[..n].copy_from_slice(&buf[..n]);
+                let reply = self.decode_packet(&encoded[..n])?;
                 self.handle_rx_packet(reply, c_local_phase, period, collect_slot, rx_buf)
                     .await?
             }
@@ -2785,9 +2986,10 @@ impl<P: Phy> Central<P> {
         self.core.nacks_recv
     }
 
-    /// Start an API-triggered traffic-contract negotiation and bounded slot
-    /// probe. The normal `frame()` loop drives Offer/Accept/Probe/Report and
-    /// final Commit packets; no packet length changes cadence automatically.
+    /// Negotiate exact directional application payload lengths and a bounded
+    /// slot probe. After Commit, Data must match its direction's fixed length;
+    /// payload/NACK lengths are omitted from the compact wire format. Existing
+    /// TX traffic must drain first, otherwise this returns `Busy`.
     pub fn negotiate_cadence(
         &mut self,
         contract: TrafficContract,
