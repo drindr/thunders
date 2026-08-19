@@ -1823,7 +1823,10 @@ impl<P: Phy> LinkCore<P> {
                 self.cadence_runtime.local_start = self.cadence_runtime.apply_epoch;
                 self.cadence_runtime.stage = CadenceRunStage::Applying;
             }
-            (_, CadenceStage::Cancel) => {
+            (_, CadenceStage::Cancel)
+                if generation == self.cadence_runtime.generation
+                    && self.cadence_runtime.stage != CadenceRunStage::Idle =>
+            {
                 self.cadence_runtime.error = Some(CadenceError::PeerRejected);
                 self.cadence_runtime.stage = CadenceRunStage::Failed;
             }
