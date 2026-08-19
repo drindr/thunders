@@ -89,6 +89,8 @@ fn raw_probe_stats(state: &MpslState) -> SlotProbeStats {
         crc_ok: state.crc_ok,
         crc_bad_long: state.crc_bad_long,
         tx_count: state.tx_count,
+        windows: 0,
+        aborted_windows: 0,
     }
 }
 
@@ -110,19 +112,28 @@ fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
         state.profile_armed = false;
     }
     if state.probe_armed && slot_profile_due(slot, state.probe_end_slot) {
-        if state.probe_started {
+        let delta = if state.probe_started {
             let mut delta = raw_probe_stats(state).wrapping_delta(state.probe_raw_start);
             delta.clock_us = state
                 .last_start_cyc
                 .wrapping_sub(state.probe_clock_start_cyc)
                 / radio::CPU_MHZ;
-            state.probe_stats_seq.fetch_add(1, Ordering::AcqRel);
-            core::sync::atomic::compiler_fence(Ordering::SeqCst);
-            state.probe_stats_total = state.probe_stats_total.wrapping_add(delta);
-            core::sync::atomic::compiler_fence(Ordering::Release);
-            state.probe_stats_seq.fetch_add(1, Ordering::Release);
-            state.probe_started = false;
-        }
+            delta.windows = 1;
+            delta
+        } else {
+            SlotProbeStats {
+                aborted_windows: 1,
+                ..SlotProbeStats::default()
+            }
+        };
+        // Keep a single odd/even generation around atomic per-field updates so
+        // readers get a coherent completed-window total without plain-data races.
+        state.probe_stats_seq.fetch_add(1, Ordering::AcqRel);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        state.probe_stats_total.wrapping_add(delta);
+        core::sync::atomic::compiler_fence(Ordering::Release);
+        state.probe_stats_seq.fetch_add(1, Ordering::Release);
+        state.probe_started = false;
         state.probe_armed = false;
     }
 }

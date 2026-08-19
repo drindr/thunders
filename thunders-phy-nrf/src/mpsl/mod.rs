@@ -710,7 +710,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
                 continue;
             }
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-            let stats = self.state.probe_stats_total;
+            let stats = self.state.probe_stats_total.load();
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
             let after = self
                 .state

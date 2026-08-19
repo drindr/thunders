@@ -1,7 +1,7 @@
 //! The MPSL radio's runtime state, provided by the caller during init.
 
 use core::mem::MaybeUninit;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
@@ -11,6 +11,67 @@ use thunders::phy::SlotProbeStats;
 
 /// One fixed-size packet: [0] = length, [1..=len] = payload.
 pub type Pkt = [u8; 64];
+
+pub(crate) struct AtomicProbeStats {
+    slots: AtomicU32,
+    clock_us: AtomicU32,
+    completed: AtomicU32,
+    op_late: AtomicU32,
+    address_events: AtomicU32,
+    crc_ok: AtomicU32,
+    crc_bad_long: AtomicU32,
+    tx_count: AtomicU32,
+    windows: AtomicU32,
+    aborted_windows: AtomicU32,
+}
+
+impl AtomicProbeStats {
+    pub const fn new() -> Self {
+        Self {
+            slots: AtomicU32::new(0),
+            clock_us: AtomicU32::new(0),
+            completed: AtomicU32::new(0),
+            op_late: AtomicU32::new(0),
+            address_events: AtomicU32::new(0),
+            crc_ok: AtomicU32::new(0),
+            crc_bad_long: AtomicU32::new(0),
+            tx_count: AtomicU32::new(0),
+            windows: AtomicU32::new(0),
+            aborted_windows: AtomicU32::new(0),
+        }
+    }
+
+    pub fn wrapping_add(&self, delta: SlotProbeStats) {
+        self.slots.fetch_add(delta.slots, Ordering::Relaxed);
+        self.clock_us.fetch_add(delta.clock_us, Ordering::Relaxed);
+        self.completed.fetch_add(delta.completed, Ordering::Relaxed);
+        self.op_late.fetch_add(delta.op_late, Ordering::Relaxed);
+        self.address_events
+            .fetch_add(delta.address_events, Ordering::Relaxed);
+        self.crc_ok.fetch_add(delta.crc_ok, Ordering::Relaxed);
+        self.crc_bad_long
+            .fetch_add(delta.crc_bad_long, Ordering::Relaxed);
+        self.tx_count.fetch_add(delta.tx_count, Ordering::Relaxed);
+        self.windows.fetch_add(delta.windows, Ordering::Relaxed);
+        self.aborted_windows
+            .fetch_add(delta.aborted_windows, Ordering::Relaxed);
+    }
+
+    pub fn load(&self) -> SlotProbeStats {
+        SlotProbeStats {
+            slots: self.slots.load(Ordering::Relaxed),
+            clock_us: self.clock_us.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            op_late: self.op_late.load(Ordering::Relaxed),
+            address_events: self.address_events.load(Ordering::Relaxed),
+            crc_ok: self.crc_ok.load(Ordering::Relaxed),
+            crc_bad_long: self.crc_bad_long.load(Ordering::Relaxed),
+            tx_count: self.tx_count.load(Ordering::Relaxed),
+            windows: self.windows.load(Ordering::Relaxed),
+            aborted_windows: self.aborted_windows.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// What the next timeslot should do.
 #[repr(u8)]
@@ -112,7 +173,7 @@ pub struct MpslState {
     /// Exact callback-boundary counters for bounded empirical probes.
     pub(crate) probe_clock_start_cyc: u32,
     pub(crate) probe_raw_start: SlotProbeStats,
-    pub(crate) probe_stats_total: SlotProbeStats,
+    pub(crate) probe_stats_total: AtomicProbeStats,
     pub(crate) probe_started: bool,
     /// Odd while the callback publishes the multiword total, even when stable.
     pub(crate) probe_stats_seq: AtomicU32,
@@ -312,7 +373,7 @@ impl MpslState {
             probe_armed: false,
             probe_clock_start_cyc: 0,
             probe_raw_start: SlotProbeStats::default(),
-            probe_stats_total: SlotProbeStats::default(),
+            probe_stats_total: AtomicProbeStats::new(),
             probe_started: false,
             probe_stats_seq: AtomicU32::new(0),
             slot_distance: 0,

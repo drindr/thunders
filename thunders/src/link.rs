@@ -347,6 +347,7 @@ const CADENCE_FLAG_REJECT: u8 = 2;
 const CADENCE_FLAG_RELEASE: u8 = 4;
 const CADENCE_FLAG_CONFIRM: u8 = 8;
 const CADENCE_FLAG_FIXED_WIRE: u8 = 16;
+const CADENCE_FLAG_PROBE_ABORT: u8 = 32;
 
 fn cadence_exit_triggered(policy: CadenceExitPolicy, failed: u32, misses: u8) -> bool {
     (policy.delivery_failures != 0 && failed >= policy.delivery_failures as u32)
@@ -437,6 +438,7 @@ struct CadenceRuntime {
     probe_superframes_current: u16,
     probe_completed_superframes: u16,
     probe_failed_bursts: u16,
+    probe_abort_retries: u8,
     confirming: bool,
     local_metrics: Option<ProbeMetrics>,
     peer_metrics: Option<ProbeMetrics>,
@@ -474,6 +476,7 @@ impl CadenceRuntime {
             probe_superframes_current: 0,
             probe_completed_superframes: 0,
             probe_failed_bursts: 0,
+            probe_abort_retries: 0,
             confirming: false,
             local_metrics: None,
             peer_metrics: None,
@@ -1224,6 +1227,16 @@ impl<P: Phy> LinkCore<P> {
             self.cadence_runtime.policy.probe_superframes
         };
         let candidate = self.cadence_runtime.candidate;
+        if burst.completed_superframes == 0 {
+            if self.cadence_runtime.probe_abort_retries < 3 {
+                self.cadence_runtime.probe_abort_retries += 1;
+                self.start_probe_plan(slot, period);
+            } else {
+                self.start_failed_probe_release();
+            }
+            return;
+        }
+        self.cadence_runtime.probe_abort_retries = 0;
         if self.cadence_runtime.confirming {
             if burst.completed_superframes < target_superframes {
                 self.start_probe_plan(slot, period);
@@ -1374,6 +1387,7 @@ impl<P: Phy> LinkCore<P> {
                 .phy
                 .slot_probe_stats()
                 .wrapping_delta(self.cadence_runtime.stats_start);
+            let window_aborted = delta.windows == 0 || delta.aborted_windows != 0;
             let isolated = !self.cadence_runtime.confirming;
             let reverse_trial = isolated
                 && self.cadence_runtime.candidate.long_slot_us
@@ -1432,9 +1446,17 @@ impl<P: Phy> LinkCore<P> {
             let slots_bad = delta.slots < expected_slots;
             let delivery_bad =
                 self.delivery_failures != self.cadence_runtime.delivery_failures_start;
-            let local_bad =
-                delta.op_late != 0 || timing_bad || samples_bad || slots_bad || delivery_bad;
-            let completed = self.cadence_runtime.probe_superframes_current;
+            let local_bad = window_aborted
+                || delta.op_late != 0
+                || timing_bad
+                || samples_bad
+                || slots_bad
+                || delivery_bad;
+            let completed = if window_aborted {
+                0
+            } else {
+                self.cadence_runtime.probe_superframes_current
+            };
             self.cadence_runtime.local_metrics = Some(ProbeMetrics::new(
                 completed,
                 u16::from(local_bad),
@@ -1517,6 +1539,9 @@ impl<P: Phy> LinkCore<P> {
         } else {
             0
         };
+        if stage == CadenceStage::Report && local.completed_superframes == 0 {
+            flags |= CADENCE_FLAG_PROBE_ABORT;
+        }
         if self.cadence_runtime.releasing {
             flags |= CADENCE_FLAG_RELEASE;
         }
@@ -2242,6 +2267,18 @@ impl<P: Phy> LinkCore<P> {
                         CadenceRunStage::Accept | CadenceRunStage::Armed | CadenceRunStage::Report
                     ) =>
             {
+                let duplicate_armed = self.cadence_runtime.stage == CadenceRunStage::Armed
+                    && self.cadence_runtime.central_start == start_epoch
+                    && self.cadence_runtime.central_end == end_epoch
+                    && self.cadence_runtime.probe_superframes_current == probe_slots
+                    && self.cadence_runtime.candidate.short_slot_us == short_us
+                    && self.cadence_runtime.candidate.long_slot_us == long_us
+                    && self.cadence_runtime.confirming == (flags & CADENCE_FLAG_CONFIRM != 0);
+                if duplicate_armed {
+                    // Keep repeating Armed, but never rewrite an immutable
+                    // descriptor that the callback may already have started.
+                    return;
+                }
                 let start_delta = start_epoch.wrapping_sub(epoch) as i32;
                 let end_delta = end_epoch.wrapping_sub(epoch) as i32;
                 if start_delta > 0 && end_delta > start_delta {
@@ -2307,9 +2344,14 @@ impl<P: Phy> LinkCore<P> {
                     && short_us == self.cadence_runtime.candidate.short_slot_us
                     && long_us == self.cadence_runtime.candidate.long_slot_us =>
             {
-                let failures = u16::from(flags & CADENCE_FLAG_STABLE == 0);
+                let aborted = flags & CADENCE_FLAG_PROBE_ABORT != 0;
+                let failures = u16::from(flags & CADENCE_FLAG_STABLE == 0 && !aborted);
                 self.cadence_runtime.peer_metrics = Some(ProbeMetrics::new(
-                    self.cadence_runtime.policy.probe_superframes,
+                    if aborted {
+                        0
+                    } else {
+                        self.cadence_runtime.probe_superframes_current
+                    },
                     failures,
                     failures,
                 ));

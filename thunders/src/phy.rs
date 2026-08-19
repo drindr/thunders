@@ -24,6 +24,10 @@ pub struct SlotProbeStats {
     pub crc_bad_long: u32,
     /// Completed TX operations.
     pub tx_count: u32,
+    /// Probe windows whose exact callback START and END were both captured.
+    pub windows: u32,
+    /// Probe windows disarmed at END without an exact START capture.
+    pub aborted_windows: u32,
 }
 
 impl SlotProbeStats {
@@ -38,6 +42,8 @@ impl SlotProbeStats {
             crc_ok: self.crc_ok.wrapping_sub(start.crc_ok),
             crc_bad_long: self.crc_bad_long.wrapping_sub(start.crc_bad_long),
             tx_count: self.tx_count.wrapping_sub(start.tx_count),
+            windows: self.windows.wrapping_sub(start.windows),
+            aborted_windows: self.aborted_windows.wrapping_sub(start.aborted_windows),
         }
     }
 
@@ -52,6 +58,8 @@ impl SlotProbeStats {
             crc_ok: self.crc_ok.wrapping_add(delta.crc_ok),
             crc_bad_long: self.crc_bad_long.wrapping_add(delta.crc_bad_long),
             tx_count: self.tx_count.wrapping_add(delta.tx_count),
+            windows: self.windows.wrapping_add(delta.windows),
+            aborted_windows: self.aborted_windows.wrapping_add(delta.aborted_windows),
         }
     }
 }
@@ -343,16 +351,19 @@ mod tests {
         let start = SlotProbeStats {
             slots: u32::MAX - 1,
             tx_count: u32::MAX,
+            windows: u32::MAX,
             ..Default::default()
         };
         let end = SlotProbeStats {
             slots: 1,
             tx_count: 2,
+            windows: 1,
             ..Default::default()
         };
         let delta = end.wrapping_delta(start);
         assert_eq!(delta.slots, 3);
         assert_eq!(delta.tx_count, 3);
+        assert_eq!(delta.windows, 2);
 
         let total = SlotProbeStats {
             slots: u32::MAX,

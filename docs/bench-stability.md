@@ -270,8 +270,11 @@ LM20→52840、8B合同的两批各3次冷启动合计得到`successes=3/6`；�
 离线，因此完整20次三板矩阵仍留给后续正式实验。
 
 Probe统计现改为MPSL callback在绝对`[start_slot,end_slot)`边界锁存slot、executed TX、
-ADDRESS/CRC、`op_late`和DWT时间，并通过odd/even sequence发布累计值；Link在安排Probe时
-提前保存累计baseline，不再依赖app线程恰好在单slot窗口内醒来。step=10硬件A/B中，central
+ADDRESS/CRC、`op_late`和DWT时间；累计值的每个字段均为atomic，并以odd/even generation
+保证一致快照，避免IRQ与任务并发读写普通多字段struct。Link在安排Probe时提前保存累计
+baseline，不再依赖app线程恰好在单slot窗口内醒来。错过精确START的窗口由callback显式
+累计为abort、通过compact Report同步给central，最多重试3次；相同Armed descriptor只重复
+应答而不重写可能已启动的overlay。step=10硬件A/B中，central
 的490/600共32次全部精确为`slots=1, tx=1/1, clock=489–490/490`，原来的central零slot/
 错operation消失。follower仍有7/32次零slot、4/32次错operation；500/590的central则
 32/32次slot/time正确但CRC catch为0。由此可区分：central侧app采样竞态已消除，剩余问题
