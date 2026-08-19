@@ -2273,16 +2273,18 @@ impl<P: Phy> LinkCore<P> {
                         CadenceRunStage::Accept | CadenceRunStage::Armed | CadenceRunStage::Report
                     ) =>
             {
-                let duplicate_armed = self.cadence_runtime.stage == CadenceRunStage::Armed
-                    && self.cadence_runtime.central_start == start_epoch
+                let duplicate_descriptor = matches!(
+                    self.cadence_runtime.stage,
+                    CadenceRunStage::Armed | CadenceRunStage::Report
+                ) && self.cadence_runtime.central_start == start_epoch
                     && self.cadence_runtime.central_end == end_epoch
                     && self.cadence_runtime.probe_superframes_current == probe_slots
                     && self.cadence_runtime.candidate.short_slot_us == short_us
                     && self.cadence_runtime.candidate.long_slot_us == long_us
                     && self.cadence_runtime.confirming == (flags & CADENCE_FLAG_CONFIRM != 0);
-                if duplicate_armed {
-                    // Keep repeating Armed, but never rewrite an immutable
-                    // descriptor that the callback may already have started.
+                if duplicate_descriptor {
+                    // Keep repeating Armed/Report, but never rewrite an
+                    // immutable descriptor or replace completed metrics.
                     return;
                 }
                 let start_delta = start_epoch.wrapping_sub(epoch) as i32;
