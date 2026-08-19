@@ -244,17 +244,37 @@ host端字节测试；实验台仍存在协商前空链路及弱向启动波动�
 
 | payload | fixed Data wire（8:2） | 2M feasibility floor | 实测Stable |
 |---:|---:|---:|---:|
-| 1B | 7B | 345µs | 500/600µs |
-| 4B | 10B | 357µs | 500/600µs |
-| 8B | 14B | 373µs | 500/600µs |
-| 16B | 22B | 405µs | 500/600µs |
-| 32B | 38B | 469µs | 500/600µs |
+| 1B | 7B | 333µs | 500/600µs |
+| 4B | 10B | 345µs | 500/600µs |
+| 8B | 14B | 361µs | 500/600µs |
+| 16B | 22B | 393µs | 500/600µs |
+| 32B | 38B | 457µs | 500/600µs |
 
-这同时证明两件不同的事：软件的候选下界确实随包长变化（纯planner测试在全部候选通过
-时分别得到345/345和469/469），但**最终稳定值不保证随包长不同**。本板对上475/575
+这里使用当前2M实现的字面公式：`wire=payload+6`、
+`airtime=28+4*(wire+3)`、`floor=airtime+265`。双方运行时实际值应以
+`CADENCE BOUNDS`日志为准。这同时证明两件不同的事：软件的候选下界确实随包长变化
+（纯planner测试在全部候选通过时分别得到333/333和457/457），但**最终稳定值不保证随包长不同**。本板对上475/575
 以下候选失败的主导因素是MPSL grant/PLL/phase稳定性，而不是airtime；长度只改变可尝试
 范围，实测稳定性仍可被同一个长度无关的硬件瓶颈钳在500/600。把公式floor直接宣称为
 稳定slot反而违反“协商期间实际尝试后决定”的要求。
+
+为避免只报告幸存的Stable run，`scripts/bench.sh`支持`BENCH_ALL_ATTEMPTS=1`并输出
+`CADENCE ATTEMPT/YIELD`；`scripts/bench_cadence_grid.sh C P PAYLOAD SECS ATTEMPTS`会对
+25/10/5µs step分别执行全部冷启动，日志按`-sSTEP`隔离。bench固件同时记录双方合并后的
+`CADENCE BOUNDS`以及每个不同的`CADENCE CANDIDATE`，可直接验证475/600、500/575、
+490/600、500/590等边界，而不是从最终profile反推。10µs-step smoke test在
+LM20→52840、8B合同的两批各3次冷启动合计得到`successes=3/6`；成功run均记录
+`local 361/361, peer 361/361, effective 361/361 → 490/600 → 500/590 → 500/600 Stable`，
+证明两端实际Accept floor与当前公式一致，也把short-chain和reverse-echo两个失败边界
+分开。测试时5340调试器临时
+离线，因此完整20次三板矩阵仍留给后续正式实验。
+
+同轮审查修复了一个会污染吞吐结果的独立问题：depth-two pipeline在发布下一轮phase 0
+时保留上一轮slot→seq map：第一颗反馈在peer完成本轮NACK前已发布，仍映射R-1；最后
+反馈在本端发布下一轮phase 0并轮换map时映射刚完成的R。另确认当前
+`HOP_MISS_THRESHOLD == LINK_LOSS_THRESHOLD == 16`且loss分支在前，adaptive-hop不可达；
+不能只降低阈值，因为central单边换台后peripheral无法先验知道新频道。该项保持禁用，
+等待“旧频道Beacon公告future hop epoch”协议后再单独修复。
 
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、

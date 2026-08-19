@@ -42,6 +42,15 @@ const BENCH_PAYLOAD_LEN: usize = 32;
 #[cfg(not(any(feature = "payload-1", feature = "payload-4", feature = "payload-16", feature = "payload-32")))]
 const BENCH_PAYLOAD_LEN: usize = 8;
 
+#[cfg(all(feature = "cadence-step-5", feature = "cadence-step-10"))]
+compile_error!("select only one cadence step feature");
+#[cfg(feature = "cadence-step-5")]
+const CADENCE_STEP_US: u16 = 5;
+#[cfg(all(not(feature = "cadence-step-5"), feature = "cadence-step-10"))]
+const CADENCE_STEP_US: u16 = 10;
+#[cfg(not(any(feature = "cadence-step-5", feature = "cadence-step-10")))]
+const CADENCE_STEP_US: u16 = 25;
+
 fn is_ping(payload: &[u8]) -> bool {
     payload.len() == BENCH_PAYLOAD_LEN
         && if BENCH_PAYLOAD_LEN >= 4 {
@@ -158,6 +167,10 @@ async fn main(spawner: Spawner) {
             let mut cadence_exit_requested = false;
             #[cfg(feature = "cadence-probe")]
             let mut cadence_released = false;
+            #[cfg(feature = "cadence-probe")]
+            let mut cadence_last_bounds: Option<thunders::CadenceProbeBounds> = None;
+            #[cfg(feature = "cadence-probe")]
+            let mut cadence_last_candidate: Option<thunders::CadenceProfile> = None;
 
             let mut rx_buf = [0u8; 32];
             let mut frames: u64 = 0;
@@ -193,13 +206,39 @@ async fn main(spawner: Spawner) {
             loop {
                 #[cfg(feature = "cadence-probe")]
                 if !cadence_requested && central.status() == thunders::link::LinkStatus::Connected {
-                    let policy = thunders::CadenceProbePolicy::new(300, 25, 32, 0);
+                    let policy = thunders::CadenceProbePolicy::new(300, CADENCE_STEP_US, 32, 0);
                     if let Ok(generation) = central.negotiate_cadence(
                         thunders::TrafficContract::new(BENCH_PAYLOAD_LEN as u16, BENCH_PAYLOAD_LEN as u16),
                         policy,
                     ) {
                         cadence_requested = true;
                         info!("CADENCE REQUEST gen={}", generation);
+                    }
+                }
+                #[cfg(feature = "cadence-probe")]
+                if let Some(bounds) = central.cadence_probe_bounds() {
+                    if cadence_last_bounds != Some(bounds) {
+                        cadence_last_bounds = Some(bounds);
+                        let peer = bounds.peer.unwrap_or((0, 0));
+                        info!(
+                            "CADENCE BOUNDS local={}/{} peer={}/{} effective={}/{}",
+                            bounds.local.0,
+                            bounds.local.1,
+                            peer.0,
+                            peer.1,
+                            bounds.effective.0,
+                            bounds.effective.1
+                        );
+                    }
+                }
+                #[cfg(feature = "cadence-probe")]
+                if let Some(candidate) = central.cadence_candidate() {
+                    if cadence_last_candidate != Some(candidate) {
+                        cadence_last_candidate = Some(candidate);
+                        info!(
+                            "CADENCE CANDIDATE short={} long={}",
+                            candidate.short_slot_us, candidate.long_slot_us
+                        );
                     }
                 }
                 #[cfg(feature = "cadence-probe")]

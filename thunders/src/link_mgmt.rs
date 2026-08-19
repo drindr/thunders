@@ -173,6 +173,9 @@ pub(crate) struct LinkMgmt {
     pub tx: TxWindow,
     pub rx: RxWindow,
     pub tx_run_slots: [Option<TxRunSlot>; WINDOW_SIZE],
+    /// Completed run retained while the depth-two pipeline publishes phase 0
+    /// of the next run before collecting the final feedback slot.
+    pub tx_prev_run_slots: [Option<TxRunSlot>; WINDOW_SIZE],
     pub rx_run_mask: [u8; NACK_BYTES],
     pub nack_for_peer: [u8; NACK_BYTES],
     pub tx_frags: [Vec<u8, MAX_PAYLOAD>; MAX_FRAGMENTS],
@@ -187,6 +190,7 @@ impl LinkMgmt {
             tx: TxWindow::new(),
             rx: RxWindow::new(),
             tx_run_slots: [None; WINDOW_SIZE],
+            tx_prev_run_slots: [None; WINDOW_SIZE],
             rx_run_mask: [0; NACK_BYTES],
             nack_for_peer: [0; NACK_BYTES],
             tx_frags: core::array::from_fn(|_| Vec::new()),
@@ -194,6 +198,11 @@ impl LinkMgmt {
             tx_frag_next: 0,
             rx_reasm: None,
         }
+    }
+
+    pub fn begin_tx_run(&mut self) {
+        self.tx_prev_run_slots = self.tx_run_slots;
+        self.tx_run_slots = [None; WINDOW_SIZE];
     }
 
     pub fn record_tx_slot(&mut self, slot: u8, seq: u16) {
@@ -427,6 +436,28 @@ mod tests {
         assert!(rx.receive(1, &[1]));
         assert_eq!(rx.peek_len(), Some(1));
         assert_eq!(rx.pop_head().unwrap().payload[0], 1);
+    }
+
+    #[test]
+    fn pipelined_run_rotation_retains_feedback_map() {
+        let mut lm = LinkMgmt::new();
+        lm.record_tx_slot(0, 0);
+        lm.record_tx_slot(1, 1);
+        lm.begin_tx_run();
+        lm.record_tx_slot(0, 2);
+
+        assert_eq!(lm.tx_prev_run_slots[0], Some(TxRunSlot { slot: 0, seq: 0 }));
+        assert_eq!(lm.tx_prev_run_slots[1], Some(TxRunSlot { slot: 1, seq: 1 }));
+        assert_eq!(lm.tx_run_slots[0], Some(TxRunSlot { slot: 0, seq: 2 }));
+        assert_eq!(lm.tx_run_slots[1], None);
+
+        lm.tx.enqueue(&[10]);
+        lm.tx.enqueue(&[11]);
+        lm.tx.mark_sent(0);
+        lm.tx.mark_sent(1);
+        let nack = [1u8];
+        lm.tx.on_nack_slots(&nack, &lm.tx_prev_run_slots);
+        assert_eq!(lm.tx.pick(), Some(0));
     }
 
     #[test]

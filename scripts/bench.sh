@@ -29,6 +29,11 @@ RADIO_MODE="${THUNDERS_RADIO_MODE:-2m}"
 RATIO="${THUNDERS_RATIO:-}"
 PAYLOAD_BYTES="${THUNDERS_BENCH_PAYLOAD_BYTES:-8}"
 PAYLOAD_SUFFIX="${THUNDERS_BENCH_PAYLOAD_SUFFIX:-0}"
+CADENCE_STEP_US="${THUNDERS_CADENCE_STEP_US:-25}"
+case "$CADENCE_STEP_US" in
+  5|10|25) ;;
+  *) echo "unsupported THUNDERS_CADENCE_STEP_US=$CADENCE_STEP_US (use 5,10,25)" >&2; exit 2 ;;
+esac
 BIN="$ROOT/bench/bin"
 LOGS="$ROOT/bench/logs"
 mkdir -p "$BIN" "$LOGS"
@@ -64,6 +69,12 @@ build_one() {
   fi
   if [ "${CADENCE_HOLD:-0}" = "1" ] && [ "$backend" = "mpsl" ]; then
     feats+=(--features cadence-hold)
+  fi
+  if [ "$backend" = "mpsl" ]; then
+    case "$CADENCE_STEP_US" in
+      5) feats+=(--features cadence-step-5) ;;
+      10) feats+=(--features cadence-step-10) ;;
+    esac
   fi
   if [ "$backend" = "mpsl" ]; then
     case "$PAYLOAD_BYTES" in
@@ -120,12 +131,18 @@ run_pair() {
   if [ "$PAYLOAD_SUFFIX" = "1" ]; then
     payload_suffix="-p${PAYLOAD_BYTES}"
   fi
-  local run="${c}-${p}-${backend}${mode_suffix}${ratio_suffix}${payload_suffix}"
+  local cadence_suffix=""
+  if [ "${CADENCE_PROBE:-0}" = "1" ] && [ "$CADENCE_STEP_US" != "25" ]; then
+    cadence_suffix="-s${CADENCE_STEP_US}"
+  fi
+  local run="${c}-${p}-${backend}${mode_suffix}${ratio_suffix}${payload_suffix}${cadence_suffix}"
   local celf="$BIN/$c-$backend-central.elf" pelf="$BIN/$p-$backend-peripheral.elf"
   [ -f "$celf" ] || { echo "missing $celf - run 'scripts/bench.sh build'"; exit 1; }
   [ -f "$pelf" ] || { echo "missing $pelf"; exit 1; }
 
   local attempts="${BENCH_ATTEMPTS:-3}"
+  local all_attempts="${BENCH_ALL_ATTEMPTS:-0}"
+  local successes=0
   for attempt in $(seq 1 "$attempts"); do
     echo "== run $run (${secs}s, ${backend}, attempt $attempt) =="
     # The 5340 net core is debug-locked: every flash needs the erase-all
@@ -231,8 +248,17 @@ run_pair() {
       sleep 2
       continue
     fi
-    return 0
+    successes=$((successes + 1))
+    echo "CADENCE ATTEMPT run=$run stable=1 attempt=$attempt/$attempts"
+    if [ "$all_attempts" != "1" ]; then
+      echo "CADENCE YIELD run=$run successes=1 attempts=$attempt"
+      return 0
+    fi
   done
+  echo "CADENCE YIELD run=$run successes=$successes attempts=$attempts"
+  if [ "$successes" -gt 0 ]; then
+    return 0
+  fi
   echo "run $run failed after retries" >&2
   return 1
 }

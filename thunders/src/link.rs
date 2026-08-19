@@ -39,8 +39,9 @@ use heapless::Vec;
 
 use crate::{
     cadence::{
-        CadenceError, CadenceExitPolicy, CadenceNegotiationStatus, CadenceProbePolicy,
-        CadenceProfile, CadenceSearch, ProbeDecision, ProbeMetrics, TrafficContract,
+        CadenceError, CadenceExitPolicy, CadenceNegotiationStatus, CadenceProbeBounds,
+        CadenceProbePolicy, CadenceProfile, CadenceSearch, ProbeDecision, ProbeMetrics,
+        TrafficContract,
     },
     config::{
         CENTRAL_REPLY_TIMEOUT_US, Config, MAX_PAYLOAD, NACK_BYTES, PERIPHERAL_LISTEN_TIMEOUT_US,
@@ -384,6 +385,17 @@ fn required_probe_rx(confirming: bool, expected_rx: u32) -> u32 {
     }
 }
 
+fn feedback_uses_previous_run(
+    collected_local_phase: u32,
+    target_local_phase: u32,
+    local_tx: u8,
+) -> bool {
+    // The first feedback op was published before the peer finalized this run's
+    // NACK, so it still describes R-1. The final feedback is collected while
+    // phase 0 publication rotates R into the previous map.
+    collected_local_phase == local_tx as u32 || target_local_phase == 0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CadenceRunStage {
     Idle,
@@ -418,6 +430,10 @@ struct CadenceRuntime {
     probe_started: bool,
     probe_floor_short_us: u16,
     probe_floor_long_us: u16,
+    local_probe_floor_short_us: u16,
+    local_probe_floor_long_us: u16,
+    peer_probe_floor_short_us: u16,
+    peer_probe_floor_long_us: u16,
     probe_superframes_current: u16,
     probe_completed_superframes: u16,
     probe_failed_bursts: u16,
@@ -451,6 +467,10 @@ impl CadenceRuntime {
             probe_started: false,
             probe_floor_short_us: 0,
             probe_floor_long_us: 0,
+            local_probe_floor_short_us: 0,
+            local_probe_floor_long_us: 0,
+            peer_probe_floor_short_us: 0,
+            peer_probe_floor_long_us: 0,
             probe_superframes_current: 0,
             probe_completed_superframes: 0,
             probe_failed_bursts: 0,
@@ -775,12 +795,7 @@ impl<P: Phy> LinkCore<P> {
     /// Build the outbound `Packet::Data` for `seq` and record the slot
     /// position mapping for slot-NACK.
     fn data_packet(&mut self, seq: u16, slot: u8, nack_run_len: usize) -> Packet {
-        for entry in self.state.lm.tx_run_slots.iter_mut() {
-            if entry.is_none() {
-                *entry = Some(TxRunSlot { slot, seq });
-                break;
-            }
-        }
+        self.state.lm.record_tx_slot(slot, seq);
         let (elen, epayload) = {
             let e = self.state.lm.tx.entry(seq);
             (e.len as usize, e.payload)
@@ -809,6 +824,38 @@ impl<P: Phy> LinkCore<P> {
             ack: self.state.lm.rx.ack(),
             nack: nack_vec(nack_run_len, &self.state.lm.nack_for_peer),
         }
+    }
+
+    fn cadence_probe_bounds(&self) -> Option<CadenceProbeBounds> {
+        (self.cadence_runtime.probe_floor_short_us != 0
+            && self.cadence_runtime.probe_floor_long_us != 0)
+            .then_some(CadenceProbeBounds {
+                local: (
+                    self.cadence_runtime.local_probe_floor_short_us,
+                    self.cadence_runtime.local_probe_floor_long_us,
+                ),
+                peer: (self.cadence_runtime.peer_probe_floor_short_us != 0
+                    && self.cadence_runtime.peer_probe_floor_long_us != 0)
+                    .then_some((
+                        self.cadence_runtime.peer_probe_floor_short_us,
+                        self.cadence_runtime.peer_probe_floor_long_us,
+                    )),
+                effective: (
+                    self.cadence_runtime.probe_floor_short_us,
+                    self.cadence_runtime.probe_floor_long_us,
+                ),
+            })
+    }
+
+    fn cadence_candidate(&self) -> Option<CadenceProfile> {
+        matches!(
+            self.cadence_runtime.stage,
+            CadenceRunStage::ProbePlan
+                | CadenceRunStage::Armed
+                | CadenceRunStage::Probing
+                | CadenceRunStage::Report
+        )
+        .then_some(self.cadence_runtime.candidate)
     }
 
     fn cadence_status(&self) -> CadenceNegotiationStatus {
@@ -943,6 +990,8 @@ impl<P: Phy> LinkCore<P> {
         self.cadence_runtime.candidate = stable;
         self.cadence_runtime.probe_floor_short_us = local_short_floor;
         self.cadence_runtime.probe_floor_long_us = local_long_floor;
+        self.cadence_runtime.local_probe_floor_short_us = local_short_floor;
+        self.cadence_runtime.local_probe_floor_long_us = local_long_floor;
         if self.state.central {
             // Offer the known-stable anchor first. The peer returns its local
             // feasibility floors in the compact Accept; only then does the
@@ -1639,12 +1688,14 @@ impl<P: Phy> LinkCore<P> {
     }
 
     /// Apply the peer's ACK/NACK carried by a received packet.
-    fn apply_ack_nack(&mut self, ack: u16, nack: &[u8]) {
+    fn apply_ack_nack(&mut self, ack: u16, nack: &[u8], previous_run: bool) {
         self.state.lm.tx.on_ack(ack);
-        self.state
-            .lm
-            .tx
-            .on_nack_slots(nack, &self.state.lm.tx_run_slots);
+        let slots = if previous_run {
+            self.state.lm.tx_prev_run_slots
+        } else {
+            self.state.lm.tx_run_slots
+        };
+        self.state.lm.tx.on_nack_slots(nack, &slots);
         if nack_nonzero(nack) {
             self.nacks_recv = self.nacks_recv.wrapping_add(1);
         }
@@ -1753,7 +1804,7 @@ impl<P: Phy> LinkCore<P> {
 
             // Start of a new local TX run: clear the slot-position table.
             if local_phase == 0 {
-                self.state.lm.tx_run_slots = [None; WINDOW_SIZE];
+                self.state.lm.begin_tx_run();
             }
 
             if slotrequest {
@@ -1870,6 +1921,7 @@ impl<P: Phy> LinkCore<P> {
                     local_phase,
                     period as u32,
                     hw_slot.wrapping_add(1),
+                    false,
                     rx_buf,
                 )
                 .await?;
@@ -2044,6 +2096,8 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_runtime.candidate = stable;
                         self.cadence_runtime.probe_floor_short_us = short_floor;
                         self.cadence_runtime.probe_floor_long_us = long_floor;
+                        self.cadence_runtime.local_probe_floor_short_us = short_floor;
+                        self.cadence_runtime.local_probe_floor_long_us = long_floor;
                         self.cadence_runtime.stage = CadenceRunStage::Offer;
                     }
                     Ok(_) | Err(_) => {
@@ -2096,6 +2150,8 @@ impl<P: Phy> LinkCore<P> {
                 self.cadence_runtime.policy = policy;
                 self.cadence_runtime.probe_floor_short_us = short_floor;
                 self.cadence_runtime.probe_floor_long_us = long_floor;
+                self.cadence_runtime.local_probe_floor_short_us = short_floor;
+                self.cadence_runtime.local_probe_floor_long_us = long_floor;
                 // Compact Accept returns local feasibility floors in its two
                 // otherwise-unused epoch fields. They are overwritten by the
                 // first authoritative Probe descriptor.
@@ -2133,8 +2189,14 @@ impl<P: Phy> LinkCore<P> {
                             return;
                         }
                     };
-                    let short_floor = local_short.max(start_epoch.min(u16::MAX as u32) as u16);
-                    let long_floor = local_long.max(end_epoch.min(u16::MAX as u32) as u16);
+                    let peer_short = start_epoch.min(u16::MAX as u32) as u16;
+                    let peer_long = end_epoch.min(u16::MAX as u32) as u16;
+                    self.cadence_runtime.local_probe_floor_short_us = local_short;
+                    self.cadence_runtime.local_probe_floor_long_us = local_long;
+                    self.cadence_runtime.peer_probe_floor_short_us = peer_short;
+                    self.cadence_runtime.peer_probe_floor_long_us = peer_long;
+                    let short_floor = local_short.max(peer_short);
+                    let long_floor = local_long.max(peer_long);
                     let wire_lengths = self.data_wire_lengths(
                         self.cadence_runtime.contract,
                         self.cadence_runtime.fixed_wire,
@@ -2360,6 +2422,7 @@ impl<P: Phy> LinkCore<P> {
         // slot) - the beacon re-anchor must use this, not the slot count
         // at processing time.
         catch_slot: u32,
+        previous_tx_run: bool,
         rx_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<P::Error>> {
         let central = self.state.central;
@@ -2385,7 +2448,7 @@ impl<P: Phy> LinkCore<P> {
             } => {
                 self.state
                     .decrypt_payload(&mut self.phy, &mut payload, seq, central)?;
-                self.apply_ack_nack(ack, &nack);
+                self.apply_ack_nack(ack, &nack, previous_tx_run);
                 if !central
                     && self.state.status == LinkStatus::Disconnected
                     && !self.state.lm.rx.in_window(seq)
@@ -2401,13 +2464,13 @@ impl<P: Phy> LinkCore<P> {
             Packet::Ack { ack, nack } => {
                 link_rx = true;
                 data_plane_rx = true;
-                self.apply_ack_nack(ack, &nack);
+                self.apply_ack_nack(ack, &nack, previous_tx_run);
             }
             Packet::Drop { seq, ack, nack } => {
                 link_rx = true;
                 data_plane_rx = true;
                 self.state.lm.rx.skip_to(seq);
-                self.apply_ack_nack(ack, &nack);
+                self.apply_ack_nack(ack, &nack, previous_tx_run);
             }
             Packet::Cadence {
                 ack,
@@ -2428,7 +2491,7 @@ impl<P: Phy> LinkCore<P> {
                 flags,
             } => {
                 link_rx = true;
-                self.apply_ack_nack(ack, &nack);
+                self.apply_ack_nack(ack, &nack, previous_tx_run);
                 self.handle_cadence_control(
                     generation,
                     stage,
@@ -2506,7 +2569,7 @@ impl<P: Phy> LinkCore<P> {
                 }
                 // The acquiring peer's cumulative ACK advances the central's
                 // TX window from liveness traffic itself.
-                self.apply_ack_nack(ack, &[0; NACK_BYTES]);
+                self.apply_ack_nack(ack, &[0; NACK_BYTES], previous_tx_run);
                 self.clear_pending_drop();
 
                 if self.cadence_id == 0 {
@@ -2785,7 +2848,7 @@ impl<P: Phy> LinkCore<P> {
 
             // Start of a new local TX run: clear the slot-position table.
             if local_phase == 0 {
-                self.state.lm.tx_run_slots = [None; WINDOW_SIZE];
+                self.state.lm.begin_tx_run();
             }
 
             if slotrequest {
@@ -2916,8 +2979,15 @@ impl<P: Phy> LinkCore<P> {
                 let mut encoded = [0u8; MAX_PAYLOAD + 32];
                 encoded[..n].copy_from_slice(&buf[..n]);
                 let reply = self.decode_packet(&encoded[..n])?;
-                self.handle_rx_packet(reply, c_local_phase, period, collect_slot, rx_buf)
-                    .await?
+                self.handle_rx_packet(
+                    reply,
+                    c_local_phase,
+                    period,
+                    collect_slot,
+                    feedback_uses_previous_run(c_local_phase, local_phase, local_tx),
+                    rx_buf,
+                )
+                .await?
             }
             None => {
                 if !c_is_tx && c_local_phase < active_end {
@@ -3079,6 +3149,16 @@ impl<P: Phy> Central<P> {
         self.core.cadence_status()
     }
 
+    /// Effective directional probe floors agreed so far, in microseconds.
+    pub fn cadence_probe_bounds(&self) -> Option<CadenceProbeBounds> {
+        self.core.cadence_probe_bounds()
+    }
+
+    /// Candidate currently being armed, exercised, or reported.
+    pub fn cadence_candidate(&self) -> Option<CadenceProfile> {
+        self.core.cadence_candidate()
+    }
+
     pub async fn frame(
         &mut self,
         tx_payload: Option<&[u8]>,
@@ -3224,6 +3304,16 @@ impl<P: Phy> Peripheral<P> {
         self.core.cadence_status()
     }
 
+    /// Effective directional probe floors agreed so far, in microseconds.
+    pub fn cadence_probe_bounds(&self) -> Option<CadenceProbeBounds> {
+        self.core.cadence_probe_bounds()
+    }
+
+    /// Candidate currently being armed, exercised, or reported.
+    pub fn cadence_candidate(&self) -> Option<CadenceProfile> {
+        self.core.cadence_candidate()
+    }
+
     pub async fn frame(
         &mut self,
         tx_payload: Option<&[u8]>,
@@ -3297,6 +3387,19 @@ mod tests {
         assert_eq!(required_probe_rx(true, 0), 0);
         assert_eq!(required_probe_rx(true, 64), 1);
         assert_eq!(required_probe_rx(false, 8), 4);
+    }
+
+    #[test]
+    fn pipelined_feedback_selects_the_run_encoded_in_packet() {
+        // 8:2: first feedback is stale R-1; final feedback is collected while
+        // target phase 0 rotates R into previous.
+        assert!(feedback_uses_previous_run(8, 9, 8));
+        assert!(feedback_uses_previous_run(9, 0, 8));
+        // With a longer feedback run, middle packets already contain R and
+        // phase 0 has not rotated it yet.
+        assert!(!feedback_uses_previous_run(9, 10, 8));
+        assert!(!feedback_uses_previous_run(10, 11, 8));
+        assert!(feedback_uses_previous_run(11, 0, 8));
     }
 
     #[test]

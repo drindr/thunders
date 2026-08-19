@@ -32,6 +32,18 @@ impl TrafficContract {
     }
 }
 
+/// Directional feasibility floors observed during cadence negotiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CadenceProbeBounds {
+    /// This endpoint's forward/reverse floors.
+    pub local: (u16, u16),
+    /// Peer's advertised forward/reverse floors, when received.
+    pub peer: Option<(u16, u16)>,
+    /// Effective pair floors used to generate candidates.
+    pub effective: (u16, u16),
+}
+
 /// Policy controlling a bounded short-slot descent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -798,8 +810,8 @@ mod tests {
             planner.final_profile().unwrap()
         }
 
-        assert_eq!(run(345), CadenceProfile::new(345, 345, 8, 2, 0));
-        assert_eq!(run(469), CadenceProfile::new(469, 469, 8, 2, 0));
+        assert_eq!(run(333), CadenceProfile::new(333, 333, 8, 2, 0));
+        assert_eq!(run(457), CadenceProfile::new(457, 457, 8, 2, 0));
     }
 
     #[test]
