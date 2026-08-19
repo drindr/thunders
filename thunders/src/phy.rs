@@ -209,6 +209,13 @@ pub trait Phy {
         self.min_short_slot_period_us()
     }
 
+    /// Lowest theoretically schedulable probe period for a serialized packet
+    /// of `wire_len` bytes. Unlike the production cadence capability, this is
+    /// only a feasibility bound: stability is established by a bounded probe.
+    fn min_probe_slot_period_us(&self, _wire_len: u16) -> u16 {
+        self.min_probe_short_slot_period_us()
+    }
+
     /// Commit a profile that both peers just measured successfully. Unlike
     /// acquisition scheduling this must not silently clamp a value; return
     /// false when the exact descriptor cannot be applied.

@@ -43,12 +43,12 @@ use crate::{
         CadenceProfile, CadenceSearch, ProbeDecision, ProbeMetrics, TrafficContract,
     },
     config::{
-        Config, Role, CENTRAL_REPLY_TIMEOUT_US, MAX_PAYLOAD, NACK_BYTES,
-        PERIPHERAL_LISTEN_TIMEOUT_US, WINDOW_SIZE,
+        CENTRAL_REPLY_TIMEOUT_US, Config, MAX_PAYLOAD, NACK_BYTES, PERIPHERAL_LISTEN_TIMEOUT_US,
+        Role, WINDOW_SIZE,
     },
     error::Error,
     link_mgmt::{
-        nack_from_mask, nack_nonzero, nack_set, nack_vec, seq_gt, LinkMgmt, RxWindow, TxRunSlot,
+        LinkMgmt, RxWindow, TxRunSlot, nack_from_mask, nack_nonzero, nack_set, nack_vec, seq_gt,
     },
     packet::{CadenceStage, Packet},
     phy::{Phy, SlotProbeStats},
@@ -56,7 +56,7 @@ use crate::{
 };
 
 #[cfg(feature = "secure")]
-use crate::security::{make_nonce, make_nonce_13, Cipher, CipherMode, Security};
+use crate::security::{Cipher, CipherMode, Security, make_nonce, make_nonce_13};
 
 /// Size of the ChaCha20-Poly1305 authentication tag.
 #[cfg(feature = "secure")]
@@ -332,6 +332,7 @@ const CADENCE_PROTOCOL_OVERHEAD: u16 = 12;
 const CADENCE_FLAG_STABLE: u8 = 1;
 const CADENCE_FLAG_REJECT: u8 = 2;
 const CADENCE_FLAG_RELEASE: u8 = 4;
+const CADENCE_FLAG_CONFIRM: u8 = 8;
 
 fn cadence_exit_triggered(policy: CadenceExitPolicy, failed: u32, misses: u8) -> bool {
     (policy.delivery_failures != 0 && failed >= policy.delivery_failures as u32)
@@ -374,6 +375,12 @@ struct CadenceRuntime {
     stats_start: SlotProbeStats,
     delivery_failures_start: u32,
     probe_started: bool,
+    probe_floor_short_us: u16,
+    probe_floor_long_us: u16,
+    probe_superframes_current: u16,
+    probe_completed_superframes: u16,
+    probe_failed_bursts: u16,
+    confirming: bool,
     local_metrics: Option<ProbeMetrics>,
     peer_metrics: Option<ProbeMetrics>,
     apply_epoch: u32,
@@ -400,6 +407,12 @@ impl CadenceRuntime {
             stats_start: SlotProbeStats::default(),
             delivery_failures_start: 0,
             probe_started: false,
+            probe_floor_short_us: 0,
+            probe_floor_long_us: 0,
+            probe_superframes_current: 0,
+            probe_completed_superframes: 0,
+            probe_failed_bursts: 0,
+            confirming: false,
             local_metrics: None,
             peer_metrics: None,
             apply_epoch: 0,
@@ -676,6 +689,29 @@ impl<P: Phy> LinkCore<P> {
         }
     }
 
+    fn cadence_local_probe_floors(
+        &self,
+        contract: TrafficContract,
+        policy: CadenceProbePolicy,
+    ) -> Result<(u16, u16), CadenceError> {
+        let forward_wire = contract
+            .forward_max_payload
+            .checked_add(CADENCE_PROTOCOL_OVERHEAD)
+            .ok_or(CadenceError::WireLengthOverflow)?;
+        let reverse_wire = contract
+            .reverse_max_payload
+            .checked_add(CADENCE_PROTOCOL_OVERHEAD)
+            .ok_or(CadenceError::WireLengthOverflow)?;
+        Ok((
+            policy
+                .min_slot_us
+                .max(self.phy.min_probe_slot_period_us(forward_wire)),
+            policy
+                .min_slot_us
+                .max(self.phy.min_probe_slot_period_us(reverse_wire)),
+        ))
+    }
+
     fn request_cadence(
         &mut self,
         contract: TrafficContract,
@@ -687,7 +723,9 @@ impl<P: Phy> LinkCore<P> {
         if !self.phy.slot_profile_active() {
             return Err(CadenceError::Busy);
         }
-        if policy.min_slot_us < self.phy.min_probe_short_slot_period_us()
+        if policy.min_slot_us == 0
+            || policy.step_us == 0
+            || policy.probe_superframes == 0
             || policy.step_us > u8::MAX as u16
             || policy.safety_steps > u8::MAX as u16
             || (policy.probe_superframes as u32)
@@ -708,7 +746,11 @@ impl<P: Phy> LinkCore<P> {
             return Err(CadenceError::Busy);
         }
         let stable = self.cadence_runtime.stable;
-        let search = CadenceSearch::new(stable, contract, policy, CADENCE_PROTOCOL_OVERHEAD)?;
+        let (local_short_floor, local_long_floor) =
+            self.cadence_local_probe_floors(contract, policy)?;
+        if local_short_floor > stable.short_slot_us || local_long_floor > stable.long_slot_us {
+            return Err(CadenceError::InvalidPolicy);
+        }
         let generation = (self.cadence_runtime.generation.wrapping_add(1) & 0x7f).max(1);
         self.cadence_runtime = CadenceRuntime::new(stable);
         self.cadence_runtime.generation = generation;
@@ -716,11 +758,13 @@ impl<P: Phy> LinkCore<P> {
         self.cadence_ack = 0;
         self.cadence_runtime.contract = contract;
         self.cadence_runtime.policy = policy;
-        self.cadence_runtime.candidate = search.next_probe().unwrap_or(stable);
+        self.cadence_runtime.candidate = stable;
+        self.cadence_runtime.probe_floor_short_us = local_short_floor;
+        self.cadence_runtime.probe_floor_long_us = local_long_floor;
         if self.state.central {
-            self.cadence_runtime.search = Some(search);
-            // Even when the verified floor leaves no lower candidate, still
-            // run Offer/Accept and commit the traffic contract to both peers.
+            // Offer the known-stable anchor first. The peer returns its local
+            // feasibility floors in the compact Accept; only then does the
+            // central construct the authoritative empirical candidate list.
             self.cadence_runtime.stage = CadenceRunStage::Offer;
         } else {
             // The peripheral API only requests a contract; the central still
@@ -794,6 +838,20 @@ impl<P: Phy> LinkCore<P> {
         }
     }
 
+    fn start_failed_probe_release(&mut self) {
+        let active = self.cadence_runtime.stable;
+        let generation = (self.cadence_runtime.generation.wrapping_add(1) & 0x7f).max(1);
+        self.cadence_runtime = CadenceRuntime::new(active);
+        self.cadence_runtime.generation = generation;
+        self.cadence_runtime.releasing = true;
+        self.cadence_runtime.contract =
+            TrafficContract::new(MAX_PAYLOAD as u16, MAX_PAYLOAD as u16);
+        self.cadence_runtime.candidate = self.cadence_safe_profile;
+        self.cadence_id = generation;
+        self.cadence_ack = 0;
+        self.cadence_runtime.stage = CadenceRunStage::Offer;
+    }
+
     fn emergency_cadence_fallback(&mut self) {
         let fallback = self.phy.fallback_slot_period_us().max(1);
         self.phy.align_slot_period(fallback);
@@ -834,10 +892,34 @@ impl<P: Phy> LinkCore<P> {
     }
 
     fn start_probe_plan(&mut self, slot: u32, period: u32) {
-        let start = Self::align_future(slot, period, 8);
-        let end = start.wrapping_add(
-            period.saturating_mul(self.cadence_runtime.policy.probe_superframes as u32),
-        );
+        let base = Self::align_future(slot, period, 8);
+        let isolated = !self.cadence_runtime.confirming;
+        // Forward candidates exercise one phase-0 interval. Reverse candidates
+        // exercise one first-reverse-phase interval. Stable slots surround
+        // every trial so an unschedulable period cannot accumulate a whole
+        // superframe of hardware-counter phase error.
+        let reverse_trial = isolated
+            && self.cadence_runtime.candidate.long_slot_us
+                != self.cadence_runtime.stable.long_slot_us;
+        let start = if reverse_trial {
+            base.wrapping_add(self.cadence_runtime.stable.forward_slots as u32)
+        } else {
+            base
+        };
+        let target_samples = if self.cadence_runtime.confirming {
+            self.cadence_runtime.policy.probe_superframes.min(4)
+        } else {
+            self.cadence_runtime.policy.probe_superframes
+        };
+        let remaining =
+            target_samples.saturating_sub(self.cadence_runtime.probe_completed_superframes);
+        let probe_samples = remaining.min(1).max(1);
+        self.cadence_runtime.probe_superframes_current = probe_samples;
+        let end = if isolated {
+            start.wrapping_add(1)
+        } else {
+            start.wrapping_add(period.saturating_mul(probe_samples as u32))
+        };
         self.cadence_runtime.central_start = start;
         self.cadence_runtime.central_end = end;
         self.cadence_runtime.local_start = start;
@@ -880,23 +962,80 @@ impl<P: Phy> LinkCore<P> {
         ) else {
             return;
         };
-        let combined = ProbeMetrics::new(
+        let burst = ProbeMetrics::new(
             local.completed_superframes.min(peer.completed_superframes),
             local.forward_failures.saturating_add(peer.forward_failures),
             local.reverse_failures.saturating_add(peer.reverse_failures),
         );
+        let target_superframes = if self.cadence_runtime.confirming {
+            self.cadence_runtime.policy.probe_superframes.min(4)
+        } else {
+            self.cadence_runtime.policy.probe_superframes
+        };
+        let burst_pass = burst.forward_failures == 0 && burst.reverse_failures == 0;
+        self.cadence_runtime.probe_completed_superframes = self
+            .cadence_runtime
+            .probe_completed_superframes
+            .saturating_add(burst.completed_superframes);
+        if !burst_pass {
+            self.cadence_runtime.probe_failed_bursts =
+                self.cadence_runtime.probe_failed_bursts.saturating_add(1);
+        }
+        if self.cadence_runtime.probe_completed_superframes < target_superframes {
+            self.start_probe_plan(slot, period);
+            return;
+        }
+        // Real links have occasional empty/CRC-bad superframes even at the
+        // active profile. A candidate passes only when at least 7/8 of its
+        // independently restored bursts meet every timing and traffic check.
+        let failed = u16::from(
+            self.cadence_runtime.probe_failed_bursts > target_superframes.saturating_div(8),
+        );
+        let combined = ProbeMetrics::new(target_superframes, failed, failed);
         let candidate = self.cadence_runtime.candidate;
+        if self.cadence_runtime.confirming {
+            self.cadence_runtime.confirming = false;
+            if combined.completed_superframes >= target_superframes
+                && combined.forward_failures == 0
+                && combined.reverse_failures == 0
+            {
+                self.start_final_commit(slot, period, candidate);
+            } else {
+                // Confirmation failure never commits a contract/profile. Use
+                // the synchronized release handshake so a reporting peer also
+                // leaves the failed generation before the 600us fallback.
+                self.start_failed_probe_release();
+            }
+            return;
+        }
         let Some(search) = self.cadence_runtime.search.as_mut() else {
             return;
         };
         match search.record_probe(candidate, combined) {
             Ok(ProbeDecision::Incomplete(_)) => {}
+            Ok(ProbeDecision::Continue(next)) => {
+                self.cadence_runtime.candidate = next;
+                self.cadence_runtime.probe_completed_superframes = 0;
+                self.cadence_runtime.probe_failed_bursts = 0;
+                self.start_probe_plan(slot, period);
+            }
             Ok(ProbeDecision::Passed(next)) if search.final_profile().is_none() => {
                 self.cadence_runtime.candidate = next;
+                self.cadence_runtime.probe_completed_superframes = 0;
+                self.cadence_runtime.probe_failed_bursts = 0;
                 self.start_probe_plan(slot, period);
             }
             Ok(ProbeDecision::Passed(profile)) | Ok(ProbeDecision::Failed(profile)) => {
-                self.start_final_commit(slot, period, profile);
+                let tested = search.passed_probes() != 0 || search.failed_probes() != 0;
+                if tested {
+                    self.cadence_runtime.candidate = profile;
+                    self.cadence_runtime.probe_completed_superframes = 0;
+                    self.cadence_runtime.probe_failed_bursts = 0;
+                    self.cadence_runtime.confirming = true;
+                    self.start_probe_plan(slot, period);
+                } else {
+                    self.start_final_commit(slot, period, profile);
+                }
             }
             Err(e) => {
                 self.cadence_runtime.error = Some(e);
@@ -915,14 +1054,51 @@ impl<P: Phy> LinkCore<P> {
                 return;
             }
         }
+        let probe_transition = matches!(
+            self.cadence_runtime.stage,
+            CadenceRunStage::ProbePlan
+                | CadenceRunStage::Armed
+                | CadenceRunStage::Probing
+                | CadenceRunStage::Report
+        );
+        let probe_recovery_expired = probe_transition
+            && self.cadence_runtime.local_end != 0
+            && (slot.wrapping_sub(
+                self.cadence_runtime
+                    .local_end
+                    .wrapping_add(period.saturating_mul(64)),
+            ) as i32)
+                >= 0;
+        if self.state.central
+            && probe_recovery_expired
+            && self.cadence_runtime.peer_metrics.is_none()
+        {
+            // Do not depend on link-level misses here: Accept traffic may keep
+            // the link alive even when every Probe descriptor was lost.
+            self.start_failed_probe_release();
+            return;
+        }
         if self.missed_frames >= LINK_LOSS_THRESHOLD
-            && (self.cadence_active_contract.is_some() || self.cadence_runtime.releasing)
+            && ((!probe_transition
+                && (self.cadence_active_contract.is_some() || self.cadence_runtime.releasing))
+                || probe_recovery_expired)
         {
             self.emergency_cadence_fallback();
             return;
         }
         if self.cadence_runtime.stage == CadenceRunStage::Stable && self.cadence_auto_exit_due() {
             let _ = self.request_cadence_exit();
+        }
+        // The pipelined PHY publishes the operation for slot N two slots
+        // early. Leave enough lead after repeatedly sending Armed so the
+        // operation already contains the worst-contract CadenceSample when
+        // the isolated/full probe overlay starts.
+        if matches!(
+            self.cadence_runtime.stage,
+            CadenceRunStage::ProbePlan | CadenceRunStage::Armed
+        ) && (slot.wrapping_sub(self.cadence_runtime.local_start.wrapping_sub(3)) as i32) >= 0
+        {
+            self.cadence_runtime.stage = CadenceRunStage::Probing;
         }
         let in_probe_state = matches!(
             self.cadence_runtime.stage,
@@ -948,50 +1124,60 @@ impl<P: Phy> LinkCore<P> {
                 .phy
                 .slot_probe_stats()
                 .wrapping_delta(self.cadence_runtime.stats_start);
-            let expected = self
-                .cadence_runtime
-                .candidate
-                .superframe_us()
-                .saturating_mul(self.cadence_runtime.policy.probe_superframes as u32);
-            let timing_bad = delta.clock_us > expected.saturating_add(expected / 50 + 100);
-            let (local_tx, local_rx) = self.local_ratio();
+            let isolated = !self.cadence_runtime.confirming;
+            let reverse_trial = isolated
+                && self.cadence_runtime.candidate.long_slot_us
+                    != self.cadence_runtime.stable.long_slot_us;
+            let expected = if isolated {
+                if reverse_trial {
+                    self.cadence_runtime.candidate.long_slot_us as u32
+                } else {
+                    self.cadence_runtime.candidate.short_slot_us as u32
+                }
+            } else {
+                self.cadence_runtime
+                    .candidate
+                    .superframe_us()
+                    .saturating_mul(self.cadence_runtime.probe_superframes_current as u32)
+            };
+            let timing_bad = delta.clock_us.abs_diff(expected) > expected / 50 + 30;
+            let (local_tx, local_rx) = if isolated {
+                let local_transmits = self.state.central != reverse_trial;
+                (u16::from(local_transmits), u16::from(!local_transmits))
+            } else {
+                let (tx, rx) = self.local_ratio();
+                (tx as u16, rx as u16)
+            };
             let expected_tx =
-                self.cadence_runtime.policy.probe_superframes as u32 * local_tx as u32;
+                self.cadence_runtime.probe_superframes_current as u32 * local_tx as u32;
             let expected_rx =
-                self.cadence_runtime.policy.probe_superframes as u32 * local_rx as u32;
+                self.cadence_runtime.probe_superframes_current as u32 * local_rx as u32;
             // A timing-only probe could pass after losing every Sample. Require
             // at least half the planned TX completions and RX address catches;
             // the latter still tolerates the measured ~28% weak reverse raw
             // loss before ARQ.
             let samples_bad =
-                delta.tx_count < expected_tx / 2 || delta.address_events < expected_rx / 2;
-            let slots_bad = delta.slots
-                < self
-                    .cadence_runtime
-                    .policy
-                    .probe_superframes
+                delta.tx_count < expected_tx.div_ceil(2) || delta.crc_ok < expected_rx.div_ceil(2);
+            let expected_slots = if isolated {
+                1
+            } else {
+                self.cadence_runtime
+                    .probe_superframes_current
                     .saturating_sub(1) as u32
-                    * period;
+                    * period
+            };
+            let slots_bad = delta.slots < expected_slots;
             let local_bad = delta.op_late != 0
                 || timing_bad
                 || samples_bad
                 || slots_bad
                 || self.delivery_failures != self.cadence_runtime.delivery_failures_start;
-            let crc_bad = delta.crc_bad_long != 0;
-            let completed = self.cadence_runtime.policy.probe_superframes;
-            self.cadence_runtime.local_metrics = Some(if self.state.central {
-                ProbeMetrics::new(
-                    completed,
-                    u16::from(local_bad),
-                    u16::from(local_bad || crc_bad),
-                )
-            } else {
-                ProbeMetrics::new(
-                    completed,
-                    u16::from(local_bad || crc_bad),
-                    u16::from(local_bad),
-                )
-            });
+            let completed = self.cadence_runtime.probe_superframes_current;
+            self.cadence_runtime.local_metrics = Some(ProbeMetrics::new(
+                completed,
+                u16::from(local_bad),
+                u16::from(local_bad),
+            ));
             if self.state.central {
                 self.finish_probe(slot, period);
             } else {
@@ -1071,6 +1257,9 @@ impl<P: Phy> LinkCore<P> {
         if self.cadence_runtime.releasing {
             flags |= CADENCE_FLAG_RELEASE;
         }
+        if stage == CadenceStage::Probe && self.cadence_runtime.confirming {
+            flags |= CADENCE_FLAG_CONFIRM;
+        }
         if self.cadence_runtime.releasing
             && matches!(stage, CadenceStage::Release | CadenceStage::Commit)
         {
@@ -1124,7 +1313,11 @@ impl<P: Phy> LinkCore<P> {
                 self.cadence_runtime.central_start
             },
             end_epoch: self.cadence_runtime.central_end,
-            probe_slots: self.cadence_runtime.policy.probe_superframes,
+            probe_slots: if self.cadence_runtime.probe_superframes_current != 0 {
+                self.cadence_runtime.probe_superframes_current
+            } else {
+                self.cadence_runtime.policy.probe_superframes
+            },
             flags,
         })
     }
@@ -1559,6 +1752,9 @@ impl<P: Phy> LinkCore<P> {
                         | CadenceRunStage::Failed
                         | CadenceRunStage::Request
                         | CadenceRunStage::Accept
+                        | CadenceRunStage::Armed
+                        | CadenceRunStage::Probing
+                        | CadenceRunStage::Report
                 ) =>
             {
                 if matches!(
@@ -1603,20 +1799,24 @@ impl<P: Phy> LinkCore<P> {
                     safety_steps as u16,
                 );
                 let stable = self.cadence_runtime.stable;
-                match CadenceSearch::new(stable, contract, policy, CADENCE_PROTOCOL_OVERHEAD) {
-                    Ok(search) => {
+                match self.cadence_local_probe_floors(contract, policy) {
+                    Ok((short_floor, long_floor))
+                        if short_floor <= stable.short_slot_us
+                            && long_floor <= stable.long_slot_us =>
+                    {
                         self.cadence_runtime = CadenceRuntime::new(stable);
                         self.cadence_runtime.generation = generation;
                         self.cadence_id = generation;
                         self.cadence_ack = 0;
                         self.cadence_runtime.contract = contract;
                         self.cadence_runtime.policy = policy;
-                        self.cadence_runtime.candidate = search.next_probe().unwrap_or(stable);
-                        self.cadence_runtime.search = Some(search);
+                        self.cadence_runtime.candidate = stable;
+                        self.cadence_runtime.probe_floor_short_us = short_floor;
+                        self.cadence_runtime.probe_floor_long_us = long_floor;
                         self.cadence_runtime.stage = CadenceRunStage::Offer;
                     }
-                    Err(e) => {
-                        self.cadence_runtime.error = Some(e);
+                    Ok(_) | Err(_) => {
+                        self.cadence_runtime.error = Some(CadenceError::InvalidPolicy);
                         self.cadence_runtime.stage = CadenceRunStage::Failed;
                     }
                 }
@@ -1631,30 +1831,41 @@ impl<P: Phy> LinkCore<P> {
                         | CadenceRunStage::Accept
                 ) =>
             {
+                let contract = TrafficContract::new(forward_payload as u16, reverse_payload as u16);
+                let policy = CadenceProbePolicy::new(
+                    min_slot_us,
+                    step_us as u16,
+                    probe_slots,
+                    safety_steps as u16,
+                );
+                let floors = self.cadence_local_probe_floors(contract, policy);
                 if forward_payload as usize > MAX_PAYLOAD
                     || reverse_payload as usize > MAX_PAYLOAD
-                    || short_us < self.phy.min_probe_short_slot_period_us()
-                    || long_us < self.phy.min_long_slot_period_us()
                     || long_us < short_us
                     || step_us == 0
                     || probe_slots == 0
+                    || !matches!(floors, Ok((forward, reverse))
+                        if forward <= self.cadence_runtime.stable.short_slot_us
+                            && reverse <= self.cadence_runtime.stable.long_slot_us)
                 {
                     self.cadence_runtime.generation = generation;
                     self.cadence_runtime.error = Some(CadenceError::PeerRejected);
                     self.cadence_runtime.stage = CadenceRunStage::Failed;
                     return;
                 }
+                let (short_floor, long_floor) = floors.unwrap_or((short_us, long_us));
                 self.cadence_runtime.generation = generation;
                 self.cadence_id = generation;
                 self.cadence_ack = 0;
-                self.cadence_runtime.contract =
-                    TrafficContract::new(forward_payload as u16, reverse_payload as u16);
-                self.cadence_runtime.policy = CadenceProbePolicy::new(
-                    min_slot_us,
-                    step_us as u16,
-                    probe_slots,
-                    safety_steps as u16,
-                );
+                self.cadence_runtime.contract = contract;
+                self.cadence_runtime.policy = policy;
+                self.cadence_runtime.probe_floor_short_us = short_floor;
+                self.cadence_runtime.probe_floor_long_us = long_floor;
+                // Compact Accept returns local feasibility floors in its two
+                // otherwise-unused epoch fields. They are overwritten by the
+                // first authoritative Probe descriptor.
+                self.cadence_runtime.central_start = short_floor as u32;
+                self.cadence_runtime.central_end = long_floor as u32;
                 self.cadence_runtime.candidate = CadenceProfile::new(
                     short_us,
                     long_us,
@@ -1673,23 +1884,51 @@ impl<P: Phy> LinkCore<P> {
                     self.cadence_runtime.stage = CadenceRunStage::Failed;
                 } else if self.cadence_runtime.releasing {
                     self.start_final_commit(catch_slot, period, self.cadence_safe_profile);
-                } else if self
-                    .cadence_runtime
-                    .search
-                    .as_ref()
-                    .and_then(CadenceSearch::next_probe)
-                    .is_some()
-                {
-                    self.start_probe_plan(catch_slot, period);
                 } else {
-                    self.start_final_commit(catch_slot, period, self.cadence_runtime.stable);
+                    let short_floor = self
+                        .cadence_runtime
+                        .probe_floor_short_us
+                        .max(start_epoch.min(u16::MAX as u32) as u16);
+                    let long_floor = self
+                        .cadence_runtime
+                        .probe_floor_long_us
+                        .max(end_epoch.min(u16::MAX as u32) as u16);
+                    match CadenceSearch::new_with_floors(
+                        self.cadence_runtime.stable,
+                        self.cadence_runtime.contract,
+                        self.cadence_runtime.policy,
+                        CADENCE_PROTOCOL_OVERHEAD,
+                        short_floor,
+                        long_floor,
+                    ) {
+                        Ok(search) => {
+                            self.cadence_runtime.probe_floor_short_us = short_floor;
+                            self.cadence_runtime.probe_floor_long_us = long_floor;
+                            self.cadence_runtime.candidate =
+                                search.next_probe().unwrap_or(self.cadence_runtime.stable);
+                            let has_probe = search.next_probe().is_some();
+                            self.cadence_runtime.search = Some(search);
+                            if has_probe {
+                                self.start_probe_plan(catch_slot, period);
+                            } else {
+                                self.start_final_commit(
+                                    catch_slot,
+                                    period,
+                                    self.cadence_runtime.stable,
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            self.start_failed_probe_release();
+                        }
+                    }
                 }
             }
             (false, CadenceStage::Probe)
                 if generation == self.cadence_runtime.generation
                     && matches!(
                         self.cadence_runtime.stage,
-                        CadenceRunStage::Accept | CadenceRunStage::Armed
+                        CadenceRunStage::Accept | CadenceRunStage::Armed | CadenceRunStage::Report
                     ) =>
             {
                 let start_delta = start_epoch.wrapping_sub(epoch) as i32;
@@ -1699,6 +1938,8 @@ impl<P: Phy> LinkCore<P> {
                     let local_end = catch_slot.wrapping_add(end_delta as u32);
                     self.cadence_runtime.central_start = start_epoch;
                     self.cadence_runtime.central_end = end_epoch;
+                    self.cadence_runtime.probe_superframes_current = probe_slots;
+                    self.cadence_runtime.confirming = flags & CADENCE_FLAG_CONFIRM != 0;
                     self.cadence_runtime.local_start = local_start;
                     self.cadence_runtime.local_end = local_end;
                     self.cadence_runtime.probe_started = false;
@@ -1711,6 +1952,18 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_runtime.stable.idle_slots,
                     );
                     let p = self.cadence_runtime.candidate;
+                    if p.short_slot_us < self.cadence_runtime.probe_floor_short_us
+                        || p.long_slot_us < self.cadence_runtime.probe_floor_long_us
+                        || p.short_slot_us > p.long_slot_us
+                    {
+                        self.cadence_runtime.local_metrics = Some(ProbeMetrics::new(
+                            self.cadence_runtime.policy.probe_superframes,
+                            1,
+                            1,
+                        ));
+                        self.cadence_runtime.stage = CadenceRunStage::Report;
+                        return;
+                    }
                     self.phy.schedule_slot_probe(
                         p.short_slot_us,
                         p.long_slot_us,
@@ -1732,8 +1985,14 @@ impl<P: Phy> LinkCore<P> {
             }
             (true, CadenceStage::Report)
                 if generation == self.cadence_runtime.generation
-                    && self.cadence_runtime.stage == CadenceRunStage::Probing
-                    && short_us == self.cadence_runtime.candidate.short_slot_us =>
+                    && matches!(
+                        self.cadence_runtime.stage,
+                        CadenceRunStage::ProbePlan | CadenceRunStage::Probing
+                    )
+                    && start_epoch == self.cadence_runtime.central_start
+                    && end_epoch == self.cadence_runtime.central_end
+                    && short_us == self.cadence_runtime.candidate.short_slot_us
+                    && long_us == self.cadence_runtime.candidate.long_slot_us =>
             {
                 let failures = u16::from(flags & CADENCE_FLAG_STABLE == 0);
                 self.cadence_runtime.peer_metrics = Some(ProbeMetrics::new(
@@ -1989,8 +2248,7 @@ impl<P: Phy> LinkCore<P> {
                 ack,
             } if central => {
                 if cadence_ack == 0
-                    && (self.cadence_active_contract.is_some()
-                        || self.cadence_runtime.releasing)
+                    && (self.cadence_active_contract.is_some() || self.cadence_runtime.releasing)
                 {
                     // The peer independently entered uniform acquisition
                     // fallback after severe loss. Join it before processing
@@ -2739,7 +2997,11 @@ mod tests {
         assert!(!cadence_exit_triggered(policy, 1, 2));
         assert!(cadence_exit_triggered(policy, 2, 0));
         assert!(cadence_exit_triggered(policy, 0, 3));
-        assert!(!cadence_exit_triggered(CadenceExitPolicy::default(), 99, 99));
+        assert!(!cadence_exit_triggered(
+            CadenceExitPolicy::default(),
+            99,
+            99
+        ));
     }
 
     #[test]
@@ -3046,7 +3308,7 @@ mod tests {
         // nothing delivered yet: the ack is the "no ack" sentinel
         assert_eq!(r.ack(), 0xFFFF);
         assert_eq!(r.nack(), 0b10); // bit 1 = seq 1 missing
-                                    // deliver 0, then the head is 1 (not yet present)
+        // deliver 0, then the head is 1 (not yet present)
         assert_eq!(r.pop_head().unwrap().payload[0], 0);
         assert_eq!(r.peek_len(), None);
         assert_eq!(r.ack(), 0);

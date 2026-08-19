@@ -584,10 +584,35 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
     }
 
     fn min_probe_short_slot_period_us(&self) -> u16 {
-        // Production calibration may only search inside the backend's
-        // hardware-verified envelope. Testing below this value can change the
-        // two MPSL counters at different wall rates and destroy the epoch map.
-        self.min_short_slot_period_us()
+        self.min_probe_slot_period_us(0)
+    }
+
+    fn min_probe_slot_period_us(&self, wire_len: u16) -> u16 {
+        // A NORMAL request grants `period - 150us`.  Bound the candidate by
+        // measured setup/ramp plus actual packet airtime and the 40us radio
+        // hand-back tail.  This is deliberately not a stability claim: the
+        // API negotiation still exercises the exact profile on both chips.
+        let air = self.state.airtime_us(wire_len as usize);
+        let setup = self.state.tx_pre_delay_us.max(8);
+        let tx_ramp = self.state.tx_ramp_us.max(40);
+        let rx_ramp = self.state.rx_ramp_us.max(40);
+        let tx_grant = setup
+            .saturating_add(tx_ramp)
+            .saturating_add(air)
+            .saturating_add(MPSL_TX_TAIL_US as u32);
+        let rx_grant = rx_ramp
+            .saturating_add(air)
+            .saturating_add(MPSL_TX_TAIL_US as u32);
+        // Hardware measurements need ~25us beyond the algebraic fit for MPSL
+        // publication and phase jitter. At 2M this is 265 + airtime, making
+        // 1/4/8/16-byte contracts meaningfully probeable below 500us while a
+        // 32-byte contract remains conservatively near the known-safe anchor.
+        let empirical_margin = air.saturating_add(265);
+        tx_grant
+            .max(rx_grant)
+            .saturating_add(150)
+            .max(empirical_margin)
+            .min(u16::MAX as u32) as u16
     }
 
     fn schedule_probed_slot_profile(
@@ -599,8 +624,8 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         phase_offset: u16,
         apply_slot: u32,
     ) -> bool {
-        if short_us < self.min_probe_short_slot_period_us()
-            || long_us < self.min_long_slot_period_us()
+        if short_us < self.min_probe_slot_period_us(0)
+            || long_us < self.min_probe_slot_period_us(0)
             || short_us > long_us
             || period == 0
         {
@@ -654,7 +679,11 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         start_slot: u32,
         end_slot: u32,
     ) {
-        if end_slot.wrapping_sub(start_slot) as i32 <= 0 {
+        if end_slot.wrapping_sub(start_slot) as i32 <= 0
+            || short_us < self.min_probe_slot_period_us(0)
+            || long_us < self.min_probe_slot_period_us(0)
+            || short_us > long_us
+        {
             return;
         }
         let period = period.max(1) as u32;
@@ -672,7 +701,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
     fn slot_probe_stats(&self) -> SlotProbeStats {
         SlotProbeStats {
             slots: self.state.slot_count,
-            clock_us: radio::cyc() / radio::CPU_MHZ,
+            clock_us: self.state.probe_clock_us_total,
             completed: self
                 .state
                 .done_count

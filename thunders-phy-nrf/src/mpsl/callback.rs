@@ -78,6 +78,9 @@ fn nominal_for_slot(state: &MpslState, slot: u32) -> u32 {
 
 #[inline(always)]
 fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
+    if state.probe_armed && slot == state.probe_start_slot {
+        state.probe_clock_start_cyc = state.last_start_cyc;
+    }
     if state.profile_armed && slot_profile_due(slot, state.profile_apply_slot) {
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
         state.active_profile_short_us = state.profile_short_us;
@@ -89,6 +92,11 @@ fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
         state.profile_armed = false;
     }
     if state.probe_armed && slot_profile_due(slot, state.probe_end_slot) {
+        let elapsed = state
+            .last_start_cyc
+            .wrapping_sub(state.probe_clock_start_cyc)
+            / radio::CPU_MHZ;
+        state.probe_clock_us_total = state.probe_clock_us_total.wrapping_add(elapsed);
         state.probe_armed = false;
     }
 }

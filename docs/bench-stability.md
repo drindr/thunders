@@ -189,13 +189,13 @@ request.length_us   = next - 150
 - 长echo仍保留450 µs grant和约229 µs合法delay。
 
 曾A/B short=450：central达到2082/s，但5340 follower只能维持
-1820–1925/s，出现2/8 profile失步；因此能力协商必须使用**实测PHY下限**
-而非纯airtime预算。当前2M板广告500，1M LM20广告650；以后只有验证过
-的backend才可广告更短值。
+1820–1925/s，出现2/8 profile失步。这组结果现在只作为**已知安全anchor与失败
+样本**：500/600不是所有短包的硬下限，更短值必须在每次API协商期间按本次
+payload合同实际尝试后才能提交。
 
-验证：52840→5340连续 **8/8**（最高tx=506/rx=505）；完整六个MPSL
-方向 **6/6**，forward loss 0–0.13%，rev_arq 0.12–0.38%，包括原弱点
-LM20↔5340。bare继续走原uniform cadence，不参与profile。
+旧版固定500/600实现曾验证52840→5340连续 **8/8**，完整六个MPSL方向
+**6/6**；这些结果不能替代新版在线搜索的最终确认。bare继续走原uniform
+cadence，不参与profile。
 
 #### 4c-7. API触发的包长合同协商与有界稳定性Probe
 
@@ -209,18 +209,25 @@ Request（peripheral API时）→ Offer → Accept
 → Commit(apply_epoch) → Applied → 双方同epoch生效 → Data确认 → Stable
 ```
 
-central仍是唯一的candidate和绝对epoch决策者。Probe发送紧凑的
-`CadenceSample`，其真实序列化wire长度匹配合同的最坏Data长度；同时采样两端的
-slot wall time、slot/发送/ADDRESS成功数、`op_late`、长帧CRC和ARQ delivery
-failure。搜索从当前稳定short向下按固定步长尝试；首次失败即停止，最终值为最低
-通过candidate加policy安全档，并且不超过原稳定值。
+central仍是唯一的candidate和绝对epoch决策者。双方先用实际方向wire长度
+`payload + 12B protocol overhead`计算仅用于排除不可能值的PHY feasibility floor，
+peripheral把本地forward/reverse floor复用Accept的两个epoch字段返回，central取
+两端最大值；12B只适用于当前非secure wire格式，启用额外认证tag前必须相应扩展。
+**该公式不是最终slot选择**，500µs也不再是Probe硬下限。
 
-生产API只允许candidate处于**双方backend已经过硬件验证的floor及以上**。曾尝试
-在线Probe 475/450；失败候选会让两颗芯片的MPSL硬件计数以不同wall rate前进，
-之后即使恢复相同slot period，原absolute epoch映射也已失效。全600在线恢复实验
-仍不能可靠修复这个计数差，因此低于验证floor的实验不会暴露给生产API。未来某
-backend离线验证并降低其floor后，同一协商/Probe状态机才会使用更短candidate。
-包长决定需要覆盖的最坏wire长度，但不能绕过芯片对的验证floor。
+搜索分两轴进行：先固定已知稳定long，下降forward/short；确定通过值后再固定它，
+下降reverse/long，并始终保持`short <= long`。每个候选累计32次真实
+`CadenceSample`试发，wire长度覆盖对应方向最坏Data。为避免失败候选连续运行一整个
+superframe后永久拉开两颗MPSL硬件计数，每次试发只overlay一个目标phase，前后都恢复
+active profile；wall time由MPSL callback边界精确计量。至少7/8试发必须同时满足
+slot timing、TX完成、CRC正确接收、`op_late`和ARQ delivery条件。
+
+两轴搜索得到带`safety_steps`余量的pair后，还要把**完整最终profile**连续运行额外
+确认窗口；只有确认通过才进入两阶段Commit。确认失败或协议异常走同步Release，最迟
+在deadline后统一回到600µs acquisition，绝不提交未验证profile。本轮
+5340→52840 8B硬件追踪实际观察到`475/600 → 500/575 → 500/600确认`：前两项被在线
+测量淘汰，严格最终确认未通过后双方回到Idle/600，证明失败路径不会把候选误标为
+Stable；当前实验台的启动前acquisition仍有独立的间歇性空链路问题。
 
 最终profile生效后，超过对应方向合同长度的`frame()`发送明确返回
 `PayloadExceedsCadenceProfile`，不会自动扩slot或偷偷重协商。协商期间ARQ retry

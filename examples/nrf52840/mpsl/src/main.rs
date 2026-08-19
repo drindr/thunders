@@ -193,7 +193,7 @@ async fn main(spawner: Spawner) {
             loop {
                 #[cfg(feature = "cadence-probe")]
                 if !cadence_requested && central.status() == thunders::link::LinkStatus::Connected {
-                    let policy = thunders::CadenceProbePolicy::new(500, 25, 32, 0);
+                    let policy = thunders::CadenceProbePolicy::new(300, 25, 32, 0);
                     if let Ok(generation) = central.negotiate_cadence(
                         thunders::TrafficContract::new(BENCH_PAYLOAD_LEN as u16, BENCH_PAYLOAD_LEN as u16),
                         policy,

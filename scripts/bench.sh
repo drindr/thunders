@@ -125,7 +125,8 @@ run_pair() {
   [ -f "$celf" ] || { echo "missing $celf - run 'scripts/bench.sh build'"; exit 1; }
   [ -f "$pelf" ] || { echo "missing $pelf"; exit 1; }
 
-  for attempt in 1 2 3; do
+  local attempts="${BENCH_ATTEMPTS:-3}"
+  for attempt in $(seq 1 "$attempts"); do
     echo "== run $run (${secs}s, ${backend}, attempt $attempt) =="
     # The 5340 net core is debug-locked: every flash needs the erase-all
     # permission (which also wipes the app core). The bench firmware is
@@ -196,6 +197,10 @@ run_pair() {
     kill -KILL -- -"$ppid" 2>/dev/null || true
     wait "$ppid" 2>/dev/null || true
     echo "captured $LOGS/$run.central.log + $LOGS/$run.peripheral.log (central_ready=$c_ready)"
+    if [ "$attempts" -gt 1 ]; then
+      cp "$LOGS/$run.central.log" "$LOGS/$run.attempt${attempt}.central.log"
+      cp "$LOGS/$run.peripheral.log" "$LOGS/$run.attempt${attempt}.peripheral.log"
+    fi
 
     # The LM20 boot is intermittent (RtcDriver::init HardFault / Firmware
     # exited unexpectedly). Retry once when either side did not produce a

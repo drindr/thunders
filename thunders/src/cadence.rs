@@ -233,10 +233,14 @@ impl ProbeMetrics {
 pub enum ProbeDecision {
     /// The sample was incomplete; continue measuring the contained profile.
     Incomplete(CadenceProfile),
-    /// The current candidate passed; probe the contained next profile, or
-    /// use the contained final profile if the floor was reached.
+    /// The current candidate passed; use the contained final profile if the
+    /// complete directional search has finished.
     Passed(CadenceProfile),
-    /// The current candidate failed; use the contained final profile.
+    /// Continue empirical testing with the contained candidate. This is also
+    /// returned when a failed forward candidate advances the search to the
+    /// reverse axis using the last known passing forward period.
+    Continue(CadenceProfile),
+    /// The current reverse candidate failed; use the contained final profile.
     Failed(CadenceProfile),
 }
 
@@ -293,26 +297,32 @@ pub enum CadenceError {
     SearchFinished,
 }
 
-/// Deterministic short-slot descent planner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchAxis {
+    Forward,
+    Reverse,
+}
+
+/// Deterministic two-axis empirical cadence search state.
 ///
-/// Candidates are generated from `stable_profile.short_slot_us - step` down
-/// to `policy.min_slot_us`, with the final candidate clamped exactly to the
-/// floor. The planner stops at the floor or at the first completed failed
-/// probe. The final short slot is:
-///
-/// ```text
-/// min(lowest_passed + safety_steps * step, stable short slot)
-/// ```
-///
-/// If no lower candidate passes, the known-stable profile is retained.
+/// Forward candidates descend first while reverse remains stable. The lowest
+/// passing forward period is then held while reverse candidates descend. Each
+/// axis stops at its feasibility floor or its first failed candidate; safety
+/// steps are added independently before the final profile is returned. If no
+/// lower candidate passes on an axis, its known-stable period is retained.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CadenceSearch {
     stable_profile: CadenceProfile,
     traffic: TrafficContract,
     policy: CadenceProbePolicy,
     protocol_overhead: u16,
+    forward_floor_us: u16,
+    reverse_floor_us: u16,
+    axis: SearchAxis,
     current_probe_us: Option<u16>,
+    selected_forward_us: u16,
     lowest_passed_us: Option<u16>,
+    lowest_passed_reverse_us: Option<u16>,
     passed_probes: u16,
     failed_probes: u16,
     last_metrics: Option<ProbeMetrics>,
@@ -332,17 +342,42 @@ impl CadenceSearch {
         policy: CadenceProbePolicy,
         protocol_overhead: u16,
     ) -> Result<Self, CadenceError> {
+        Self::new_with_floors(
+            stable_profile,
+            traffic,
+            policy,
+            protocol_overhead,
+            policy.min_slot_us,
+            stable_profile.long_slot_us,
+        )
+    }
+
+    /// Create a two-axis empirical search with independent directional floors.
+    ///
+    /// The forward period is searched first. The selected passing forward
+    /// period is then held while reverse/idle periods are shortened. Floors
+    /// are feasibility bounds only; every selected production profile still
+    /// has to pass an actual bounded probe.
+    pub fn new_with_floors(
+        stable_profile: CadenceProfile,
+        traffic: TrafficContract,
+        policy: CadenceProbePolicy,
+        protocol_overhead: u16,
+        forward_floor_us: u16,
+        reverse_floor_us: u16,
+    ) -> Result<Self, CadenceError> {
         stable_profile.validate()?;
         if policy.min_slot_us == 0
             || policy.step_us == 0
             || policy.probe_superframes == 0
-            || policy.min_slot_us > stable_profile.short_slot_us
+            || forward_floor_us == 0
+            || reverse_floor_us == 0
+            || forward_floor_us > stable_profile.short_slot_us
+            || reverse_floor_us > stable_profile.long_slot_us
         {
             return Err(CadenceError::InvalidPolicy);
         }
 
-        // Validate the wire-length arithmetic at construction so every
-        // subsequent query is infallible.
         traffic
             .forward_max_payload
             .checked_add(protocol_overhead)
@@ -352,11 +387,22 @@ impl CadenceSearch {
             .checked_add(protocol_overhead)
             .ok_or(CadenceError::WireLengthOverflow)?;
 
-        let first_probe = first_lower_candidate(stable_profile.short_slot_us, &policy);
-        let final_profile = if first_probe.is_none() {
-            Some(stable_profile)
+        let first_forward = first_lower_candidate_from(
+            stable_profile.short_slot_us,
+            forward_floor_us,
+            policy.step_us,
+        );
+        let first_reverse = first_lower_candidate_from(
+            stable_profile.long_slot_us,
+            reverse_floor_us.max(stable_profile.short_slot_us),
+            policy.step_us,
+        );
+        let (axis, current_probe_us, final_profile) = if let Some(first) = first_forward {
+            (SearchAxis::Forward, Some(first), None)
+        } else if let Some(first) = first_reverse {
+            (SearchAxis::Reverse, Some(first), None)
         } else {
-            None
+            (SearchAxis::Forward, None, Some(stable_profile))
         };
 
         Ok(Self {
@@ -364,8 +410,13 @@ impl CadenceSearch {
             traffic,
             policy,
             protocol_overhead,
-            current_probe_us: first_probe,
+            forward_floor_us,
+            reverse_floor_us,
+            axis,
+            current_probe_us,
+            selected_forward_us: stable_profile.short_slot_us,
             lowest_passed_us: None,
+            lowest_passed_reverse_us: None,
             passed_probes: 0,
             failed_probes: 0,
             last_metrics: None,
@@ -410,18 +461,30 @@ impl CadenceSearch {
 
     /// Number of distinct lower candidates generated by this policy.
     pub fn candidate_count(&self) -> u16 {
-        let span = self.stable_profile.short_slot_us - self.policy.min_slot_us;
-        if span == 0 {
-            0
-        } else {
-            span / self.policy.step_us + u16::from(span % self.policy.step_us != 0)
-        }
+        let count = |from: u16, to: u16| {
+            let span = from.saturating_sub(to);
+            if span == 0 {
+                0
+            } else {
+                span / self.policy.step_us + u16::from(span % self.policy.step_us != 0)
+            }
+        };
+        count(self.stable_profile.short_slot_us, self.forward_floor_us).saturating_add(count(
+            self.stable_profile.long_slot_us,
+            self.reverse_floor_us.max(self.forward_floor_us),
+        ))
     }
 
     /// The candidate currently awaiting measurements, if any.
     pub fn next_probe(&self) -> Option<CadenceProfile> {
-        self.current_probe_us
-            .map(|short| self.stable_profile.with_short_slot(short))
+        self.current_probe_us.map(|period| match self.axis {
+            SearchAxis::Forward => self.stable_profile.with_short_slot(period),
+            SearchAxis::Reverse => CadenceProfile {
+                short_slot_us: self.selected_forward_us,
+                long_slot_us: period,
+                ..self.stable_profile
+            },
+        })
     }
 
     /// Record a metrics sample for the current candidate.
@@ -438,7 +501,7 @@ impl CadenceSearch {
         let Some(current_us) = self.current_probe_us else {
             return Err(CadenceError::SearchFinished);
         };
-        if candidate != self.stable_profile.with_short_slot(current_us) {
+        if self.next_probe() != Some(candidate) {
             return Err(CadenceError::WrongCandidate);
         }
 
@@ -447,27 +510,75 @@ impl CadenceSearch {
             return Ok(ProbeDecision::Incomplete(candidate));
         }
 
-        if metrics.is_pass(&self.policy) {
+        let passed = metrics.is_pass(&self.policy);
+        if passed {
             self.passed_probes = self.passed_probes.saturating_add(1);
-            self.lowest_passed_us = Some(current_us);
-            if current_us == self.policy.min_slot_us {
-                let final_profile = self.make_final_profile();
-                self.current_probe_us = None;
-                self.final_profile = Some(final_profile);
-                Ok(ProbeDecision::Passed(final_profile))
-            } else {
-                let next_us = next_lower_candidate(current_us, &self.policy);
-                self.current_probe_us = Some(next_us);
-                Ok(ProbeDecision::Passed(
-                    self.stable_profile.with_short_slot(next_us),
-                ))
-            }
         } else {
             self.failed_probes = self.failed_probes.saturating_add(1);
-            let final_profile = self.make_final_profile();
-            self.current_probe_us = None;
-            self.final_profile = Some(final_profile);
-            Ok(ProbeDecision::Failed(final_profile))
+        }
+
+        match self.axis {
+            SearchAxis::Forward => {
+                if passed {
+                    self.lowest_passed_us = Some(current_us);
+                }
+                let at_floor = current_us == self.forward_floor_us;
+                if passed && !at_floor {
+                    self.current_probe_us = Some(next_lower_candidate_from(
+                        current_us,
+                        self.forward_floor_us,
+                        self.policy.step_us,
+                    ));
+                    return Ok(ProbeDecision::Passed(
+                        self.next_probe().unwrap_or(candidate),
+                    ));
+                }
+
+                self.selected_forward_us = self.final_forward_us();
+                let reverse_floor = self.reverse_floor_us.max(self.selected_forward_us);
+                self.axis = SearchAxis::Reverse;
+                self.current_probe_us = first_lower_candidate_from(
+                    self.stable_profile.long_slot_us,
+                    reverse_floor,
+                    self.policy.step_us,
+                );
+                if let Some(next) = self.next_probe() {
+                    Ok(ProbeDecision::Continue(next))
+                } else {
+                    let final_profile = self.make_final_profile();
+                    self.final_profile = Some(final_profile);
+                    Ok(if passed {
+                        ProbeDecision::Passed(final_profile)
+                    } else {
+                        ProbeDecision::Failed(final_profile)
+                    })
+                }
+            }
+            SearchAxis::Reverse => {
+                if passed {
+                    self.lowest_passed_reverse_us = Some(current_us);
+                }
+                let reverse_floor = self.reverse_floor_us.max(self.selected_forward_us);
+                if passed && current_us != reverse_floor {
+                    self.current_probe_us = Some(next_lower_candidate_from(
+                        current_us,
+                        reverse_floor,
+                        self.policy.step_us,
+                    ));
+                    Ok(ProbeDecision::Continue(
+                        self.next_probe().unwrap_or(candidate),
+                    ))
+                } else {
+                    let final_profile = self.make_final_profile();
+                    self.current_probe_us = None;
+                    self.final_profile = Some(final_profile);
+                    Ok(if passed {
+                        ProbeDecision::Passed(final_profile)
+                    } else {
+                        ProbeDecision::Failed(final_profile)
+                    })
+                }
+            }
         }
     }
 
@@ -497,30 +608,48 @@ impl CadenceSearch {
         self.final_profile
     }
 
-    fn make_final_profile(&self) -> CadenceProfile {
+    /// Lowest reverse/idle candidate that completed a passing probe.
+    pub const fn lowest_passed_reverse_us(&self) -> Option<u16> {
+        self.lowest_passed_reverse_us
+    }
+
+    fn final_forward_us(&self) -> u16 {
         let base = self
             .lowest_passed_us
             .unwrap_or(self.stable_profile.short_slot_us);
         let margin = self.policy.safety_steps.saturating_mul(self.policy.step_us);
-        let short = base
+        base.saturating_add(margin)
+            .min(self.stable_profile.short_slot_us)
+    }
+
+    fn make_final_profile(&self) -> CadenceProfile {
+        let short = self.final_forward_us();
+        let base_long = self
+            .lowest_passed_reverse_us
+            .unwrap_or(self.stable_profile.long_slot_us);
+        let margin = self.policy.safety_steps.saturating_mul(self.policy.step_us);
+        let long = base_long
             .saturating_add(margin)
-            .min(self.stable_profile.short_slot_us);
-        self.stable_profile.with_short_slot(short)
+            .min(self.stable_profile.long_slot_us)
+            .max(short);
+        CadenceProfile {
+            short_slot_us: short,
+            long_slot_us: long,
+            ..self.stable_profile
+        }
     }
 }
 
-fn first_lower_candidate(stable_short_us: u16, policy: &CadenceProbePolicy) -> Option<u16> {
-    if stable_short_us == policy.min_slot_us {
+fn first_lower_candidate_from(current_us: u16, floor_us: u16, step_us: u16) -> Option<u16> {
+    if current_us <= floor_us {
         None
     } else {
-        Some(next_lower_candidate(stable_short_us, policy))
+        Some(next_lower_candidate_from(current_us, floor_us, step_us))
     }
 }
 
-fn next_lower_candidate(current_us: u16, policy: &CadenceProbePolicy) -> u16 {
-    current_us
-        .saturating_sub(policy.step_us)
-        .max(policy.min_slot_us)
+fn next_lower_candidate_from(current_us: u16, floor_us: u16, step_us: u16) -> u16 {
+    current_us.saturating_sub(step_us).max(floor_us)
 }
 
 #[cfg(test)]
@@ -667,6 +796,72 @@ mod tests {
         }
         assert_eq!(planner.final_profile(), Some(stable().with_short_slot(505)));
         assert_eq!(planner.lowest_passed_us(), Some(455));
+    }
+
+    #[test]
+    fn bidirectional_search_measures_forward_then_reverse() {
+        let policy = CadenceProbePolicy::new(300, 50, 2, 0);
+        let mut planner =
+            CadenceSearch::new_with_floors(stable(), traffic(), policy, 12, 400, 450).unwrap();
+
+        for forward in [550, 500, 450] {
+            let candidate = planner.next_probe().unwrap();
+            assert_eq!(
+                (candidate.short_slot_us, candidate.long_slot_us),
+                (forward, 600)
+            );
+            assert!(matches!(
+                planner.record_probe(candidate, pass(&policy)),
+                Ok(ProbeDecision::Passed(_))
+            ));
+        }
+        let candidate = planner.next_probe().unwrap();
+        assert_eq!(
+            (candidate.short_slot_us, candidate.long_slot_us),
+            (400, 600)
+        );
+        assert!(matches!(
+            planner.record_probe(candidate, pass(&policy)),
+            Ok(ProbeDecision::Continue(_))
+        ));
+
+        for reverse in [550, 500, 450] {
+            let candidate = planner.next_probe().unwrap();
+            assert_eq!(
+                (candidate.short_slot_us, candidate.long_slot_us),
+                (400, reverse)
+            );
+            let decision = planner.record_probe(candidate, pass(&policy)).unwrap();
+            if reverse == 450 {
+                assert_eq!(
+                    decision,
+                    ProbeDecision::Passed(CadenceProfile::new(400, 450, 8, 2, 0))
+                );
+            }
+        }
+        assert_eq!(
+            planner.final_profile(),
+            Some(CadenceProfile::new(400, 450, 8, 2, 0))
+        );
+        assert_eq!(planner.lowest_passed_us(), Some(400));
+        assert_eq!(planner.lowest_passed_reverse_us(), Some(450));
+    }
+
+    #[test]
+    fn forward_failure_still_empirically_searches_reverse() {
+        let policy = CadenceProbePolicy::new(300, 50, 2, 0);
+        let mut planner =
+            CadenceSearch::new_with_floors(stable(), traffic(), policy, 12, 400, 450).unwrap();
+        let first = planner.next_probe().unwrap();
+        planner.record_probe(first, pass(&policy)).unwrap();
+        let failed = planner.next_probe().unwrap();
+        let next = planner
+            .record_probe(failed, ProbeMetrics::new(policy.probe_superframes, 1, 0))
+            .unwrap();
+        assert_eq!(
+            next,
+            ProbeDecision::Continue(CadenceProfile::new(550, 550, 8, 2, 0))
+        );
     }
 
     #[test]
