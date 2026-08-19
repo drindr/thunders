@@ -240,6 +240,22 @@ follower若恰好错过callback起始时间戳会得到`clock_us=0`，此时使�
 `delivery_failures=0`。这证明codec确实越过apply epoch并承载真实双向数据，而不只是
 host端字节测试；实验台仍存在协商前空链路及弱向启动波动。
 
+同一52840→5340组合随后用默认`min=300, step=25, probe=32`分别协商五种精确payload：
+
+| payload | fixed Data wire（8:2） | 2M feasibility floor | 实测Stable |
+|---:|---:|---:|---:|
+| 1B | 7B | 345µs | 500/600µs |
+| 4B | 10B | 357µs | 500/600µs |
+| 8B | 14B | 373µs | 500/600µs |
+| 16B | 22B | 405µs | 500/600µs |
+| 32B | 38B | 469µs | 500/600µs |
+
+这同时证明两件不同的事：软件的候选下界确实随包长变化（纯planner测试在全部候选通过
+时分别得到345/345和469/469），但**最终稳定值不保证随包长不同**。本板对上475/575
+以下候选失败的主导因素是MPSL grant/PLL/phase稳定性，而不是airtime；长度只改变可尝试
+范围，实测稳定性仍可被同一个长度无关的硬件瓶颈钳在500/600。把公式floor直接宣称为
+稳定slot反而违反“协商期间实际尝试后决定”的要求。
+
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
 自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收

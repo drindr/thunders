@@ -779,6 +779,30 @@ mod tests {
     }
 
     #[test]
+    fn payload_specific_floors_produce_different_profiles_when_hardware_passes() {
+        fn run(floor: u16) -> CadenceProfile {
+            let policy = CadenceProbePolicy::new(300, 25, 2, 0);
+            let mut planner = CadenceSearch::new_with_wire_lengths_and_floors(
+                stable(),
+                TrafficContract::new(1, 1),
+                policy,
+                7,
+                7,
+                floor,
+                floor,
+            )
+            .unwrap();
+            while let Some(candidate) = planner.next_probe() {
+                planner.record_probe(candidate, pass(&policy)).unwrap();
+            }
+            planner.final_profile().unwrap()
+        }
+
+        assert_eq!(run(345), CadenceProfile::new(345, 345, 8, 2, 0));
+        assert_eq!(run(469), CadenceProfile::new(469, 469, 8, 2, 0));
+    }
+
+    #[test]
     fn wire_length_overflow_is_rejected() {
         let traffic = TrafficContract::new(u16::MAX, 1);
         let err = CadenceSearch::new(stable(), traffic, Default::default(), 1).unwrap_err();
