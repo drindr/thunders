@@ -251,11 +251,20 @@ pub unsafe extern "C" fn timeslot_cb(
                         // (the reverse dead state).
                         let next = 1 - ei;
                         let pending_len = state.ops[next].tx_buf[0] as usize;
-                        let air = if state.ops[next].kind == OpKind::Tx as u8 && pending_len > 0 {
+                        let pending_is_next_tx = state.ops[next].kind == OpKind::Tx as u8
+                            && state.ops[next].target == slot.wrapping_add(1)
+                            && pending_len > 0;
+                        let air = if pending_is_next_tx {
                             state.airtime_us(pending_len)
                         } else {
                             state.airtime_us(state.ops[ei].rx_result as usize)
                         } as i32;
+                        let tx_nominal = if pending_is_next_tx {
+                            nominal_for_slot(state, state.ops[next].target)
+                        } else {
+                            next_nominal
+                        };
+                        let tx_slot_len = tx_nominal.saturating_sub(150) as i32;
                         // Everything below is measured; the only fixed
                         // constant is the named tail margin (the address
                         // anchor is mode-dependent).
@@ -267,19 +276,25 @@ pub unsafe extern "C" fn timeslot_cb(
                         let peer_tx_ramp = state.peer_tx_ramp_us as i32;
                         let own_tx_ramp = state.tx_ramp_us as i32;
                         let setup = state.tx_pre_delay_us as i32;
-                        let w = state.peer_rx_window_us as i32;
+                        // Advertised W is measured from RXEN (minus the fixed
+                        // 40us shutdown reserve), not from READY. Clamp that
+                        // raw duration to both candidate idle and hard edges,
+                        // then remove the peer ramp only for centering.
+                        let w_raw = (state.peer_rx_window_us as i32)
+                            .min((tx_slot_len - 100).max(0))
+                            .min((tx_slot_len - 40 - peer_rx).max(0));
+                        let w_ready = (w_raw - peer_rx_ramp).max(0);
                         // Forward catch anchor: peer TX on-air at our slot
                         // start = own_rx + own_addr - address_anchor.
                         let forward_catch = own_rx + own_addr - state.air_prefix_us as i32;
                         let delay = forward_catch - (peer_tx_en + peer_tx_ramp)
                             + (peer_rx + peer_rx_ramp)
-                            + (w - air) / 2
+                            + (w_ready - air) / 2
                             - setup
                             - own_tx_ramp;
-                        // The TX op must fit the grant: setup + delay +
-                        // own TX ramp + air + tail <= slot_len.
-                        let max_delay =
-                            state.slot_len as i32 - setup - own_tx_ramp - air - MPSL_TX_TAIL_US;
+                        // The pending TX op must fit its target grant: setup +
+                        // delay + own TX ramp + air + tail <= tx_slot_len.
+                        let max_delay = tx_slot_len - setup - own_tx_ramp - air - MPSL_TX_TAIL_US;
                         // The peer-window fit (our-slot time): the frame
                         // must END before the peer's listen window ends, or
                         // its tail is clipped against the MPSL hard edge and
@@ -293,7 +308,7 @@ pub unsafe extern "C" fn timeslot_cb(
                         // start in our time is the forward-catch anchor
                         // minus where their TX started in their time.
                         let peer_slot_start = forward_catch - (peer_tx_en + peer_tx_ramp);
-                        let window_end = peer_slot_start + peer_rx + peer_rx_ramp + w;
+                        let window_end = peer_slot_start + peer_rx + w_raw;
                         let peer_fit = window_end - (setup + own_tx_ramp + air) - MPSL_TX_TAIL_US;
                         state.tx_delay_us = delay.clamp(0, max_delay.min(peer_fit).max(0)) as u32;
                     }

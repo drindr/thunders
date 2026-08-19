@@ -386,6 +386,12 @@ fn required_probe_rx(confirming: bool, expected_rx: u32) -> u32 {
     }
 }
 
+fn probe_has_sufficient_arm_lead(start_delta: i32) -> bool {
+    // A descriptor caught two slots ahead can still publish the target op
+    // through the depth-two ring. One slot of lead cannot.
+    start_delta >= 2
+}
+
 fn feedback_uses_previous_run(
     collected_local_phase: u32,
     target_local_phase: u32,
@@ -2281,7 +2287,23 @@ impl<P: Phy> LinkCore<P> {
                 }
                 let start_delta = start_epoch.wrapping_sub(epoch) as i32;
                 let end_delta = end_epoch.wrapping_sub(epoch) as i32;
-                if start_delta > 0 && end_delta > start_delta {
+                if end_delta > start_delta && !probe_has_sufficient_arm_lead(start_delta) {
+                    self.cadence_runtime.central_start = start_epoch;
+                    self.cadence_runtime.central_end = end_epoch;
+                    self.cadence_runtime.probe_superframes_current = probe_slots;
+                    self.cadence_runtime.confirming = flags & CADENCE_FLAG_CONFIRM != 0;
+                    self.cadence_runtime.candidate = CadenceProfile::new(
+                        short_us,
+                        long_us,
+                        self.cadence_runtime.stable.forward_slots,
+                        self.cadence_runtime.stable.reverse_slots,
+                        self.cadence_runtime.stable.idle_slots,
+                    );
+                    self.cadence_runtime.local_metrics = Some(ProbeMetrics::new(0, 1, 1));
+                    self.cadence_runtime.stage = CadenceRunStage::Report;
+                    return;
+                }
+                if probe_has_sufficient_arm_lead(start_delta) && end_delta > start_delta {
                     let local_start = catch_slot.wrapping_add(start_delta as u32);
                     let local_end = catch_slot.wrapping_add(end_delta as u32);
                     self.cadence_runtime.central_start = start_epoch;
@@ -3431,6 +3453,14 @@ mod tests {
         assert_eq!(required_probe_rx(true, 0), 0);
         assert_eq!(required_probe_rx(true, 64), 1);
         assert_eq!(required_probe_rx(false, 8), 4);
+    }
+
+    #[test]
+    fn probe_arm_lead_covers_depth_two_publication() {
+        assert!(!probe_has_sufficient_arm_lead(-1));
+        assert!(!probe_has_sufficient_arm_lead(0));
+        assert!(!probe_has_sufficient_arm_lead(1));
+        assert!(probe_has_sufficient_arm_lead(2));
     }
 
     #[test]

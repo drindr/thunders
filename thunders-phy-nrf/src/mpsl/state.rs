@@ -189,7 +189,8 @@ pub struct MpslState {
     /// corrects on this even when the frame's CRC failed).
     pub(crate) addr_seen: bool,
     pub(crate) rx_misses: u32,
-    /// Our measured RX listen window (us, post-ramp), advertised in the beacon.
+    /// Measured RX window duration from RXEN, excluding the fixed 40us
+    /// shutdown reserve; advertised in the beacon.
     pub(crate) rx_window_us: u32,
     /// The follower's TX delay (us from slot start to TXEN): places the echo
     /// in the middle of the peer's advertised RX window. Recomputed on each
