@@ -262,10 +262,11 @@ pub trait Phy {
         _long_us: u16,
         _period: u16,
         _short_phases: u16,
-        _phase_offset: u16,
+        _central_start_slot: u32,
         _start_slot: u32,
         _end_slot: u32,
-    ) {
+    ) -> bool {
+        false
     }
 
     /// Cumulative counters for cadence-probe evaluation.

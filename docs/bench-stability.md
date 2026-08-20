@@ -342,11 +342,28 @@ follower:  phase=[9,0,1] nominal=[600,600,600]
 ```
 
 因此静态epoch差值和phase编号一致，但central进入490µs Probe时，follower在对应phase-0既未
-启用candidate nominal，也没有发布RX op。单纯把最低lead从2提高到3/4没有产生任何Stable，
-说明问题不是阈值少1 slot，而是central即使没有收到Armed也会在`start-3`自行进入Probing。
-当forward Probe descriptor/Armed握手未及时闭合时，两端会单边执行不同overlay。下一修复应
-把Probe改成真正的两阶段arm：central只有收到匹配Armed且仍有发布余量才执行；否则为同一
-candidate重新分配future epoch，不能按本地时钟自行开始。
+启用candidate nominal，也没有发布RX op。根因最终定位为：API协商期间仍收到的周期Beacon
+满足旧`cadence_ack==0`条件，调用`align_slot_period(600)`并在descriptor与start之间撤销
+follower的probe overlay；同时central过去会在未收到Armed时按本地`start-3`单边开始。
+
+修复后central不预先arm，只有收到匹配且lead足够的Armed才schedule本地overlay；未Armed窗口
+结束后同candidate换新epoch。Beacon在任何API cadence transaction中都不得调用uniform
+align。Probe phase不再依赖可能陈旧的`slot_offset`，而以完整
+`central_start + (local_slot-local_start)`计算（包括两端独立u32 wrap）；`probe_armed`改为
+Release/Acquire atomic发布。修复后的trace中两端phase、candidate nominal及TX/RX op一致。
+
+硬件结果随即从全部0 Stable变为：lead=4的8次冷启动有1次选择并提交`440/440µs`；生产默认
+lead=2的8次有1次提交`500/500µs`。500/500在约20秒内维持1985–1990 slots/s、双向Data持续、
+`delivery_failures=0`，440/440也短暂达到约2101 slots/s。但两者随后都触发安全fallback到
+600µs，说明单边Probe根因已修复并真正解锁sub-500搜索，下一瓶颈已转为提交后的长期
+phase稳定性；不能把140ms最终确认当作生产稳定证明。
+
+Commit阶段也改用`apply_epoch-local_apply`得到权威pending slot offset；Applying窗口的Link op
+使用descriptor phase，完成apply后才发布全局offset，避免Probe正确而生产profile又退回陈旧
+`slot_offset`。新增2048-superframe（约8–10秒）强制Probation：期间恢复正常ARQ tick，任何
+新delivery failure或16次连续miss都会由central同步Release，只有deadline通过才对API公开
+Stable。此前会短暂报告440/440、500/500的同类8次A/B在Probation版本中为0 Stable，证明
+不可持续profile不再被误报，同时仍保持600µs安全回退。
 
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、

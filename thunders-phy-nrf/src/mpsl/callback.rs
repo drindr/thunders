@@ -55,18 +55,19 @@ fn probe_trace_index(state: &MpslState, slot: u32) -> Option<usize> {
 #[inline(always)]
 fn nominal_for_slot(state: &MpslState, slot: u32) -> u32 {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-    if state.probe_armed
+    if state.probe_armed.load(Ordering::Acquire)
         && slot_profile_due(slot, state.probe_start_slot)
         && slot_before(slot, state.probe_end_slot)
     {
-        return phase_nominal(
-            slot,
-            state.probe_short_us,
-            state.probe_long_us,
-            state.probe_period,
-            state.probe_short_phases,
-            state.probe_phase_offset,
-        );
+        let phase = state
+            .probe_central_start_slot
+            .wrapping_add(slot.wrapping_sub(state.probe_start_slot))
+            % state.probe_period.max(1);
+        return if phase < state.probe_short_phases {
+            state.probe_short_us
+        } else {
+            state.probe_long_us
+        };
     }
     if state.profile_armed && slot_profile_due(slot, state.profile_apply_slot) {
         return phase_nominal(
@@ -109,7 +110,7 @@ fn raw_probe_stats(state: &MpslState) -> SlotProbeStats {
 
 #[inline(always)]
 fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
-    if state.probe_armed && slot == state.probe_start_slot {
+    if state.probe_armed.load(Ordering::Acquire) && slot == state.probe_start_slot {
         state.probe_clock_start_cyc = state.last_start_cyc;
         state.probe_raw_start = raw_probe_stats(state);
         state.probe_started = true;
@@ -124,7 +125,7 @@ fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
         state.active_profile_armed = true;
         state.profile_armed = false;
     }
-    if state.probe_armed && slot_profile_due(slot, state.probe_end_slot) {
+    if state.probe_armed.load(Ordering::Acquire) && slot_profile_due(slot, state.probe_end_slot) {
         let delta = if state.probe_started {
             let mut delta = raw_probe_stats(state).wrapping_delta(state.probe_raw_start);
             delta.clock_us = state
@@ -147,7 +148,7 @@ fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
         core::sync::atomic::compiler_fence(Ordering::Release);
         state.probe_stats_seq.fetch_add(1, Ordering::Release);
         state.probe_started = false;
-        state.probe_armed = false;
+        state.probe_armed.store(false, Ordering::Release);
     }
 }
 
@@ -216,8 +217,10 @@ pub unsafe extern "C" fn timeslot_cb(
         let trace_index = probe_trace_index(state, slot);
         if let Some(ti) = trace_index {
             state.probe_trace_slot[ti] = slot;
-            state.probe_trace_phase[ti] =
-                slot.wrapping_add(state.probe_phase_offset) % state.probe_period.max(1);
+            state.probe_trace_phase[ti] = state
+                .probe_central_start_slot
+                .wrapping_add(slot.wrapping_sub(state.probe_start_slot))
+                % state.probe_period.max(1);
             state.probe_trace_nominal[ti] = current_nominal;
             state.probe_trace_exec_kind[ti] = executed_kind as u32;
             state.probe_trace_exec_target[ti] = exec.map(|i| state.ops[i].target).unwrap_or(0);
@@ -403,7 +406,7 @@ pub unsafe extern "C" fn timeslot_cb(
                 let nominal = current_nominal as i32;
                 let new_dist = (nominal + corr).clamp(nominal - 20, nominal + 20) as u32;
                 let freeze_probe = cfg!(feature = "pll-probe-freeze")
-                    && state.probe_armed
+                    && state.probe_armed.load(Ordering::Acquire)
                     && slot_profile_due(slot, state.probe_start_slot)
                     && slot_before(slot, state.probe_end_slot);
                 if !cfg!(feature = "pll-fixed") && !freeze_probe && new_dist != state.slot_distance

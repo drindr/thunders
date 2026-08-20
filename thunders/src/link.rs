@@ -348,6 +348,7 @@ const CADENCE_FLAG_RELEASE: u8 = 4;
 const CADENCE_FLAG_CONFIRM: u8 = 8;
 const CADENCE_FLAG_FIXED_WIRE: u8 = 16;
 const CADENCE_FLAG_PROBE_ABORT: u8 = 32;
+const CADENCE_PROBATION_SUPERFRAMES: u32 = 2048;
 
 fn cadence_exit_triggered(policy: CadenceExitPolicy, failed: u32, misses: u8) -> bool {
     (policy.delivery_failures != 0 && failed >= policy.delivery_failures as u32)
@@ -401,6 +402,10 @@ fn probe_has_sufficient_arm_lead(start_delta: i32) -> bool {
     start_delta >= PROBE_ARM_LEAD_SLOTS
 }
 
+fn descriptor_phase(local_slot: u32, local_start: u32, central_start: u32, period: u32) -> u32 {
+    central_start.wrapping_add(local_slot.wrapping_sub(local_start)) % period.max(1)
+}
+
 fn feedback_uses_previous_run(
     collected_local_phase: u32,
     target_local_phase: u32,
@@ -424,6 +429,7 @@ enum CadenceRunStage {
     Report,
     Commit,
     Applying,
+    Probation,
     Stable,
     Failed,
 }
@@ -458,6 +464,9 @@ struct CadenceRuntime {
     local_metrics: Option<ProbeMetrics>,
     peer_metrics: Option<ProbeMetrics>,
     apply_epoch: u32,
+    pending_slot_offset: u32,
+    probation_deadline: u32,
+    probation_failures_start: u32,
     commit_changes_profile: bool,
     releasing: bool,
     release_deadline: u32,
@@ -496,6 +505,9 @@ impl CadenceRuntime {
             local_metrics: None,
             peer_metrics: None,
             apply_epoch: 0,
+            pending_slot_offset: 0,
+            probation_deadline: 0,
+            probation_failures_start: 0,
             commit_changes_profile: false,
             releasing: false,
             release_deadline: 0,
@@ -885,7 +897,7 @@ impl<P: Phy> LinkCore<P> {
             CadenceRunStage::Probing => CadenceNegotiationStatus::Probing {
                 candidate: self.cadence_runtime.candidate,
             },
-            CadenceRunStage::Commit | CadenceRunStage::Applying => {
+            CadenceRunStage::Commit | CadenceRunStage::Applying | CadenceRunStage::Probation => {
                 CadenceNegotiationStatus::Applying {
                     profile: self.cadence_runtime.stable,
                 }
@@ -1047,7 +1059,7 @@ impl<P: Phy> LinkCore<P> {
         }
         if !matches!(
             self.cadence_runtime.stage,
-            CadenceRunStage::Stable | CadenceRunStage::Failed
+            CadenceRunStage::Stable | CadenceRunStage::Probation | CadenceRunStage::Failed
         ) {
             return Err(CadenceError::Busy);
         }
@@ -1070,6 +1082,9 @@ impl<P: Phy> LinkCore<P> {
     }
 
     fn complete_cadence_apply(&mut self) {
+        if !self.state.central && self.cadence_runtime.apply_epoch != 0 {
+            self.state.slot_offset = self.cadence_runtime.pending_slot_offset;
+        }
         if self.cadence_runtime.releasing {
             self.cadence_active_contract = None;
             self.cadence_active_fixed_wire = false;
@@ -1086,7 +1101,9 @@ impl<P: Phy> LinkCore<P> {
             self.cadence_active_contract = Some(self.cadence_runtime.contract);
             self.cadence_active_fixed_wire = self.cadence_runtime.fixed_wire;
             self.fixed_legacy_rx_grace = u8::from(self.cadence_runtime.fixed_wire) * 2;
-            self.cadence_runtime.stage = CadenceRunStage::Stable;
+            self.cadence_runtime.probation_deadline = 0;
+            self.cadence_runtime.probation_failures_start = self.delivery_failures;
+            self.cadence_runtime.stage = CadenceRunStage::Probation;
             self.cadence_exit_failure_baseline = self.delivery_failures;
         }
     }
@@ -1196,17 +1213,29 @@ impl<P: Phy> LinkCore<P> {
         self.cadence_runtime.delivery_failures_start = self.delivery_failures;
         self.cadence_runtime.local_metrics = None;
         self.cadence_runtime.peer_metrics = None;
+        // The central deliberately does not arm its PHY yet. The peripheral
+        // may arm this bounded descriptor, but the central joins only after a
+        // matching Armed reply proves both sides know the same future window.
+        self.cadence_runtime.stage = CadenceRunStage::ProbePlan;
+    }
+
+    fn arm_central_probe(&mut self) -> bool {
         let p = self.cadence_runtime.candidate;
-        self.phy.schedule_slot_probe(
+        self.cadence_runtime.stats_start = self.phy.slot_probe_stats();
+        self.cadence_runtime.delivery_failures_start = self.delivery_failures;
+        if !self.phy.schedule_slot_probe(
             p.short_slot_us,
             p.long_slot_us,
             p.period_slots() as u16,
             p.forward_slots,
-            0,
-            start,
-            end,
-        );
-        self.cadence_runtime.stage = CadenceRunStage::ProbePlan;
+            self.cadence_runtime.central_start,
+            self.cadence_runtime.local_start,
+            self.cadence_runtime.local_end,
+        ) {
+            return false;
+        }
+        self.cadence_runtime.stage = CadenceRunStage::Probing;
+        true
     }
 
     fn start_final_commit(&mut self, slot: u32, period: u32, profile: CadenceProfile) {
@@ -1366,24 +1395,51 @@ impl<P: Phy> LinkCore<P> {
             self.emergency_cadence_fallback();
             return;
         }
+        if self.cadence_runtime.stage == CadenceRunStage::Probation {
+            if self.cadence_runtime.probation_deadline == 0 {
+                self.cadence_runtime.probation_deadline =
+                    slot.wrapping_add(period.saturating_mul(CADENCE_PROBATION_SUPERFRAMES));
+            }
+            let probation_failed = self.delivery_failures
+                != self.cadence_runtime.probation_failures_start
+                || self.missed_frames >= LINK_LOSS_THRESHOLD;
+            if self.state.central && probation_failed {
+                self.start_failed_probe_release();
+                return;
+            }
+            if (slot.wrapping_sub(self.cadence_runtime.probation_deadline) as i32) >= 0 {
+                self.cadence_runtime.stage = CadenceRunStage::Stable;
+                self.cadence_exit_failure_baseline = self.delivery_failures;
+            }
+        }
         if self.cadence_runtime.stage == CadenceRunStage::Stable && self.cadence_auto_exit_due() {
             let _ = self.request_cadence_exit();
         }
-        // The pipelined PHY publishes the operation for slot N two slots
-        // early. Leave enough lead after repeatedly sending Armed so the
-        // operation already contains the worst-contract CadenceSample when
-        // the isolated/full probe overlay starts.
-        if matches!(
-            self.cadence_runtime.stage,
-            CadenceRunStage::ProbePlan | CadenceRunStage::Armed
-        ) && (slot.wrapping_sub(self.cadence_runtime.local_start.wrapping_sub(3)) as i32) >= 0
+        // A central that never receives Armed must not execute its candidate
+        // unilaterally. Let the peer's bounded window restore automatically,
+        // then retry the same candidate at a fresh future epoch.
+        if self.state.central
+            && self.cadence_runtime.stage == CadenceRunStage::ProbePlan
+            && (slot.wrapping_sub(self.cadence_runtime.local_end) as i32) >= 0
+        {
+            if self.cadence_runtime.probe_abort_retries < 3 {
+                self.cadence_runtime.probe_abort_retries += 1;
+                self.start_probe_plan(slot, period);
+            } else {
+                self.start_failed_probe_release();
+            }
+            return;
+        }
+        // The follower already armed the immutable descriptor. Enter Sample
+        // mode early enough for the depth-two publisher to fill the first op.
+        if !self.state.central
+            && self.cadence_runtime.stage == CadenceRunStage::Armed
+            && (slot.wrapping_sub(self.cadence_runtime.local_start.wrapping_sub(3)) as i32) >= 0
         {
             self.cadence_runtime.stage = CadenceRunStage::Probing;
         }
-        let in_probe_state = matches!(
-            self.cadence_runtime.stage,
-            CadenceRunStage::ProbePlan | CadenceRunStage::Armed | CadenceRunStage::Probing
-        );
+        let in_probe_state = self.cadence_runtime.stage == CadenceRunStage::Probing
+            || (!self.state.central && self.cadence_runtime.stage == CadenceRunStage::Armed);
         if in_probe_state
             && !self.cadence_runtime.probe_started
             && (slot.wrapping_sub(self.cadence_runtime.local_start) as i32) >= 0
@@ -1762,6 +1818,34 @@ impl<P: Phy> LinkCore<P> {
         }
     }
 
+    fn phase_for_target(&self, target: u32, period: u32) -> u32 {
+        if self.cadence_runtime.stage == CadenceRunStage::Applying
+            && (target.wrapping_sub(self.cadence_runtime.local_start) as i32) >= 0
+        {
+            return descriptor_phase(
+                target,
+                self.cadence_runtime.local_start,
+                self.cadence_runtime.apply_epoch,
+                period,
+            );
+        }
+        let in_window = matches!(
+            self.cadence_runtime.stage,
+            CadenceRunStage::Armed | CadenceRunStage::Probing
+        ) && (target.wrapping_sub(self.cadence_runtime.local_start) as i32) >= 0
+            && (target.wrapping_sub(self.cadence_runtime.local_end) as i32) < 0;
+        if in_window {
+            descriptor_phase(
+                target,
+                self.cadence_runtime.local_start,
+                self.cadence_runtime.central_start,
+                period,
+            )
+        } else {
+            self.state.next_phase(target.wrapping_sub(1), period)
+        }
+    }
+
     /// Advance epoch/bookkeeping shared by both roles.
     fn advance_epoch(&mut self, hw_slot: u32) {
         if hw_slot != 0 {
@@ -1790,7 +1874,7 @@ impl<P: Phy> LinkCore<P> {
         // exhaust application retries merely because its slots were reserved.
         if matches!(
             self.cadence_runtime.stage,
-            CadenceRunStage::Idle | CadenceRunStage::Stable
+            CadenceRunStage::Idle | CadenceRunStage::Probation | CadenceRunStage::Stable
         ) {
             self.state.lm.tx.tick();
         }
@@ -2050,7 +2134,9 @@ impl<P: Phy> LinkCore<P> {
                 if cadence_generation_newer(generation, self.cadence_runtime.generation)
                     && matches!(
                         self.cadence_runtime.stage,
-                        CadenceRunStage::Stable | CadenceRunStage::Failed
+                        CadenceRunStage::Stable
+                            | CadenceRunStage::Probation
+                            | CadenceRunStage::Failed
                     ) =>
             {
                 let active = self.cadence_runtime.stable;
@@ -2078,7 +2164,7 @@ impl<P: Phy> LinkCore<P> {
             {
                 if matches!(
                     self.cadence_runtime.stage,
-                    CadenceRunStage::Stable | CadenceRunStage::Failed
+                    CadenceRunStage::Stable | CadenceRunStage::Probation | CadenceRunStage::Failed
                 ) && !cadence_generation_newer(generation, self.cadence_runtime.generation)
                 {
                     return;
@@ -2347,24 +2433,34 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_runtime.stage = CadenceRunStage::Report;
                         return;
                     }
-                    self.phy.schedule_slot_probe(
+                    if self.phy.schedule_slot_probe(
                         p.short_slot_us,
                         p.long_slot_us,
                         p.period_slots() as u16,
                         p.forward_slots,
-                        (self.state.slot_offset % period.max(1)) as u16,
+                        start_epoch,
                         local_start,
                         local_end,
-                    );
-                    self.cadence_runtime.stage = CadenceRunStage::Armed;
+                    ) {
+                        self.cadence_runtime.stage = CadenceRunStage::Armed;
+                    } else {
+                        self.cadence_runtime.local_metrics = Some(ProbeMetrics::new(0, 1, 1));
+                        self.cadence_runtime.stage = CadenceRunStage::Report;
+                    }
                 }
             }
             (true, CadenceStage::Armed)
                 if generation == self.cadence_runtime.generation
+                    && self.cadence_runtime.stage == CadenceRunStage::ProbePlan
                     && start_epoch == self.cadence_runtime.central_start
                     && end_epoch == self.cadence_runtime.central_end =>
             {
-                self.cadence_runtime.stage = CadenceRunStage::Probing;
+                let lead = self.cadence_runtime.local_start.wrapping_sub(catch_slot) as i32;
+                if probe_has_sufficient_arm_lead(lead) && !self.arm_central_probe() {
+                    self.start_failed_probe_release();
+                }
+                // A late Armed cannot safely fill the first depth-two op. Keep
+                // ProbePlan; cadence_tick replans after the peer window ends.
             }
             (true, CadenceStage::Report)
                 if generation == self.cadence_runtime.generation
@@ -2414,6 +2510,8 @@ impl<P: Phy> LinkCore<P> {
                     );
                     let profile_changed = self.cadence_runtime.commit_changes_profile
                         || profile != self.cadence_runtime.stable;
+                    let commit_slot_offset = start_epoch.wrapping_sub(local_apply);
+                    self.cadence_runtime.pending_slot_offset = commit_slot_offset;
                     self.cadence_runtime.commit_changes_profile = profile_changed;
                     if profile_changed
                         && !self.phy.schedule_probed_slot_profile(
@@ -2421,7 +2519,7 @@ impl<P: Phy> LinkCore<P> {
                             profile.long_slot_us,
                             profile.period_slots() as u16,
                             profile.forward_slots,
-                            (self.state.slot_offset % period.max(1)) as u16,
+                            (commit_slot_offset % period.max(1)) as u16,
                             local_apply,
                         )
                     {
@@ -2742,10 +2840,15 @@ impl<P: Phy> LinkCore<P> {
                 if tx_ramp > 0 {
                     self.phy.set_peer_tx_ramp(tx_ramp);
                 }
-                // Uniform 600-us acquisition alignment. Once an armed mixed
-                // profile has been scheduled, later beacons must not clear it
-                // by re-applying the uniform cadence.
-                if slot_us > 0 && self.cadence_ack & 0x80 == 0 {
+                // Uniform acquisition alignment is only legal outside an API
+                // cadence transaction. Periodic beacons continue during
+                // Offer/Probe/Commit; align_slot_period would otherwise disarm
+                // the active/probe profile between descriptor and start.
+                let api_cadence_in_flight = !matches!(
+                    self.cadence_runtime.stage,
+                    CadenceRunStage::Idle | CadenceRunStage::Stable | CadenceRunStage::Failed
+                );
+                if slot_us > 0 && self.cadence_ack & 0x80 == 0 && !api_cadence_in_flight {
                     self.phy.align_slot_period(slot_us);
                 }
                 let min = self.phy.min_slot_period_us();
@@ -2788,6 +2891,7 @@ impl<P: Phy> LinkCore<P> {
                     && self.cadence_runtime.stage == CadenceRunStage::Applying
                     && cadence_apply_epoch == self.cadence_runtime.apply_epoch
                     && (beacon_epoch.wrapping_sub(cadence_apply_epoch) as i32) >= 0
+                    && (catch_slot.wrapping_sub(self.cadence_runtime.local_start) as i32) >= 0
                 {
                     // A same-generation descriptor sent after the apply epoch
                     // proves the central received Applied and resumed its
@@ -2884,7 +2988,7 @@ impl<P: Phy> LinkCore<P> {
         // next_phase applies the follower's mirror offset (slot_offset);
         // target % period alone would ignore the re-anchor and scramble
         // the peripheral's TX/RX phase decisions.
-        let phase = self.state.next_phase(target.wrapping_sub(1), period);
+        let phase = self.phase_for_target(target, period);
         let (local_tx, local_rx) = self.local_ratio();
         let local_phase = self.to_local_phase(phase);
         let central = self.state.central;
@@ -3472,6 +3576,14 @@ mod tests {
         assert!(!probe_has_sufficient_arm_lead(0));
         assert!(!probe_has_sufficient_arm_lead(PROBE_ARM_LEAD_SLOTS - 1));
         assert!(probe_has_sufficient_arm_lead(PROBE_ARM_LEAD_SLOTS));
+    }
+
+    #[test]
+    fn descriptor_phase_survives_independent_epoch_wraps() {
+        assert_eq!(descriptor_phase(43_621, 43_621, 10_000, 10), 0);
+        assert_eq!(descriptor_phase(43_629, 43_621, 10_000, 10), 8);
+        assert_eq!(descriptor_phase(1, u32::MAX - 1, 10_000, 10), 3);
+        assert_eq!(descriptor_phase(43_624, 43_621, u32::MAX - 1, 10), 1);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The MPSL radio's runtime state, provided by the caller during init.
 
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
@@ -166,10 +166,10 @@ pub struct MpslState {
     pub(crate) probe_long_us: u32,
     pub(crate) probe_period: u32,
     pub(crate) probe_short_phases: u32,
-    pub(crate) probe_phase_offset: u32,
+    pub(crate) probe_central_start_slot: u32,
     pub(crate) probe_start_slot: u32,
     pub(crate) probe_end_slot: u32,
-    pub(crate) probe_armed: bool,
+    pub(crate) probe_armed: AtomicBool,
     /// Exact callback-boundary counters for bounded empirical probes.
     pub(crate) probe_clock_start_cyc: u32,
     pub(crate) probe_raw_start: SlotProbeStats,
@@ -376,10 +376,10 @@ impl MpslState {
             probe_long_us: 0,
             probe_period: 0,
             probe_short_phases: 0,
-            probe_phase_offset: 0,
+            probe_central_start_slot: 0,
             probe_start_slot: 0,
             probe_end_slot: 0,
-            probe_armed: false,
+            probe_armed: AtomicBool::new(false),
             probe_clock_start_cyc: 0,
             probe_raw_start: SlotProbeStats::default(),
             probe_stats_total: AtomicProbeStats::new(),

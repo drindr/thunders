@@ -708,28 +708,37 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         long_us: u16,
         period: u16,
         short_phases: u16,
-        phase_offset: u16,
+        central_start_slot: u32,
         start_slot: u32,
         end_slot: u32,
-    ) {
+    ) -> bool {
         if end_slot.wrapping_sub(start_slot) as i32 <= 0
             || short_us < self.min_probe_slot_period_us(0)
             || long_us < self.min_probe_slot_period_us(0)
             || short_us > long_us
         {
-            return;
+            return false;
         }
+        // Explicit publication transition: a changed future descriptor may
+        // replace an old armed one only after readers observe it disarmed.
+        self.state
+            .probe_armed
+            .store(false, core::sync::atomic::Ordering::Release);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         let period = period.max(1) as u32;
         self.state.probe_short_us = short_us as u32;
         self.state.probe_long_us = long_us as u32;
         self.state.probe_period = period;
         self.state.probe_short_phases = (short_phases as u32).min(period);
-        self.state.probe_phase_offset = phase_offset as u32 % period;
+        self.state.probe_central_start_slot = central_start_slot;
         self.state.probe_start_slot = start_slot;
         self.state.probe_end_slot = end_slot;
         self.state.probe_started = false;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        self.state.probe_armed = true;
+        self.state
+            .probe_armed
+            .store(true, core::sync::atomic::Ordering::Release);
+        true
     }
 
     fn slot_probe_stats(&self) -> SlotProbeStats {
@@ -773,7 +782,9 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         // must keep using the old complete profile rather than a mixed state.
         self.state.profile_armed = false;
         self.state.active_profile_armed = false;
-        self.state.probe_armed = false;
+        self.state
+            .probe_armed
+            .store(false, core::sync::atomic::Ordering::Release);
         self.state.probe_started = false;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         self.state.slot_nominal = us;
