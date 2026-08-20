@@ -2382,6 +2382,13 @@ impl<P: Phy> LinkCore<P> {
                     // immutable descriptor or replace completed metrics.
                     return;
                 }
+                if self.cadence_runtime.stage == CadenceRunStage::Armed {
+                    // A changed replan may arrive while this follower's slower
+                    // counter is still inside the old bounded window. Ignore it
+                    // until callback END moves us to Report; central repeats the
+                    // new immutable descriptor meanwhile.
+                    return;
+                }
                 let start_delta = start_epoch.wrapping_sub(epoch) as i32;
                 let end_delta = end_epoch.wrapping_sub(epoch) as i32;
                 if end_delta > start_delta && !probe_has_sufficient_arm_lead(start_delta) {

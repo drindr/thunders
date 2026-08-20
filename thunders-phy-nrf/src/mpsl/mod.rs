@@ -723,8 +723,8 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         // replace an old armed one only after readers observe it disarmed.
         self.state
             .probe_armed
-            .store(false, core::sync::atomic::Ordering::Release);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+            .swap(false, core::sync::atomic::Ordering::AcqRel);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let period = period.max(1) as u32;
         self.state.probe_short_us = short_us as u32;
         self.state.probe_long_us = long_us as u32;
