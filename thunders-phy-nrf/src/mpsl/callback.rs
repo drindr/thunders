@@ -36,6 +36,19 @@ fn slot_before(slot: u32, end: u32) -> bool {
     (slot.wrapping_sub(end) as i32) < 0
 }
 
+#[inline(always)]
+fn probe_trace_index(state: &MpslState, slot: u32) -> Option<usize> {
+    if state.probe_start_slot == 0 {
+        return None;
+    }
+    match slot.wrapping_sub(state.probe_start_slot) as i32 {
+        -1 => Some(0),
+        0 => Some(1),
+        1 => Some(2),
+        _ => None,
+    }
+}
+
 /// Negotiated period for hardware slot `slot`: bounded probe overlay,
 /// pending commit after its apply epoch, current active profile, then the
 /// uniform acquisition fallback.
@@ -197,20 +210,38 @@ pub unsafe extern "C" fn timeslot_cb(
                 state.op_grace_used = state.op_grace_used.wrapping_add(1);
             }
         }
+        let executed_kind = exec
+            .map(|i| state.ops[i].kind)
+            .unwrap_or(OpKind::Idle as u8);
+        let trace_index = probe_trace_index(state, slot);
+        if let Some(ti) = trace_index {
+            state.probe_trace_slot[ti] = slot;
+            state.probe_trace_phase[ti] =
+                slot.wrapping_add(state.probe_phase_offset) % state.probe_period.max(1);
+            state.probe_trace_nominal[ti] = current_nominal;
+            state.probe_trace_exec_kind[ti] = executed_kind as u32;
+            state.probe_trace_exec_target[ti] = exec.map(|i| state.ops[i].target).unwrap_or(0);
+        }
         if let Some(i) = exec {
             state.ops[i].done_seq = state.ops[i].seq;
             state.ops[i].skipped = false;
         }
 
         radio::timeslot_do_work(state, exec);
+        if let Some(ti) = trace_index {
+            state.probe_trace_event_us[ti] = if executed_kind == OpKind::Tx as u8 {
+                state.tx_en_offset_us
+            } else if executed_kind == OpKind::Rx as u8 && state.addr_seen {
+                state.addr_poll_us
+            } else if executed_kind == OpKind::Rx as u8 {
+                state.rx_en_offset_us
+            } else {
+                0
+            };
+        }
 
         // The follower's phase-lock (the RX catch iter -> the chain distance).
-        // Runs only for an RX op that actually executed in THIS slot: the
-        // op kind is latched at START, not re-read after the work (the app
-        // may have published the next op meanwhile).
-        let executed_kind = exec
-            .map(|i| state.ops[i].kind)
-            .unwrap_or(OpKind::Idle as u8);
+        // Runs only for an RX op that actually executed in THIS slot.
         if executed_kind == OpKind::Rx as u8 {
             let ei = exec.unwrap_or(0);
             if state.ops[ei].rx_ok {

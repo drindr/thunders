@@ -58,6 +58,39 @@ pub fn mpsl_rssi() -> u32 {
     }
 }
 
+/// Callback trace around the most recent Probe start boundary.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct MpslProbeTrace {
+    /// Absolute hardware slots for start-1/start/start+1.
+    pub slot: [u32; 3],
+    /// Probe profile phase selected in each slot.
+    pub phase: [u32; 3],
+    /// Nominal period selected in each slot.
+    pub nominal: [u32; 3],
+    /// Executed [`OpKind`] numeric value.
+    pub exec_kind: [u32; 3],
+    /// Published op target consumed in each slot.
+    pub exec_target: [u32; 3],
+    /// TXEN offset, RX ADDRESS offset, or RXEN offset for the executed op.
+    pub event_us: [u32; 3],
+}
+
+/// Snapshot the most recent Probe boundary trace.
+pub fn mpsl_probe_trace() -> MpslProbeTrace {
+    unsafe {
+        let s = &*(STATE as *const MpslState);
+        MpslProbeTrace {
+            slot: s.probe_trace_slot,
+            phase: s.probe_trace_phase,
+            nominal: s.probe_trace_nominal,
+            exec_kind: s.probe_trace_exec_kind,
+            exec_target: s.probe_trace_exec_target,
+            event_us: s.probe_trace_event_us,
+        }
+    }
+}
+
 /// A named, ergonomic snapshot of the MPSL phase-lock state.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

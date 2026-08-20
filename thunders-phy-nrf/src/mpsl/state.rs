@@ -177,6 +177,14 @@ pub struct MpslState {
     pub(crate) probe_started: bool,
     /// Odd while the callback publishes the multiword total, even when stable.
     pub(crate) probe_stats_seq: AtomicU32,
+    /// Callback trace for slots immediately around the most recent Probe
+    /// boundary: indices are start-1, start, start+1.
+    pub(crate) probe_trace_slot: [u32; 3],
+    pub(crate) probe_trace_phase: [u32; 3],
+    pub(crate) probe_trace_nominal: [u32; 3],
+    pub(crate) probe_trace_exec_kind: [u32; 3],
+    pub(crate) probe_trace_exec_target: [u32; 3],
+    pub(crate) probe_trace_event_us: [u32; 3],
 
     // The phase-lock.
     pub(crate) slot_distance: u32,
@@ -377,6 +385,12 @@ impl MpslState {
             probe_stats_total: AtomicProbeStats::new(),
             probe_started: false,
             probe_stats_seq: AtomicU32::new(0),
+            probe_trace_slot: [0; 3],
+            probe_trace_phase: [0; 3],
+            probe_trace_nominal: [0; 3],
+            probe_trace_exec_kind: [0; 3],
+            probe_trace_exec_target: [0; 3],
+            probe_trace_event_us: [0; 3],
             slot_distance: 0,
             catch_poll_us: 0,
             addr_poll_us: 0,

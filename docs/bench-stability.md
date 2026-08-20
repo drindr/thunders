@@ -318,6 +318,36 @@ correction反而使follower无法完成acquisition，证明PLL修正是必要的
 两条独立chain的phase状态/重锚问题，而非CPU性能或长期LFCLK漂移。剩余优先排查项是
 Probe epoch→local slot映射、overlay首slot实际op/phase，以及reverse on-air anchor。
 
+#### 4c-7b. Probe arm lead与首slot callback trace
+
+bench增加`THUNDERS_PROBE_ARM_LEAD=2|3|4`。8B、step10的结果：
+
+| 方向 | lead | 尝试 | Data链路 | Request | Stable |
+|---|---:|---:|---:|---:|---:|
+| LM20→52840 | 2 | 20 | 10 | 10 | 0 |
+| LM20→52840 | 3 | 8 | 3 | 3 | 0 |
+| LM20→52840 | 4 | 8 | 5 | 5 | 0 |
+| 52840→LM20 | 2 | 6 | 1 | 1 | 0 |
+| 52840→LM20 | 3 | 8 | 3 | 3 | 0 |
+| 52840→LM20 | 4 | 8 | 2 | 2 | 0 |
+
+增加的callback trace锁存`start-1/start/start+1`的slot、profile phase、nominal、实际exec
+kind/target及TXEN/RXEN/ADDRESS offset。一个LM20 central→52840 follower的lead=4 run给出：
+
+```text
+central:   phase=[9,0,1] nominal=[600,490,500]
+           kind=[RX,TX,TX] target=[S-1,S,S+1]
+follower:  phase=[9,0,1] nominal=[600,600,600]
+           kind=[TX,IDLE,RX] target=[L-1,0,L+1]
+```
+
+因此静态epoch差值和phase编号一致，但central进入490µs Probe时，follower在对应phase-0既未
+启用candidate nominal，也没有发布RX op。单纯把最低lead从2提高到3/4没有产生任何Stable，
+说明问题不是阈值少1 slot，而是central即使没有收到Armed也会在`start-3`自行进入Probing。
+当forward Probe descriptor/Armed握手未及时闭合时，两端会单边执行不同overlay。下一修复应
+把Probe改成真正的两阶段arm：central只有收到匹配Armed且仍有发布余量才执行；否则为同一
+candidate重新分配future epoch，不能按本地时钟自行开始。
+
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
 自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收

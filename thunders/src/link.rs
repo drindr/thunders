@@ -386,10 +386,19 @@ fn required_probe_rx(confirming: bool, expected_rx: u32) -> u32 {
     }
 }
 
+#[cfg(all(feature = "probe-lead-3", feature = "probe-lead-4"))]
+compile_error!("select only one probe lead feature");
+
+const PROBE_ARM_LEAD_SLOTS: i32 = if cfg!(feature = "probe-lead-4") {
+    4
+} else if cfg!(feature = "probe-lead-3") {
+    3
+} else {
+    2
+};
+
 fn probe_has_sufficient_arm_lead(start_delta: i32) -> bool {
-    // A descriptor caught two slots ahead can still publish the target op
-    // through the depth-two ring. One slot of lead cannot.
-    start_delta >= 2
+    start_delta >= PROBE_ARM_LEAD_SLOTS
 }
 
 fn feedback_uses_previous_run(
@@ -3461,8 +3470,8 @@ mod tests {
     fn probe_arm_lead_covers_depth_two_publication() {
         assert!(!probe_has_sufficient_arm_lead(-1));
         assert!(!probe_has_sufficient_arm_lead(0));
-        assert!(!probe_has_sufficient_arm_lead(1));
-        assert!(probe_has_sufficient_arm_lead(2));
+        assert!(!probe_has_sufficient_arm_lead(PROBE_ARM_LEAD_SLOTS - 1));
+        assert!(probe_has_sufficient_arm_lead(PROBE_ARM_LEAD_SLOTS));
     }
 
     #[test]
