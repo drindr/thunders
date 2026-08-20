@@ -14,16 +14,17 @@ fn slot_profile_due(slot: u32, apply: u32) -> bool {
 #[inline(always)]
 fn phase_nominal(
     slot: u32,
+    central_start: u32,
+    local_start: u32,
     short_us: u32,
     long_us: u32,
     period: u32,
     short_phases: u32,
-    phase_offset: u32,
 ) -> u32 {
     if period == 0 {
         return long_us;
     }
-    let phase = slot.wrapping_add(phase_offset) % period;
+    let phase = central_start.wrapping_add(slot.wrapping_sub(local_start)) % period;
     if phase < short_phases {
         short_us
     } else {
@@ -69,24 +70,28 @@ fn nominal_for_slot(state: &MpslState, slot: u32) -> u32 {
             state.probe_long_us
         };
     }
-    if state.profile_armed && slot_profile_due(slot, state.profile_apply_slot) {
+    if state.profile_armed.load(Ordering::Acquire)
+        && slot_profile_due(slot, state.profile_apply_slot)
+    {
         return phase_nominal(
             slot,
+            state.profile_central_apply_slot,
+            state.profile_apply_slot,
             state.profile_short_us,
             state.profile_long_us,
             state.profile_period,
             state.profile_short_phases,
-            state.profile_phase_offset,
         );
     }
-    if state.active_profile_armed {
+    if state.active_profile_armed.load(Ordering::Acquire) {
         return phase_nominal(
             slot,
+            state.active_profile_central_apply_slot,
+            state.active_profile_local_apply_slot,
             state.active_profile_short_us,
             state.active_profile_long_us,
             state.active_profile_period,
             state.active_profile_short_phases,
-            state.active_profile_phase_offset,
         );
     }
     state.slot_nominal
@@ -115,15 +120,18 @@ fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
         state.probe_raw_start = raw_probe_stats(state);
         state.probe_started = true;
     }
-    if state.profile_armed && slot_profile_due(slot, state.profile_apply_slot) {
+    if state.profile_armed.load(Ordering::Acquire)
+        && slot_profile_due(slot, state.profile_apply_slot)
+    {
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
         state.active_profile_short_us = state.profile_short_us;
         state.active_profile_long_us = state.profile_long_us;
         state.active_profile_period = state.profile_period;
         state.active_profile_short_phases = state.profile_short_phases;
-        state.active_profile_phase_offset = state.profile_phase_offset;
-        state.active_profile_armed = true;
-        state.profile_armed = false;
+        state.active_profile_central_apply_slot = state.profile_central_apply_slot;
+        state.active_profile_local_apply_slot = state.profile_apply_slot;
+        state.active_profile_armed.store(true, Ordering::Release);
+        state.profile_armed.store(false, Ordering::Release);
     }
     if state.probe_armed.load(Ordering::Acquire) && slot_profile_due(slot, state.probe_end_slot) {
         let delta = if state.probe_started {

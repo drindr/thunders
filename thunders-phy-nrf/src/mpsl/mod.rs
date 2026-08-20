@@ -654,8 +654,8 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         long_us: u16,
         period: u16,
         short_phases: u16,
-        phase_offset: u16,
-        apply_slot: u32,
+        central_apply_slot: u32,
+        local_apply_slot: u32,
     ) -> bool {
         if short_us < self.min_probe_slot_period_us(0)
             || long_us < self.min_probe_slot_period_us(0)
@@ -664,15 +664,24 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         {
             return false;
         }
+        if self
+            .state
+            .profile_armed
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
         let period = period as u32;
         self.state.profile_short_us = short_us as u32;
         self.state.profile_long_us = long_us as u32;
         self.state.profile_period = period;
         self.state.profile_short_phases = (short_phases as u32).min(period);
-        self.state.profile_phase_offset = phase_offset as u32 % period;
-        self.state.profile_apply_slot = apply_slot;
+        self.state.profile_central_apply_slot = central_apply_slot;
+        self.state.profile_apply_slot = local_apply_slot;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        self.state.profile_armed = true;
+        self.state
+            .profile_armed
+            .store(true, core::sync::atomic::Ordering::Release);
         true
     }
 
@@ -682,9 +691,16 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         long_us: u16,
         period: u16,
         short_phases: u16,
-        phase_offset: u16,
-        apply_slot: u32,
+        central_apply_slot: u32,
+        local_apply_slot: u32,
     ) {
+        if self
+            .state
+            .profile_armed
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         let short = short_us.max(self.min_short_slot_period_us()) as u32;
         let long = long_us.max(self.min_long_slot_period_us()) as u32;
         let period = period.max(1) as u32;
@@ -692,14 +708,16 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state.profile_long_us = long;
         self.state.profile_period = period;
         self.state.profile_short_phases = (short_phases as u32).min(period);
-        self.state.profile_phase_offset = phase_offset as u32 % period;
-        self.state.profile_apply_slot = apply_slot;
+        self.state.profile_central_apply_slot = central_apply_slot;
+        self.state.profile_apply_slot = local_apply_slot;
         // Same-core app -> MPSL IRQ publication: armed is written last. If
         // the IRQ preempts any earlier write it still sees false and uses the
         // uniform fallback; after true, the compiler fence guarantees the
         // complete immutable profile is visible.
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        self.state.profile_armed = true;
+        self.state
+            .profile_armed
+            .store(true, core::sync::atomic::Ordering::Release);
     }
 
     fn schedule_slot_probe(
@@ -765,7 +783,9 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
     }
 
     fn slot_profile_active(&self) -> bool {
-        self.state.active_profile_armed
+        self.state
+            .active_profile_armed
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
     fn fallback_slot_period_us(&self) -> u16 {
@@ -780,8 +800,12 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         let us = us.max(SLOT_US as u16).max(MPSL_FALLBACK_SLOT_US as u16) as u32;
         // Disarm first: an IRQ that preempts the uniform-field writes below
         // must keep using the old complete profile rather than a mixed state.
-        self.state.profile_armed = false;
-        self.state.active_profile_armed = false;
+        self.state
+            .profile_armed
+            .store(false, core::sync::atomic::Ordering::Release);
+        self.state
+            .active_profile_armed
+            .store(false, core::sync::atomic::Ordering::Release);
         self.state
             .probe_armed
             .store(false, core::sync::atomic::Ordering::Release);

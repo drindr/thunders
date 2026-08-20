@@ -119,8 +119,8 @@ impl Default for CadenceProbePolicy {
 
 /// A phase-indexed short/long slot profile.
 ///
-/// The first `forward_slots` phases of a superframe use `short_slot_us`; the
-/// reverse and shared-idle phases use `long_slot_us`.
+/// Forward phases use `short_slot_us`, except optional phase 0 which may be a
+/// dedicated long Beacon/resync slot. Reverse and idle phases use `long_slot_us`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CadenceProfile {
@@ -134,6 +134,8 @@ pub struct CadenceProfile {
     pub reverse_slots: u16,
     /// Number of shared idle phases after the active phases.
     pub idle_slots: u16,
+    /// Reserve forward phase 0 as a long Beacon/resync slot.
+    pub sync_slot: bool,
 }
 
 impl CadenceProfile {
@@ -151,6 +153,7 @@ impl CadenceProfile {
             forward_slots,
             reverse_slots,
             idle_slots,
+            sync_slot: false,
         }
     }
 
@@ -172,15 +175,21 @@ impl CadenceProfile {
         }
     }
 
+    /// Return a copy with optional phase-0 Beacon/resync semantics.
+    pub const fn with_sync_slot(self, sync_slot: bool) -> Self {
+        Self { sync_slot, ..self }
+    }
+
     /// Number of slots in one superframe.
     pub const fn period_slots(&self) -> u32 {
         self.forward_slots as u32 + self.reverse_slots as u32 + self.idle_slots as u32
     }
 
-    /// Wall-clock duration of one superframe in microseconds.
+    /// Wall-clock duration using this profile's phase-0 semantics.
     pub const fn superframe_us(&self) -> u32 {
-        self.forward_slots as u32 * self.short_slot_us as u32
-            + (self.reverse_slots as u32 + self.idle_slots as u32) * self.long_slot_us as u32
+        let sync = self.sync_slot as u32;
+        (self.forward_slots as u32 - sync) * self.short_slot_us as u32
+            + (self.reverse_slots as u32 + self.idle_slots as u32 + sync) * self.long_slot_us as u32
     }
 
     /// Validate the phase counts and slot ordering.
@@ -190,6 +199,7 @@ impl CadenceProfile {
             || self.short_slot_us > self.long_slot_us
             || self.forward_slots == 0
             || self.reverse_slots == 0
+            || (self.sync_slot && self.forward_slots < 2)
         {
             Err(CadenceError::InvalidProfile)
         } else {

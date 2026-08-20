@@ -365,6 +365,24 @@ Commit阶段也改用`apply_epoch-local_apply`得到权威pending slot offset；
 Stable。此前会短暂报告440/440、500/500的同类8次A/B在Probation版本中为0 Stable，证明
 不可持续profile不再被误报，同时仍保持600µs安全回退。
 
+#### 4c-7c. 专用phase-0同步slot
+
+协商能力flag新增`sync_slot`并由Offer/Accept回显；旧peer不回显时保留旧布局。新布局把phase0
+固定为long Beacon/resync，只有phase1..7使用payload-aware short，phase8..9 reverse继续long。
+`CadenceProfile.sync_slot`使API的superframe时长/容量自描述；MPSL Probe和active profile都
+携带完整central/local apply epoch，避免独立u32 wrap。long feasibility floor同时覆盖36B
+Beacon序列化上界。正常数据面每个superframe强制发送phase-0 Beacon。
+
+LM20→52840、8B、step10硬件结果：lead4为6/8通过Probation并公开Stable，profile分别为
+`410/433, 420/433, 390/433(2次), 361/433, 420/433`；其中361/433达到约2607–2609 slots/s，
+连续约50秒双向Data、`delivery_failures=0`后才安全fallback。生产默认lead2为2/8 Stable，
+profile为420/433和400/433，峰值约2353和2431 slots/s。相比旧500/600约1922/s，专用同步
+slot已把可用运行区间提高约22–36%，并显著延长sub-500持续时间。随后把Beacon golden最大
+33B上取整为36B floor、并将pending/active profile publication改为AtomicBool后，最终lead4
+复测为2/8 Stable：420/449约2326 slots/s、410/449约2356 slots/s；两者均通过双向Data
+Probation，但120秒内仍会安全fallback。下一步应让Beacon的绝对epoch参与持续
+future-boundary重锚，而非只提供长RX窗口。
+
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
 自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收

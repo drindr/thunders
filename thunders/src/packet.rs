@@ -59,9 +59,8 @@ pub enum Packet {
         /// The receiver re-syncs its scheduler to this index; hopping is
         /// driven by the central's miss threshold, not one step per slot.
         channel_index: u8,
-        /// The sender's RX listen window, in 16 us units (0 = unknown).
-        /// Advertised pre-connection so the peer can align its
-        /// transmissions to this (possibly poorer) window.
+        /// Low 7 bits: sender RX window in 16us units. Bit 7 advertises an
+        /// active negotiated phase-0 Beacon/resync slot.
         flags: u8,
         /// The sender's slot cadence in us (0 = unknown). The follower
         /// adopts it at runtime: no compile-time matching needed.
@@ -542,23 +541,24 @@ mod tests {
     #[test]
     fn round_trip_beacon() {
         let pkt = Packet::Beacon {
-            epoch: 0x1234_5678,
-            channel_index: 17,
-            flags: 0xAA,
-            slot_us: 0xBEEF,
-            slot_phase: 7u16,
+            epoch: u32::MAX,
+            channel_index: u8::MAX,
+            flags: u8::MAX,
+            slot_us: u16::MAX,
+            slot_phase: u16::MAX,
             rx_en_offset: 10,
             tx_en_offset: 20,
             rx_ramp: 40,
             tx_ramp: 40,
-            cadence_id: 1,
-            short_slot_us: 450,
-            long_slot_us: 600,
-            short_phases: 8,
-            cadence_apply_epoch: 1024,
+            cadence_id: u8::MAX,
+            short_slot_us: u16::MAX,
+            long_slot_us: u16::MAX,
+            short_phases: u16::MAX,
+            cadence_apply_epoch: u32::MAX,
         };
         let mut buf = [0u8; 64];
         let n = pkt.to_bytes(&mut buf).unwrap();
+        assert!(n <= 36, "Beacon wire length {n} exceeds negotiated floor");
         let decoded = Packet::from_bytes(&buf[..n]).unwrap();
         assert_eq!(pkt, decoded);
     }

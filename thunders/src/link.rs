@@ -348,7 +348,10 @@ const CADENCE_FLAG_RELEASE: u8 = 4;
 const CADENCE_FLAG_CONFIRM: u8 = 8;
 const CADENCE_FLAG_FIXED_WIRE: u8 = 16;
 const CADENCE_FLAG_PROBE_ABORT: u8 = 32;
+const CADENCE_FLAG_SYNC_SLOT: u8 = 64;
 const CADENCE_PROBATION_SUPERFRAMES: u32 = 2048;
+const CADENCE_BEACON_WIRE_LEN: u16 = 36;
+const BEACON_FLAG_SYNC_SLOT: u8 = 0x80;
 
 fn cadence_exit_triggered(policy: CadenceExitPolicy, failed: u32, misses: u8) -> bool {
     (policy.delivery_failures != 0 && failed >= policy.delivery_failures as u32)
@@ -402,6 +405,22 @@ fn probe_has_sufficient_arm_lead(start_delta: i32) -> bool {
     start_delta >= PROBE_ARM_LEAD_SLOTS
 }
 
+fn profile_short_phases(forward_slots: u16, sync_slot: bool) -> u16 {
+    if sync_slot {
+        forward_slots.saturating_sub(1)
+    } else {
+        forward_slots
+    }
+}
+
+fn profile_central_start(central_start: u32, period: u32, sync_slot: bool) -> u32 {
+    if sync_slot {
+        central_start.wrapping_add(period.max(1).wrapping_sub(1))
+    } else {
+        central_start
+    }
+}
+
 fn descriptor_phase(local_slot: u32, local_start: u32, central_start: u32, period: u32) -> u32 {
     central_start.wrapping_add(local_slot.wrapping_sub(local_start)) % period.max(1)
 }
@@ -440,6 +459,7 @@ struct CadenceRuntime {
     search: Option<CadenceSearch>,
     contract: TrafficContract,
     fixed_wire: bool,
+    sync_slot: bool,
     policy: CadenceProbePolicy,
     candidate: CadenceProfile,
     stable: CadenceProfile,
@@ -467,6 +487,8 @@ struct CadenceRuntime {
     pending_slot_offset: u32,
     probation_deadline: u32,
     probation_failures_start: u32,
+    probation_rx_data_start: u32,
+    probation_tx_data_start: u32,
     commit_changes_profile: bool,
     releasing: bool,
     release_deadline: u32,
@@ -481,6 +503,7 @@ impl CadenceRuntime {
             search: None,
             contract: TrafficContract::new(0, 0),
             fixed_wire: false,
+            sync_slot: false,
             policy: CadenceProbePolicy::default(),
             candidate: stable,
             stable,
@@ -508,6 +531,8 @@ impl CadenceRuntime {
             pending_slot_offset: 0,
             probation_deadline: 0,
             probation_failures_start: 0,
+            probation_rx_data_start: 0,
+            probation_tx_data_start: 0,
             commit_changes_profile: false,
             releasing: false,
             release_deadline: 0,
@@ -551,6 +576,8 @@ struct LinkCore<P: Phy> {
     cadence_active_contract: Option<TrafficContract>,
     /// Whether the active contract uses the negotiated fixed data codec.
     cadence_active_fixed_wire: bool,
+    /// Whether phase 0 is the negotiated long Beacon/resync slot.
+    cadence_active_sync_slot: bool,
     /// Remaining old-postcard data-plane packets tolerated after an epoch
     /// switch, covering operations published by the two-slot pipeline.
     fixed_legacy_rx_grace: u8,
@@ -633,6 +660,7 @@ impl<P: Phy> LinkCore<P> {
             cadence_safe_profile: stable_profile,
             cadence_active_contract: None,
             cadence_active_fixed_wire: false,
+            cadence_active_sync_slot: false,
             fixed_legacy_rx_grace: 0,
             cadence_exit_policy: None,
             cadence_exit_failure_baseline: 0,
@@ -959,9 +987,10 @@ impl<P: Phy> LinkCore<P> {
             policy
                 .min_slot_us
                 .max(self.phy.min_probe_slot_period_us(forward_wire)),
-            policy
-                .min_slot_us
-                .max(self.phy.min_probe_slot_period_us(reverse_wire)),
+            policy.min_slot_us.max(
+                self.phy
+                    .min_probe_slot_period_us(reverse_wire.max(CADENCE_BEACON_WIRE_LEN)),
+            ),
         ))
     }
 
@@ -981,9 +1010,12 @@ impl<P: Phy> LinkCore<P> {
             || policy.probe_superframes == 0
             || policy.step_us > u8::MAX as u16
             || policy.safety_steps > u8::MAX as u16
-            || (policy.probe_superframes as u32)
-                .saturating_mul(self.cadence_runtime.stable.superframe_us())
-                > 30_000_000
+            || (policy.probe_superframes as u32).saturating_mul(
+                self.cadence_runtime
+                    .stable
+                    .with_sync_slot(self.cadence_runtime.stable.forward_slots >= 2)
+                    .superframe_us(),
+            ) > 30_000_000
         {
             return Err(CadenceError::InvalidPolicy);
         }
@@ -1016,6 +1048,7 @@ impl<P: Phy> LinkCore<P> {
         self.cadence_ack = 0;
         self.cadence_runtime.contract = contract;
         self.cadence_runtime.fixed_wire = true;
+        self.cadence_runtime.sync_slot = self.cadence_runtime.stable.forward_slots >= 2;
         self.cadence_runtime.policy = policy;
         self.cadence_runtime.candidate = stable;
         self.cadence_runtime.probe_floor_short_us = local_short_floor;
@@ -1088,6 +1121,7 @@ impl<P: Phy> LinkCore<P> {
         if self.cadence_runtime.releasing {
             self.cadence_active_contract = None;
             self.cadence_active_fixed_wire = false;
+            self.cadence_active_sync_slot = false;
             self.fixed_legacy_rx_grace = 0;
             self.cadence_runtime = CadenceRuntime::new(self.cadence_safe_profile);
             // Keep the completed generation/apply descriptor in periodic
@@ -1100,9 +1134,12 @@ impl<P: Phy> LinkCore<P> {
         } else {
             self.cadence_active_contract = Some(self.cadence_runtime.contract);
             self.cadence_active_fixed_wire = self.cadence_runtime.fixed_wire;
+            self.cadence_active_sync_slot = self.cadence_runtime.sync_slot;
             self.fixed_legacy_rx_grace = u8::from(self.cadence_runtime.fixed_wire) * 2;
             self.cadence_runtime.probation_deadline = 0;
             self.cadence_runtime.probation_failures_start = self.delivery_failures;
+            self.cadence_runtime.probation_rx_data_start = self.rx_data;
+            self.cadence_runtime.probation_tx_data_start = self.tx_data;
             self.cadence_runtime.stage = CadenceRunStage::Probation;
             self.cadence_exit_failure_baseline = self.delivery_failures;
         }
@@ -1127,6 +1164,7 @@ impl<P: Phy> LinkCore<P> {
         self.phy.align_slot_period(fallback);
         self.cadence_active_contract = None;
         self.cadence_active_fixed_wire = false;
+        self.cadence_active_sync_slot = false;
         self.cadence_runtime = CadenceRuntime::new(self.cadence_safe_profile);
         self.cadence_id = 1;
         self.cadence_short_us = self.cadence_safe_profile.short_slot_us;
@@ -1183,6 +1221,10 @@ impl<P: Phy> LinkCore<P> {
                 != self.cadence_runtime.stable.long_slot_us;
         let start = if reverse_trial {
             base.wrapping_add(self.cadence_runtime.stable.forward_slots as u32)
+        } else if isolated && self.cadence_runtime.sync_slot {
+            // Phase 0 is the negotiated long Beacon/resync slot; exercise the
+            // first payload-bearing short phase instead.
+            base.wrapping_add(1)
         } else {
             base
         };
@@ -1227,8 +1269,12 @@ impl<P: Phy> LinkCore<P> {
             p.short_slot_us,
             p.long_slot_us,
             p.period_slots() as u16,
-            p.forward_slots,
-            self.cadence_runtime.central_start,
+            profile_short_phases(p.forward_slots, self.cadence_runtime.sync_slot),
+            profile_central_start(
+                self.cadence_runtime.central_start,
+                p.period_slots(),
+                self.cadence_runtime.sync_slot,
+            ),
             self.cadence_runtime.local_start,
             self.cadence_runtime.local_end,
         ) {
@@ -1408,6 +1454,13 @@ impl<P: Phy> LinkCore<P> {
                 return;
             }
             if (slot.wrapping_sub(self.cadence_runtime.probation_deadline) as i32) >= 0 {
+                let bidirectional_data = self.rx_data
+                    != self.cadence_runtime.probation_rx_data_start
+                    && self.tx_data != self.cadence_runtime.probation_tx_data_start;
+                if self.state.central && !bidirectional_data {
+                    self.start_failed_probe_release();
+                    return;
+                }
                 self.cadence_runtime.stage = CadenceRunStage::Stable;
                 self.cadence_exit_failure_baseline = self.delivery_failures;
             }
@@ -1622,6 +1675,9 @@ impl<P: Phy> LinkCore<P> {
         if self.cadence_runtime.fixed_wire && !self.cadence_runtime.releasing {
             flags |= CADENCE_FLAG_FIXED_WIRE;
         }
+        if self.cadence_runtime.sync_slot && !self.cadence_runtime.releasing {
+            flags |= CADENCE_FLAG_SYNC_SLOT;
+        }
         if self.cadence_runtime.releasing
             && matches!(stage, CadenceStage::Release | CadenceStage::Commit)
         {
@@ -1685,10 +1741,16 @@ impl<P: Phy> LinkCore<P> {
     }
 
     fn beacon_packet(&self, step: u32, period: u16, beacon_epoch: u32) -> Packet {
+        let flags = (self.phy.rx_window_us() / 16).min(0x7f) as u8
+            | if self.cadence_active_sync_slot {
+                BEACON_FLAG_SYNC_SLOT
+            } else {
+                0
+            };
         Packet::Beacon {
             epoch: beacon_epoch,
             channel_index: self.state.scheduler.index(),
-            flags: (self.phy.rx_window_us() / 16).min(255) as u8,
+            flags,
             slot_us: self.phy.slot_period_us(),
             slot_phase: (step % period as u32) as u16,
             rx_en_offset: self.phy.rx_en_offset_us(),
@@ -1923,8 +1985,13 @@ impl<P: Phy> LinkCore<P> {
                 && self.cadence_id != 0
                 && self.cadence_apply_epoch != 0
                 && (self.state.epoch.wrapping_sub(self.cadence_apply_epoch) as i32) < 0;
-            let forced_beacon =
-                central && (self.state.epoch % 64 == 0 || cadence_pending || profile_countdown);
+            let sync_slot = self.cadence_active_sync_slot
+                || (self.cadence_runtime.sync_slot && !self.cadence_runtime.releasing);
+            let forced_beacon = central
+                && ((sync_slot && phase == 0)
+                    || self.state.epoch % 64 == 0
+                    || cadence_pending
+                    || profile_countdown);
 
             // Start of a new local TX run: clear the slot-position table.
             if local_phase == 0 {
@@ -2207,6 +2274,7 @@ impl<P: Phy> LinkCore<P> {
                 );
                 let stable = self.cadence_runtime.stable;
                 let fixed_wire = flags & CADENCE_FLAG_FIXED_WIRE != 0;
+                let sync_slot = flags & CADENCE_FLAG_SYNC_SLOT != 0 && stable.forward_slots >= 2;
                 match self.cadence_local_probe_floors(contract, policy, fixed_wire) {
                     Ok((short_floor, long_floor))
                         if short_floor <= stable.short_slot_us
@@ -2218,6 +2286,7 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_ack = 0;
                         self.cadence_runtime.contract = contract;
                         self.cadence_runtime.fixed_wire = fixed_wire;
+                        self.cadence_runtime.sync_slot = sync_slot;
                         self.cadence_runtime.policy = policy;
                         self.cadence_runtime.candidate = stable;
                         self.cadence_runtime.probe_floor_short_us = short_floor;
@@ -2252,6 +2321,8 @@ impl<P: Phy> LinkCore<P> {
                     safety_steps as u16,
                 );
                 let fixed_wire = flags & CADENCE_FLAG_FIXED_WIRE != 0;
+                let sync_slot = flags & CADENCE_FLAG_SYNC_SLOT != 0
+                    && self.cadence_runtime.stable.forward_slots >= 2;
                 let floors = self.cadence_local_probe_floors(contract, policy, fixed_wire);
                 if forward_payload as usize > MAX_PAYLOAD
                     || reverse_payload as usize > MAX_PAYLOAD
@@ -2273,6 +2344,7 @@ impl<P: Phy> LinkCore<P> {
                 self.cadence_ack = 0;
                 self.cadence_runtime.contract = contract;
                 self.cadence_runtime.fixed_wire = fixed_wire;
+                self.cadence_runtime.sync_slot = sync_slot;
                 self.cadence_runtime.policy = policy;
                 self.cadence_runtime.probe_floor_short_us = short_floor;
                 self.cadence_runtime.probe_floor_long_us = long_floor;
@@ -2289,7 +2361,8 @@ impl<P: Phy> LinkCore<P> {
                     self.cadence_runtime.stable.forward_slots,
                     self.cadence_runtime.stable.reverse_slots,
                     self.cadence_runtime.stable.idle_slots,
-                );
+                )
+                .with_sync_slot(self.cadence_runtime.sync_slot);
                 self.cadence_runtime.stage = CadenceRunStage::Accept;
             }
             (true, CadenceStage::Accept)
@@ -2303,6 +2376,7 @@ impl<P: Phy> LinkCore<P> {
                     self.start_final_commit(catch_slot, period, self.cadence_safe_profile);
                 } else {
                     self.cadence_runtime.fixed_wire &= flags & CADENCE_FLAG_FIXED_WIRE != 0;
+                    self.cadence_runtime.sync_slot &= flags & CADENCE_FLAG_SYNC_SLOT != 0;
                     let local_floors = self.cadence_local_probe_floors(
                         self.cadence_runtime.contract,
                         self.cadence_runtime.policy,
@@ -2329,7 +2403,9 @@ impl<P: Phy> LinkCore<P> {
                     );
                     match wire_lengths.and_then(|(forward_wire, reverse_wire)| {
                         CadenceSearch::new_with_wire_lengths_and_floors(
-                            self.cadence_runtime.stable,
+                            self.cadence_runtime
+                                .stable
+                                .with_sync_slot(self.cadence_runtime.sync_slot),
                             self.cadence_runtime.contract,
                             self.cadence_runtime.policy,
                             forward_wire,
@@ -2402,7 +2478,8 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_runtime.stable.forward_slots,
                         self.cadence_runtime.stable.reverse_slots,
                         self.cadence_runtime.stable.idle_slots,
-                    );
+                    )
+                    .with_sync_slot(self.cadence_runtime.sync_slot);
                     self.cadence_runtime.local_metrics = Some(ProbeMetrics::new(0, 1, 1));
                     self.cadence_runtime.stage = CadenceRunStage::Report;
                     return;
@@ -2426,7 +2503,8 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_runtime.stable.forward_slots,
                         self.cadence_runtime.stable.reverse_slots,
                         self.cadence_runtime.stable.idle_slots,
-                    );
+                    )
+                    .with_sync_slot(self.cadence_runtime.sync_slot);
                     let p = self.cadence_runtime.candidate;
                     if p.short_slot_us < self.cadence_runtime.probe_floor_short_us
                         || p.long_slot_us < self.cadence_runtime.probe_floor_long_us
@@ -2444,8 +2522,12 @@ impl<P: Phy> LinkCore<P> {
                         p.short_slot_us,
                         p.long_slot_us,
                         p.period_slots() as u16,
-                        p.forward_slots,
-                        start_epoch,
+                        profile_short_phases(p.forward_slots, self.cadence_runtime.sync_slot),
+                        profile_central_start(
+                            start_epoch,
+                            p.period_slots(),
+                            self.cadence_runtime.sync_slot,
+                        ),
                         local_start,
                         local_end,
                     ) {
@@ -2502,6 +2584,14 @@ impl<P: Phy> LinkCore<P> {
                             | CadenceRunStage::Applying
                     ) =>
             {
+                if self.cadence_runtime.stage == CadenceRunStage::Applying {
+                    if start_epoch == self.cadence_runtime.apply_epoch {
+                        return;
+                    }
+                    if (catch_slot.wrapping_sub(self.cadence_runtime.local_start) as i32) < 0 {
+                        return;
+                    }
+                }
                 self.cadence_runtime.releasing = flags & CADENCE_FLAG_RELEASE != 0;
                 self.cadence_runtime.contract =
                     TrafficContract::new(forward_payload as u16, reverse_payload as u16);
@@ -2514,7 +2604,8 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_runtime.stable.forward_slots,
                         self.cadence_runtime.stable.reverse_slots,
                         self.cadence_runtime.stable.idle_slots,
-                    );
+                    )
+                    .with_sync_slot(self.cadence_runtime.sync_slot);
                     let profile_changed = self.cadence_runtime.commit_changes_profile
                         || profile != self.cadence_runtime.stable;
                     let commit_slot_offset = start_epoch.wrapping_sub(local_apply);
@@ -2525,8 +2616,15 @@ impl<P: Phy> LinkCore<P> {
                             profile.short_slot_us,
                             profile.long_slot_us,
                             profile.period_slots() as u16,
-                            profile.forward_slots,
-                            (commit_slot_offset % period.max(1)) as u16,
+                            profile_short_phases(
+                                profile.forward_slots,
+                                self.cadence_runtime.sync_slot,
+                            ),
+                            profile_central_start(
+                                start_epoch,
+                                period,
+                                self.cadence_runtime.sync_slot,
+                            ),
                             local_apply,
                         )
                     {
@@ -2563,8 +2661,15 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_runtime.stable.short_slot_us,
                         self.cadence_runtime.stable.long_slot_us,
                         self.cadence_runtime.stable.period_slots() as u16,
-                        self.cadence_runtime.stable.forward_slots,
-                        0,
+                        profile_short_phases(
+                            self.cadence_runtime.stable.forward_slots,
+                            self.cadence_runtime.sync_slot,
+                        ),
+                        profile_central_start(
+                            self.cadence_runtime.apply_epoch,
+                            period,
+                            self.cadence_runtime.sync_slot,
+                        ),
                         self.cadence_runtime.apply_epoch,
                     )
                 {
@@ -2794,8 +2899,8 @@ impl<P: Phy> LinkCore<P> {
                             self.cadence_short_us,
                             self.cadence_long_us,
                             period as u16,
-                            self.cadence_short_phases,
-                            0,
+                            profile_short_phases(self.cadence_short_phases, false),
+                            self.cadence_apply_epoch,
                             self.cadence_apply_epoch,
                         );
                         self.cadence_negotiated = true;
@@ -2832,8 +2937,9 @@ impl<P: Phy> LinkCore<P> {
                     self.emergency_cadence_fallback();
                 }
                 self.state.scheduler.sync(channel_index);
-                if flags > 0 {
-                    self.phy.set_peer_rx_window(flags as u16 * 16);
+                let rx_window_flags = flags & !BEACON_FLAG_SYNC_SLOT;
+                if rx_window_flags > 0 {
+                    self.phy.set_peer_rx_window(rx_window_flags as u16 * 16);
                 }
                 if rx_en_offset > 0 {
                     self.phy.set_peer_rx_en_offset(rx_en_offset);
@@ -2932,8 +3038,8 @@ impl<P: Phy> LinkCore<P> {
                                 self.cadence_short_us,
                                 self.cadence_long_us,
                                 period as u16,
-                                self.cadence_short_phases,
-                                (self.state.slot_offset % period.max(1)) as u16,
+                                profile_short_phases(self.cadence_short_phases, false),
+                                cadence_apply_epoch,
                                 local_apply,
                             );
                             self.cadence_apply_epoch = cadence_apply_epoch;
@@ -3031,8 +3137,13 @@ impl<P: Phy> LinkCore<P> {
                 && self.cadence_id != 0
                 && self.cadence_apply_epoch != 0
                 && (target.wrapping_sub(self.cadence_apply_epoch) as i32) < 0;
-            let forced_beacon =
-                central && (target % 64 == 0 || cadence_pending || profile_countdown);
+            let sync_slot = self.cadence_active_sync_slot
+                || (self.cadence_runtime.sync_slot && !self.cadence_runtime.releasing);
+            let forced_beacon = central
+                && ((sync_slot && phase == 0)
+                    || target % 64 == 0
+                    || cadence_pending
+                    || profile_countdown);
 
             // Start of a new local TX run: clear the slot-position table.
             if local_phase == 0 {
@@ -3583,6 +3694,23 @@ mod tests {
         assert!(!probe_has_sufficient_arm_lead(0));
         assert!(!probe_has_sufficient_arm_lead(PROBE_ARM_LEAD_SLOTS - 1));
         assert!(probe_has_sufficient_arm_lead(PROBE_ARM_LEAD_SLOTS));
+    }
+
+    #[test]
+    fn sync_slot_profile_maps_phase_zero_long() {
+        assert_eq!(profile_short_phases(8, true), 7);
+        assert_eq!(profile_short_phases(8, false), 8);
+        let shifted = profile_central_start(100, 10, true);
+        assert_eq!(shifted, 109);
+        assert_eq!(descriptor_phase(1_000, 1_000, shifted, 10), 9);
+        assert_eq!(descriptor_phase(1_001, 1_000, shifted, 10), 0);
+        assert_eq!(descriptor_phase(1_008, 1_000, shifted, 10), 7);
+        let profile = CadenceProfile::new(500, 600, 8, 2, 0);
+        assert_eq!(
+            profile.with_sync_slot(true).superframe_us(),
+            7 * 500 + 3 * 600
+        );
+        assert_eq!(profile.superframe_us(), 8 * 500 + 2 * 600);
     }
 
     #[test]

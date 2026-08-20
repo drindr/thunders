@@ -209,18 +209,17 @@ pub trait Phy {
             .max(self.min_slot_period_us())
     }
 
-    /// Arm a phase-indexed short/long slot profile at absolute hardware slot
-    /// `apply_slot`. Phases `[0, short_phases)` use `short_us`; the remainder
-    /// use `long_us`. `phase_offset` maps the follower's hardware counter to
-    /// the central schedule. Backends without a hardware cadence ignore it.
+    /// Arm a phase-indexed short/long slot profile at `local_apply_slot`.
+    /// `central_apply_slot` preserves the full cross-counter mapping across
+    /// independent u32 wraps. Backends without a hardware cadence ignore it.
     fn schedule_slot_profile(
         &mut self,
         _short_us: u16,
         _long_us: u16,
         _period: u16,
         _short_phases: u16,
-        _phase_offset: u16,
-        _apply_slot: u32,
+        _central_apply_slot: u32,
+        _local_apply_slot: u32,
     ) {
     }
 
@@ -247,8 +246,8 @@ pub trait Phy {
         _long_us: u16,
         _period: u16,
         _short_phases: u16,
-        _phase_offset: u16,
-        _apply_slot: u32,
+        _central_apply_slot: u32,
+        _local_apply_slot: u32,
     ) -> bool {
         false
     }

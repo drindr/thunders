@@ -174,6 +174,7 @@ async fn main(spawner: Spawner) {
             info!("link ready (Central)");
             #[cfg(feature = "cadence-probe")]
             let mut cadence_requested = false;
+            let mut cadence_draining = false;
             #[cfg(feature = "cadence-probe")]
             let mut cadence_reported = false;
             #[cfg(feature = "cadence-probe")]
@@ -221,12 +222,14 @@ async fn main(spawner: Spawner) {
             loop {
                 #[cfg(feature = "cadence-probe")]
                 if !cadence_requested && central.status() == thunders::link::LinkStatus::Connected {
+                    cadence_draining = true;
                     let policy = thunders::CadenceProbePolicy::new(300, CADENCE_STEP_US, 32, 0);
                     if let Ok(generation) = central.negotiate_cadence(
                         thunders::TrafficContract::new(BENCH_PAYLOAD_LEN as u16, BENCH_PAYLOAD_LEN as u16),
                         policy,
                     ) {
                         cadence_requested = true;
+                        cadence_draining = false;
                         info!("CADENCE REQUEST gen={}", generation);
                     }
                 }
@@ -304,7 +307,7 @@ async fn main(spawner: Spawner) {
                 let echo_pending =
                     ping_tx > echo_rx + central.delivery_failures().saturating_sub(df_base) as u64;
                 let tx: Option<&[u8]> =
-                    if tx_phase && !echo_pending && !central.tx_window_full() {
+                    if tx_phase && !cadence_draining && !echo_pending && !central.tx_window_full() {
                     ping_tx += 1;
                     ping_seq = ping_seq.wrapping_add(1);
                     t_ping_tx = Instant::now();
