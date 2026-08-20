@@ -371,7 +371,12 @@ pub unsafe extern "C" fn timeslot_cb(
                 let corr = err * PLL_GAIN_NUM / PLL_GAIN_DEN;
                 let nominal = current_nominal as i32;
                 let new_dist = (nominal + corr).clamp(nominal - 20, nominal + 20) as u32;
-                if new_dist != state.slot_distance {
+                let freeze_probe = cfg!(feature = "pll-probe-freeze")
+                    && state.probe_armed
+                    && slot_profile_due(slot, state.probe_start_slot)
+                    && slot_before(slot, state.probe_end_slot);
+                if !cfg!(feature = "pll-fixed") && !freeze_probe && new_dist != state.slot_distance
+                {
                     state.slot_distance = new_dist;
                 }
             }

@@ -295,6 +295,29 @@ baseline，不再依赖app线程恰好在单slot窗口内醒来。错过精确ST
 不能只降低阈值，因为central单边换台后peripheral无法先验知道新频道。该项保持禁用，
 等待“旧频道Beacon公告future hop epoch”协议后再单独修复。
 
+#### 4c-7a. 52840时钟与PLL来源隔离
+
+bench增加`THUNDERS_52840_LFCLK=rc|xtal`以及
+`THUNDERS_PLL_MODE=phase|fixed|probe-freeze`，均为默认关闭的实验feature。8B、step10的
+冷启动A/B如下：
+
+| 方向/配置 | 尝试 | Data链路 | Request | Stable |
+|---|---:|---:|---:|---:|
+| LM20→52840，RC+phase | 20 | 10 | 10 | 0 |
+| LM20→52840，LFXO+phase | 8 | 3 | 3 | 0 |
+| LM20→52840，LFXO+fixed PLL | 8 | 0 | 0 | 0 |
+| LM20→52840，RC+probe-freeze | 8 | 4 | 4 | 0 |
+| 52840→LM20，RC+phase | 6 | 1 | 1 | 0 |
+| 52840→LM20，LFXO+phase | 8 | 0 | 0 | 0 |
+| 52840→LM20，RC+probe-freeze | 8 | 2 | 2 | 0 |
+
+LFXO没有改善candidate或Stable yield，因此不能把失败归因于52840 RC频漂。完全关闭phase
+correction反而使follower无法完成acquisition，证明PLL修正是必要的；只在Probe overlay内
+冻结修正仍为0 Stable，说明candidate期间的`err/4`修正也不是主因。52840作为LFXO central
+时曾在启动早期累计1078个CRC catch，随后长期无新catch而slot rate仍为1922/s，更符合
+两条独立chain的phase状态/重锚问题，而非CPU性能或长期LFCLK漂移。剩余优先排查项是
+Probe epoch→local slot映射、overlay首slot实际op/phase，以及reverse on-air anchor。
+
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
 自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收

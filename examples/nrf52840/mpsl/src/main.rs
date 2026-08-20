@@ -95,10 +95,15 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     info!("thunders MPSL (nRF52840, {:?})", defmt::Debug2Format(&ROLE));
+    info!("LFCLK {}", if cfg!(feature = "lfxo") { "XTAL" } else { "RC" });
 
     let mut config = embassy_nrf::config::Config::default();
     config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
-    config.lfclk_source = embassy_nrf::config::LfclkSource::InternalRC;
+    config.lfclk_source = if cfg!(feature = "lfxo") {
+        embassy_nrf::config::LfclkSource::ExternalXtal
+    } else {
+        embassy_nrf::config::LfclkSource::InternalRC
+    };
     let p = embassy_nrf::init(config);
 
     let mpsl_p = Peripherals::new(
@@ -106,12 +111,22 @@ async fn main(spawner: Spawner) {
         p.PPI_CH19, p.PPI_CH30, p.PPI_CH31,
     );
 
-    let lfclk_cfg = raw::mpsl_clock_lfclk_cfg_t {
-        source: raw::MPSL_CLOCK_LF_SRC_RC as u8,
-        rc_ctiv: raw::MPSL_RECOMMENDED_RC_CTIV as u8,
-        rc_temp_ctiv: raw::MPSL_RECOMMENDED_RC_TEMP_CTIV as u8,
-        accuracy_ppm: raw::MPSL_DEFAULT_CLOCK_ACCURACY_PPM as u16,
-        skip_wait_lfclk_started: raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
+    let lfclk_cfg = if cfg!(feature = "lfxo") {
+        raw::mpsl_clock_lfclk_cfg_t {
+            source: raw::MPSL_CLOCK_LF_SRC_XTAL as u8,
+            rc_ctiv: 0,
+            rc_temp_ctiv: 0,
+            accuracy_ppm: 50,
+            skip_wait_lfclk_started: false,
+        }
+    } else {
+        raw::mpsl_clock_lfclk_cfg_t {
+            source: raw::MPSL_CLOCK_LF_SRC_RC as u8,
+            rc_ctiv: raw::MPSL_RECOMMENDED_RC_CTIV as u8,
+            rc_temp_ctiv: raw::MPSL_RECOMMENDED_RC_TEMP_CTIV as u8,
+            accuracy_ppm: raw::MPSL_DEFAULT_CLOCK_ACCURACY_PPM as u16,
+            skip_wait_lfclk_started: raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
+        }
     };
 
     // The MPSL layer is initialized WITH timeslot support: the SessionMem is

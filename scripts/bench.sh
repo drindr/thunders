@@ -30,6 +30,16 @@ RATIO="${THUNDERS_RATIO:-}"
 PAYLOAD_BYTES="${THUNDERS_BENCH_PAYLOAD_BYTES:-8}"
 PAYLOAD_SUFFIX="${THUNDERS_BENCH_PAYLOAD_SUFFIX:-0}"
 CADENCE_STEP_US="${THUNDERS_CADENCE_STEP_US:-25}"
+LFCLK_52840="${THUNDERS_52840_LFCLK:-rc}"
+PLL_MODE="${THUNDERS_PLL_MODE:-phase}"
+case "$PLL_MODE" in
+  phase|fixed|probe-freeze) ;;
+  *) echo "unsupported THUNDERS_PLL_MODE=$PLL_MODE (use phase,fixed,probe-freeze)" >&2; exit 2 ;;
+esac
+case "$LFCLK_52840" in
+  rc|xtal) ;;
+  *) echo "unsupported THUNDERS_52840_LFCLK=$LFCLK_52840 (use rc,xtal)" >&2; exit 2 ;;
+esac
 case "$CADENCE_STEP_US" in
   5|10|25) ;;
   *) echo "unsupported THUNDERS_CADENCE_STEP_US=$CADENCE_STEP_US (use 5,10,25)" >&2; exit 2 ;;
@@ -63,6 +73,14 @@ build_one() {
   local feats=(--no-default-features)
   if [ "$RADIO_MODE" = "1m" ]; then
     feats+=(--features radio-1m)
+  fi
+  if [ "$board" = "52840" ] && [ "$LFCLK_52840" = "xtal" ]; then
+    feats+=(--features lfxo)
+  fi
+  if [ "$PLL_MODE" = "fixed" ]; then
+    feats+=(--features pll-fixed)
+  elif [ "$PLL_MODE" = "probe-freeze" ]; then
+    feats+=(--features pll-probe-freeze)
   fi
   if [ "${CADENCE_PROBE:-0}" = "1" ] && [ "$backend" = "mpsl" ]; then
     feats+=(--features cadence-probe)
@@ -123,6 +141,16 @@ run_pair() {
   if [ "$RADIO_MODE" = "1m" ]; then
     mode_suffix="-1m"
   fi
+  local lfclk_suffix=""
+  if { [ "$c" = "52840" ] || [ "$p" = "52840" ]; } && [ "$LFCLK_52840" = "xtal" ]; then
+    lfclk_suffix="-lfxo"
+  fi
+  local pll_suffix=""
+  if [ "$PLL_MODE" = "fixed" ]; then
+    pll_suffix="-pllfixed"
+  elif [ "$PLL_MODE" = "probe-freeze" ]; then
+    pll_suffix="-pllprobefreeze"
+  fi
   local ratio_suffix=""
   if [ -n "$RATIO" ]; then
     ratio_suffix="-r$RATIO"
@@ -135,7 +163,7 @@ run_pair() {
   if [ "${CADENCE_PROBE:-0}" = "1" ] && [ "$CADENCE_STEP_US" != "25" ]; then
     cadence_suffix="-s${CADENCE_STEP_US}"
   fi
-  local run="${c}-${p}-${backend}${mode_suffix}${ratio_suffix}${payload_suffix}${cadence_suffix}"
+  local run="${c}-${p}-${backend}${mode_suffix}${lfclk_suffix}${pll_suffix}${ratio_suffix}${payload_suffix}${cadence_suffix}"
   local celf="$BIN/$c-$backend-central.elf" pelf="$BIN/$p-$backend-peripheral.elf"
   [ -f "$celf" ] || { echo "missing $celf - run 'scripts/bench.sh build'"; exit 1; }
   [ -f "$pelf" ] || { echo "missing $pelf"; exit 1; }
