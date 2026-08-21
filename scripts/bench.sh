@@ -38,8 +38,8 @@ case "$PROBE_ARM_LEAD" in
   *) echo "unsupported THUNDERS_PROBE_ARM_LEAD=$PROBE_ARM_LEAD (use 2,3,4)" >&2; exit 2 ;;
 esac
 case "$PLL_MODE" in
-  phase|fixed|probe-freeze) ;;
-  *) echo "unsupported THUNDERS_PLL_MODE=$PLL_MODE (use phase,fixed,probe-freeze)" >&2; exit 2 ;;
+  phase|fixed|probe-freeze|sync-servo) ;;
+  *) echo "unsupported THUNDERS_PLL_MODE=$PLL_MODE (use phase,fixed,probe-freeze,sync-servo)" >&2; exit 2 ;;
 esac
 case "$LFCLK_52840" in
   rc|xtal) ;;
@@ -86,6 +86,8 @@ build_one() {
     feats+=(--features pll-fixed)
   elif [ "$PLL_MODE" = "probe-freeze" ]; then
     feats+=(--features pll-probe-freeze)
+  elif [ "$PLL_MODE" = "sync-servo" ]; then
+    feats+=(--features pll-sync-servo)
   fi
   case "$PROBE_ARM_LEAD" in
     3) feats+=(--features probe-lead-3) ;;
@@ -159,6 +161,8 @@ run_pair() {
     pll_suffix="-pllfixed"
   elif [ "$PLL_MODE" = "probe-freeze" ]; then
     pll_suffix="-pllprobefreeze"
+  elif [ "$PLL_MODE" = "sync-servo" ]; then
+    pll_suffix="-pllsyncservo"
   fi
   local lead_suffix=""
   if [ "$PROBE_ARM_LEAD" != "2" ]; then
@@ -195,7 +199,7 @@ run_pair() {
     # starts after it, so the link forms from the first slot. setsid: the
     # peripheral probe-rs runs in its own process group so it can be reaped
     # cleanly when the central finishes.
-    setsid timeout -s INT $((secs + 20)) probe-rs run --chip "${CHIP[$p]}" --probe "${PROBE[$p]}" \
+    setsid timeout -s INT $((secs + 120)) probe-rs run --chip "${CHIP[$p]}" --probe "${PROBE[$p]}" \
       ${EXTRA[$p]:-} --scan-region "${SCAN[$p]}" "$pelf" > "$LOGS/$run.peripheral.log" 2>&1 &
     local ppid=$!
     # Wait for the peripheral to actually reach BENCH READY before starting

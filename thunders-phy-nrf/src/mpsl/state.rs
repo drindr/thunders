@@ -149,6 +149,7 @@ pub struct MpslState {
     pub(crate) active_profile_long_us: u32,
     pub(crate) active_profile_period: u32,
     pub(crate) active_profile_short_phases: u32,
+    pub(crate) active_profile_sync_slot: bool,
     pub(crate) active_profile_central_apply_slot: u32,
     pub(crate) active_profile_local_apply_slot: u32,
     pub(crate) active_profile_armed: AtomicBool,
@@ -157,6 +158,7 @@ pub struct MpslState {
     pub(crate) profile_long_us: u32,
     pub(crate) profile_period: u32,
     pub(crate) profile_short_phases: u32,
+    pub(crate) profile_sync_slot: bool,
     pub(crate) profile_central_apply_slot: u32,
     pub(crate) profile_apply_slot: u32,
     pub(crate) profile_armed: AtomicBool,
@@ -285,6 +287,16 @@ pub struct MpslState {
     /// Learned follower PLL address target (us from RXEN). Starts at the
     /// legacy default and is calibrated from the first locked catches.
     pub addr_target_us: u32,
+    /// Local slot of the previous valid phase-0 sync anchor.
+    pub sync_prev_anchor_slot: u32,
+    /// Fast one-shot phase corrections accumulated since that anchor.
+    pub sync_phase_correction_sum_us: i32,
+    /// Slow fractional frequency correction, in Q8 microseconds per slot.
+    pub sync_freq_q8: i32,
+    /// Fractional dither accumulator for `sync_freq_q8`.
+    pub sync_freq_accum_q8: i32,
+    /// Number of valid phase-0 sync anchors used by the servo.
+    pub sync_anchor_count: u32,
     /// RXEN offset from slot START, measured on the last RX op (us).
     pub(crate) rx_en_offset_us: u32,
     /// RXEN -> READY ramp measured on the last RX op (us).
@@ -364,6 +376,7 @@ impl MpslState {
             active_profile_long_us: 0,
             active_profile_period: 0,
             active_profile_short_phases: 0,
+            active_profile_sync_slot: false,
             active_profile_central_apply_slot: 0,
             active_profile_local_apply_slot: 0,
             active_profile_armed: AtomicBool::new(false),
@@ -371,6 +384,7 @@ impl MpslState {
             profile_long_us: 0,
             profile_period: 0,
             profile_short_phases: 0,
+            profile_sync_slot: false,
             profile_central_apply_slot: 0,
             profile_apply_slot: 0,
             profile_armed: AtomicBool::new(false),
@@ -436,6 +450,11 @@ impl MpslState {
             done_count: AtomicU32::new(0),
             addr_events: 0,
             addr_target_us: 60,
+            sync_prev_anchor_slot: 0,
+            sync_phase_correction_sum_us: 0,
+            sync_freq_q8: 0,
+            sync_freq_accum_q8: 0,
+            sync_anchor_count: 0,
             rx_en_offset_us: 0,
             rx_ramp_us: 0,
             tx_en_offset_us: 0,

@@ -383,6 +383,24 @@ slot已把可用运行区间提高约22–36%，并显著延长sub-500持续时�
 Probation，但120秒内仍会安全fallback。下一步应让Beacon的绝对epoch参与持续
 future-boundary重锚，而非只提供长RX窗口。
 
+#### 4c-7d. 120秒生产稳定guardrail
+
+继续A/B发现旧日志末尾统一回600的一部分是bench伪影：peripheral probe进程仅保留`SECS+20`，
+会在central完整measurement window结束前退出。改为`SECS+120`后再评估。同时，sync profile
+生产floor收紧为450/600µs，保留600µs phase-0/reverse恢复余量；active sync链路的连续miss
+回退阈值从16提高到64（约30ms），该模式禁止旧的central单边adaptive hop，仍会在持续失联时
+同步安全回退。
+
+最终LM20→52840、8B、step10、生产默认lead2冷启动4次中2次完成协商；两次均选择
+`450/600µs`，在完整120秒窗口末尾仍维持约2018–2019 slots/s、双向Data、
+`delivery_failures=0`，没有回600。相对500/600基线约1922/s提升约5%，应用吞吐窗口约
+3.6–4.8KB/s。lead4复测也得到完整120秒不回退的450/600 run。
+
+另增加默认关闭的`pll-sync-servo`实验：只在phase-0 anchor按实际elapsed slots积分fast PLL残余，
+以Q8分数微秒dither修正slot distance。8次A/B仅1次Stable且未延长失效时间，因此不启用生产
+默认；当前稳定收益来自专用长同步slot、保守floor、burst-tolerant miss阈值和正确bench窗口，
+不是未经验证的频率积分器。
+
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
 自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收

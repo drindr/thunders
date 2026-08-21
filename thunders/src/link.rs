@@ -8,6 +8,7 @@ const HOP_MISS_THRESHOLD: u8 = 16;
 /// drops back to `Disconnected` and the node returns to the initial channel,
 /// so a recovered link can re-align.
 const LINK_LOSS_THRESHOLD: u8 = 16;
+const SYNC_LINK_LOSS_THRESHOLD: u8 = 64;
 
 /// Consecutive successful frames before the link is called Connected (one
 /// lucky catch on a marginal link must not enable the hop: the peer may
@@ -184,17 +185,20 @@ impl LinkState {
     /// central hop away from a jammed channel; a long streak declares the
     /// link lost and pins back to the initial channel so a recovered link
     /// can re-align. The peripheral never hops on its own streak.
-    fn on_miss(&mut self, streak: &mut u8) {
+    fn on_miss(&mut self, streak: &mut u8, loss_threshold: u8) {
         *streak = streak.saturating_add(1);
         self.connect_streak = 0;
         if self.status != LinkStatus::Connected {
             return;
         }
-        if *streak >= LINK_LOSS_THRESHOLD {
+        if *streak >= loss_threshold {
             self.status = LinkStatus::Disconnected;
             self.scheduler.sync(self.initial_channel);
             *streak = 0;
-        } else if self.central && *streak >= HOP_MISS_THRESHOLD {
+        } else if loss_threshold == LINK_LOSS_THRESHOLD
+            && self.central
+            && *streak >= HOP_MISS_THRESHOLD
+        {
             // Only the central drives the hop; the peripheral follows via
             // the beacon's channel index.
             self.scheduler.advance();
@@ -352,6 +356,8 @@ const CADENCE_FLAG_SYNC_SLOT: u8 = 64;
 const CADENCE_PROBATION_SUPERFRAMES: u32 = 2048;
 const CADENCE_BEACON_WIRE_LEN: u16 = 36;
 const BEACON_FLAG_SYNC_SLOT: u8 = 0x80;
+const SYNC_PRODUCTION_SHORT_FLOOR_US: u16 = 450;
+const SYNC_PRODUCTION_LONG_FLOOR_US: u16 = 600;
 
 fn cadence_exit_triggered(policy: CadenceExitPolicy, failed: u32, misses: u8) -> bool {
     (policy.delivery_failures != 0 && failed >= policy.delivery_failures as u32)
@@ -981,17 +987,21 @@ impl<P: Phy> LinkCore<P> {
         contract: TrafficContract,
         policy: CadenceProbePolicy,
         fixed_wire: bool,
+        sync_slot: bool,
     ) -> Result<(u16, u16), CadenceError> {
         let (forward_wire, reverse_wire) = self.data_wire_lengths(contract, fixed_wire)?;
-        Ok((
-            policy
-                .min_slot_us
-                .max(self.phy.min_probe_slot_period_us(forward_wire)),
-            policy.min_slot_us.max(
-                self.phy
-                    .min_probe_slot_period_us(reverse_wire.max(CADENCE_BEACON_WIRE_LEN)),
-            ),
-        ))
+        let mut short = policy
+            .min_slot_us
+            .max(self.phy.min_probe_slot_period_us(forward_wire));
+        let mut long = policy.min_slot_us.max(
+            self.phy
+                .min_probe_slot_period_us(reverse_wire.max(CADENCE_BEACON_WIRE_LEN)),
+        );
+        if sync_slot {
+            short = short.max(SYNC_PRODUCTION_SHORT_FLOOR_US);
+            long = long.max(SYNC_PRODUCTION_LONG_FLOOR_US);
+        }
+        Ok((short, long))
     }
 
     fn request_cadence(
@@ -1036,8 +1046,12 @@ impl<P: Phy> LinkCore<P> {
             return Err(CadenceError::Busy);
         }
         let stable = self.cadence_runtime.stable;
-        let (local_short_floor, local_long_floor) =
-            self.cadence_local_probe_floors(contract, policy, true)?;
+        let (local_short_floor, local_long_floor) = self.cadence_local_probe_floors(
+            contract,
+            policy,
+            true,
+            self.cadence_runtime.stable.forward_slots >= 2,
+        )?;
         if local_short_floor > stable.short_slot_us || local_long_floor > stable.long_slot_us {
             return Err(CadenceError::InvalidPolicy);
         }
@@ -1400,6 +1414,7 @@ impl<P: Phy> LinkCore<P> {
     }
 
     fn cadence_tick(&mut self, slot: u32, period: u32) {
+        let loss_threshold = self.loss_threshold();
         if self.cadence_runtime.releasing {
             if self.cadence_runtime.release_deadline == 0 {
                 self.cadence_runtime.release_deadline =
@@ -1433,7 +1448,7 @@ impl<P: Phy> LinkCore<P> {
             self.start_failed_probe_release();
             return;
         }
-        if self.missed_frames >= LINK_LOSS_THRESHOLD
+        if self.missed_frames >= loss_threshold
             && ((!probe_transition
                 && (self.cadence_active_contract.is_some() || self.cadence_runtime.releasing))
                 || probe_recovery_expired)
@@ -1448,7 +1463,7 @@ impl<P: Phy> LinkCore<P> {
             }
             let probation_failed = self.delivery_failures
                 != self.cadence_runtime.probation_failures_start
-                || self.missed_frames >= LINK_LOSS_THRESHOLD;
+                || self.missed_frames >= loss_threshold;
             if self.state.central && probation_failed {
                 self.start_failed_probe_release();
                 return;
@@ -1872,6 +1887,22 @@ impl<P: Phy> LinkCore<P> {
     /// `Config::tx_rx_ratio`; the peripheral's local ratio is the reverse,
     /// so both roles run exactly the same `tx then rx` data-plane rule and
     /// the ratio is no longer a mirror special-case.
+    fn loss_threshold(&self) -> u8 {
+        if self.cadence_active_sync_slot
+            || (self.cadence_runtime.sync_slot
+                && matches!(
+                    self.cadence_runtime.stage,
+                    CadenceRunStage::Applying
+                        | CadenceRunStage::Probation
+                        | CadenceRunStage::Stable
+                ))
+        {
+            SYNC_LINK_LOSS_THRESHOLD
+        } else {
+            LINK_LOSS_THRESHOLD
+        }
+    }
+
     fn local_ratio(&self) -> (u8, u8) {
         if self.state.central {
             self.state.tx_rx_ratio
@@ -2134,7 +2165,9 @@ impl<P: Phy> LinkCore<P> {
             self.cadence_runtime.stage,
             CadenceRunStage::Idle | CadenceRunStage::Stable
         ) {
-            self.state.on_miss(&mut self.consecutive_misses);
+            let loss_threshold = self.loss_threshold();
+            self.state
+                .on_miss(&mut self.consecutive_misses, loss_threshold);
         }
         // Negotiation deliberately substitutes control/Sample traffic for
         // Data. Do not let candidate losses drive the central's adaptive hop
@@ -2275,7 +2308,7 @@ impl<P: Phy> LinkCore<P> {
                 let stable = self.cadence_runtime.stable;
                 let fixed_wire = flags & CADENCE_FLAG_FIXED_WIRE != 0;
                 let sync_slot = flags & CADENCE_FLAG_SYNC_SLOT != 0 && stable.forward_slots >= 2;
-                match self.cadence_local_probe_floors(contract, policy, fixed_wire) {
+                match self.cadence_local_probe_floors(contract, policy, fixed_wire, sync_slot) {
                     Ok((short_floor, long_floor))
                         if short_floor <= stable.short_slot_us
                             && long_floor <= stable.long_slot_us =>
@@ -2323,7 +2356,8 @@ impl<P: Phy> LinkCore<P> {
                 let fixed_wire = flags & CADENCE_FLAG_FIXED_WIRE != 0;
                 let sync_slot = flags & CADENCE_FLAG_SYNC_SLOT != 0
                     && self.cadence_runtime.stable.forward_slots >= 2;
-                let floors = self.cadence_local_probe_floors(contract, policy, fixed_wire);
+                let floors =
+                    self.cadence_local_probe_floors(contract, policy, fixed_wire, sync_slot);
                 if forward_payload as usize > MAX_PAYLOAD
                     || reverse_payload as usize > MAX_PAYLOAD
                     || long_us < short_us
@@ -2381,6 +2415,7 @@ impl<P: Phy> LinkCore<P> {
                         self.cadence_runtime.contract,
                         self.cadence_runtime.policy,
                         self.cadence_runtime.fixed_wire,
+                        self.cadence_runtime.sync_slot,
                     );
                     let (local_short, local_long) = match local_floors {
                         Ok(floors) => floors,
@@ -2620,6 +2655,7 @@ impl<P: Phy> LinkCore<P> {
                                 profile.forward_slots,
                                 self.cadence_runtime.sync_slot,
                             ),
+                            profile.sync_slot,
                             profile_central_start(
                                 start_epoch,
                                 period,
@@ -2665,6 +2701,7 @@ impl<P: Phy> LinkCore<P> {
                             self.cadence_runtime.stable.forward_slots,
                             self.cadence_runtime.sync_slot,
                         ),
+                        self.cadence_runtime.stable.sync_slot,
                         profile_central_start(
                             self.cadence_runtime.apply_epoch,
                             period,
@@ -2900,6 +2937,7 @@ impl<P: Phy> LinkCore<P> {
                             self.cadence_long_us,
                             period as u16,
                             profile_short_phases(self.cadence_short_phases, false),
+                            false,
                             self.cadence_apply_epoch,
                             self.cadence_apply_epoch,
                         );
@@ -3039,6 +3077,7 @@ impl<P: Phy> LinkCore<P> {
                                 self.cadence_long_us,
                                 period as u16,
                                 profile_short_phases(self.cadence_short_phases, false),
+                                false,
                                 cadence_apply_epoch,
                                 local_apply,
                             );
