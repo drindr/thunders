@@ -161,7 +161,7 @@ async fn main(spawner: Spawner) {
 
     match ROLE {
         Role::Central => {
-            let period = tx_n as u64 + rx_n as u64 + idle_n as u64;
+            let period = 1 + tx_n as u64 + rx_n as u64 + idle_n as u64;
             let mut central = Central::new(phy, cfg).await.unwrap();
             info!("link ready (Central)");
             #[cfg(feature = "cadence-probe")]
@@ -287,7 +287,8 @@ async fn main(spawner: Spawner) {
                     p[..4].copy_from_slice(b"PING");
                 }
                 let slot = thunders_phy_nrf::mpsl::mpsl_slot_count().wrapping_add(1);
-                let tx_phase = (slot % period as u32) < tx_n as u32 && slot % 64 != 0;
+                let phase = slot % period as u32;
+                let tx_phase = (1..=tx_n as u32).contains(&phase) && slot % 64 != 0;
                 if tx_phase {
                     tx_frames += 1;
                 }

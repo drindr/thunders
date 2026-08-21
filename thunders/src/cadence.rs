@@ -119,8 +119,8 @@ impl Default for CadenceProbePolicy {
 
 /// A phase-indexed short/long slot profile.
 ///
-/// Forward phases use `short_slot_us`, except optional phase 0 which may be a
-/// dedicated long Beacon/resync slot. Reverse and idle phases use `long_slot_us`.
+/// `forward_slots` and `reverse_slots` count only application Data phases.
+/// An optional phase-0 Beacon/resync slot is independent and uses `long_slot_us`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CadenceProfile {
@@ -128,13 +128,13 @@ pub struct CadenceProfile {
     pub short_slot_us: u16,
     /// Period of reverse/peripheral-TX and idle phases, in microseconds.
     pub long_slot_us: u16,
-    /// Number of forward phases at the start of each superframe.
+    /// Number of forward Data phases after the optional sync slot.
     pub forward_slots: u16,
     /// Number of reverse phases after the forward phases.
     pub reverse_slots: u16,
     /// Number of shared idle phases after the active phases.
     pub idle_slots: u16,
-    /// Reserve forward phase 0 as a long Beacon/resync slot.
+    /// Add an independent long phase-0 Beacon/resync slot.
     pub sync_slot: bool,
 }
 
@@ -175,21 +175,25 @@ impl CadenceProfile {
         }
     }
 
-    /// Return a copy with optional phase-0 Beacon/resync semantics.
+    /// Return a copy with an independent phase-0 Beacon/resync slot. Data
+    /// slot counts are unchanged: 8:2 becomes 1 sync + 8 forward + 2 reverse.
     pub const fn with_sync_slot(self, sync_slot: bool) -> Self {
         Self { sync_slot, ..self }
     }
 
     /// Number of slots in one superframe.
     pub const fn period_slots(&self) -> u32 {
-        self.forward_slots as u32 + self.reverse_slots as u32 + self.idle_slots as u32
+        self.forward_slots as u32
+            + self.reverse_slots as u32
+            + self.idle_slots as u32
+            + self.sync_slot as u32
     }
 
-    /// Wall-clock duration using this profile's phase-0 semantics.
+    /// Wall-clock duration using this profile's independent sync phase.
     pub const fn superframe_us(&self) -> u32 {
-        let sync = self.sync_slot as u32;
-        (self.forward_slots as u32 - sync) * self.short_slot_us as u32
-            + (self.reverse_slots as u32 + self.idle_slots as u32 + sync) * self.long_slot_us as u32
+        self.forward_slots as u32 * self.short_slot_us as u32
+            + (self.reverse_slots as u32 + self.idle_slots as u32 + self.sync_slot as u32)
+                * self.long_slot_us as u32
     }
 
     /// Validate the phase counts and slot ordering.
@@ -199,7 +203,6 @@ impl CadenceProfile {
             || self.short_slot_us > self.long_slot_us
             || self.forward_slots == 0
             || self.reverse_slots == 0
-            || (self.sync_slot && self.forward_slots < 2)
         {
             Err(CadenceError::InvalidProfile)
         } else {

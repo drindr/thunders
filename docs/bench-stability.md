@@ -401,6 +401,24 @@ future-boundary重锚，而非只提供长RX窗口。
 默认；当前稳定收益来自专用长同步slot、保守floor、burst-tolerant miss阈值和正确bench窗口，
 不是未经验证的频率积分器。
 
+#### 4c-7e. Beacon与8:2 Data分配彻底分离
+
+最终布局不再把Beacon算入8个forward slot：物理superframe是`1 sync + 8 forward Data +
+2 reverse Data`共11 slots。`CadenceProfile.forward_slots/reverse_slots`只表示应用Data容量，
+`sync_slot`独立增加period和long时长；phase0在Link/ARQ中没有local Data phase，phase1..8映射
+forward 0..7，phase9..10映射reverse 0..1。Beacon不会写RX run mask、轮换TX map或重置
+Stable期Data miss streak。MPSL初始profile、Probe、Commit和active profile统一使用11-slot布局。
+
+该布局是MPSL wire-layout版本变更：sync capability未回显时明确PeerRejected，不能在建立连接前
+兼容旧10-slot固件。Config新增`physical_period_slots(sync_slots)`，bench pacing和phase telemetry
+使用11-slot物理grid。同步Release还保留旧fixed contract解码2个depth-two残留包，避免codec
+retirement边界把`0xF1` fixed ACK误判为InvalidPacket。
+
+LM20→52840、8B、默认lead2、hold模式4次冷启动有1次完成协商；该run的500/600 profile在完整
+120秒窗口末尾仍维持约1895 slots/s、双向Data、`delivery_failures=0`。450/600在4次样本中
+没有通过完整Probation，因此独立sync布局的生产floor暂保持500/600。虽然slot rate低于旧的
+10-slot 450/600，但8:2现在是完整8个forward Data slots，Beacon不再偷占Data容量。
+
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
 自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收

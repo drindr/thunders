@@ -119,6 +119,11 @@ impl Config {
         self.tx_rx_ratio.0 as u16 + self.tx_rx_ratio.1 as u16 + self.idle_slots as u16
     }
 
+    /// Physical period after adding independently managed non-Data slots.
+    pub const fn physical_period_slots(&self, sync_slots: u8) -> u16 {
+        self.period_slots() + sync_slots as u16
+    }
+
     /// TX capacity of `role` in slots per period. This is the theoretical
     /// maximum offered load; ARQ retransmissions need spare capacity, so the
     /// bench offers only when the TX window has room.
