@@ -419,6 +419,20 @@ LM20→52840、8B、默认lead2、hold模式4次冷启动有1次完成协商；�
 没有通过完整Probation，因此独立sync布局的生产floor暂保持500/600。虽然slot rate低于旧的
 10-slot 450/600，但8:2现在是完整8个forward Data slots，Beacon不再偷占Data容量。
 
+#### 4c-7f. Fast模式与有界重试
+
+新增默认关闭的`cadence-fast`能力和bench入口`THUNDERS_CADENCE_MODE=fast`；它只把独立布局的
+forward Data floor从500降到450µs，sync/reverse仍为600µs，并保留Probe、双向Data
+Probation和64-miss fallback。450/600在90秒8次冷启动中3次Stable、120秒4次中1次Stable；
+成功run均保持到窗口末尾、约2035–2036 slots/s、`delivery_failures=0`。新fast入口复测4次有
+2次Stable。
+
+失败分类证明fast timing不是主因：失败run主要在建立初始Data前（无Request），少数停在
+Request后无peer bounds；没有run进入450 candidate后被Probe/Probation拒绝。为后者增加
+Request/Offer/Accept 2048-superframe控制deadline，示例在`ControlTimeout/Failed`后等待2秒、
+排空TX并用新generation重试，最多4次。无Data的冷启动仍需bench/设备级重启，不能靠cadence
+generation重试修复。
+
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
 自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收

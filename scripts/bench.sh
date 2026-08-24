@@ -32,6 +32,7 @@ PAYLOAD_SUFFIX="${THUNDERS_BENCH_PAYLOAD_SUFFIX:-0}"
 CADENCE_STEP_US="${THUNDERS_CADENCE_STEP_US:-25}"
 LFCLK_52840="${THUNDERS_52840_LFCLK:-rc}"
 PLL_MODE="${THUNDERS_PLL_MODE:-phase}"
+CADENCE_MODE="${THUNDERS_CADENCE_MODE:-safe}"
 PROBE_ARM_LEAD="${THUNDERS_PROBE_ARM_LEAD:-2}"
 case "$PROBE_ARM_LEAD" in
   2|3|4) ;;
@@ -40,6 +41,10 @@ esac
 case "$PLL_MODE" in
   phase|fixed|probe-freeze|sync-servo) ;;
   *) echo "unsupported THUNDERS_PLL_MODE=$PLL_MODE (use phase,fixed,probe-freeze,sync-servo)" >&2; exit 2 ;;
+esac
+case "$CADENCE_MODE" in
+  safe|fast) ;;
+  *) echo "unsupported THUNDERS_CADENCE_MODE=$CADENCE_MODE (use safe,fast)" >&2; exit 2 ;;
 esac
 case "$LFCLK_52840" in
   rc|xtal) ;;
@@ -93,6 +98,9 @@ build_one() {
     3) feats+=(--features probe-lead-3) ;;
     4) feats+=(--features probe-lead-4) ;;
   esac
+  if [ "$CADENCE_MODE" = "fast" ]; then
+    feats+=(--features cadence-fast)
+  fi
   if [ "${CADENCE_PROBE:-0}" = "1" ] && [ "$backend" = "mpsl" ]; then
     feats+=(--features cadence-probe)
   fi
@@ -180,7 +188,11 @@ run_pair() {
   if [ "${CADENCE_PROBE:-0}" = "1" ] && [ "$CADENCE_STEP_US" != "25" ]; then
     cadence_suffix="-s${CADENCE_STEP_US}"
   fi
-  local run="${c}-${p}-${backend}${mode_suffix}${lfclk_suffix}${pll_suffix}${lead_suffix}${ratio_suffix}${payload_suffix}${cadence_suffix}"
+  local cadence_mode_suffix=""
+  if [ "$CADENCE_MODE" = "fast" ]; then
+    cadence_mode_suffix="-fast"
+  fi
+  local run="${c}-${p}-${backend}${mode_suffix}${lfclk_suffix}${pll_suffix}${lead_suffix}${ratio_suffix}${payload_suffix}${cadence_mode_suffix}${cadence_suffix}"
   local celf="$BIN/$c-$backend-central.elf" pelf="$BIN/$p-$backend-peripheral.elf"
   [ -f "$celf" ] || { echo "missing $celf - run 'scripts/bench.sh build'"; exit 1; }
   [ -f "$pelf" ] || { echo "missing $pelf"; exit 1; }

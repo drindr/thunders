@@ -356,7 +356,11 @@ const CADENCE_FLAG_SYNC_SLOT: u8 = 64;
 const CADENCE_PROBATION_SUPERFRAMES: u32 = 2048;
 const CADENCE_BEACON_WIRE_LEN: u16 = 36;
 const BEACON_FLAG_SYNC_SLOT: u8 = 0x80;
-const SYNC_PRODUCTION_SHORT_FLOOR_US: u16 = 500;
+const SYNC_PRODUCTION_SHORT_FLOOR_US: u16 = if cfg!(feature = "cadence-fast") {
+    450
+} else {
+    500
+};
 const SYNC_PRODUCTION_LONG_FLOOR_US: u16 = 600;
 
 fn cadence_exit_triggered(policy: CadenceExitPolicy, failed: u32, misses: u8) -> bool {
@@ -367,6 +371,19 @@ fn cadence_exit_triggered(policy: CadenceExitPolicy, failed: u32, misses: u8) ->
 fn cadence_generation_newer(candidate: u8, current: u8) -> bool {
     let delta = candidate.wrapping_sub(current) & 0x7f;
     delta != 0 && delta < 64
+}
+
+fn cadence_offer_generation_allowed(stage: CadenceRunStage, current: u8, incoming: u8) -> bool {
+    match stage {
+        CadenceRunStage::Request => incoming == current,
+        CadenceRunStage::Accept => {
+            incoming == current || cadence_generation_newer(incoming, current)
+        }
+        CadenceRunStage::Idle | CadenceRunStage::Stable | CadenceRunStage::Failed => {
+            cadence_generation_newer(incoming, current)
+        }
+        _ => false,
+    }
 }
 
 fn accept_legacy_data_plane(active_fixed: bool, grace: &mut u8) -> bool {
@@ -503,6 +520,7 @@ struct CadenceRuntime {
     probation_failures_start: u32,
     probation_rx_data_start: u32,
     probation_tx_data_start: u32,
+    control_deadline: u32,
     commit_changes_profile: bool,
     releasing: bool,
     release_deadline: u32,
@@ -547,6 +565,7 @@ impl CadenceRuntime {
             probation_failures_start: 0,
             probation_rx_data_start: 0,
             probation_tx_data_start: 0,
+            control_deadline: 0,
             commit_changes_profile: false,
             releasing: false,
             release_deadline: 0,
@@ -1469,6 +1488,23 @@ impl<P: Phy> LinkCore<P> {
                 return;
             }
         }
+        let control_exchange = matches!(
+            self.cadence_runtime.stage,
+            CadenceRunStage::Request | CadenceRunStage::Offer | CadenceRunStage::Accept
+        ) && !self.cadence_runtime.releasing;
+        if control_exchange {
+            if self.cadence_runtime.control_deadline == 0 {
+                self.cadence_runtime.control_deadline =
+                    slot.wrapping_add(period.saturating_mul(2048));
+            } else if (slot.wrapping_sub(self.cadence_runtime.control_deadline) as i32) >= 0 {
+                self.cadence_runtime.control_deadline = 0;
+                self.cadence_runtime.error = Some(CadenceError::ControlTimeout);
+                self.cadence_runtime.stage = CadenceRunStage::Failed;
+                return;
+            }
+        } else {
+            self.cadence_runtime.control_deadline = 0;
+        }
         let probe_transition = matches!(
             self.cadence_runtime.stage,
             CadenceRunStage::ProbePlan
@@ -1712,7 +1748,7 @@ impl<P: Phy> LinkCore<P> {
             self.cadence_runtime.candidate
         };
         let mut flags = if stage == CadenceStage::Accept
-            && self.cadence_runtime.error == Some(CadenceError::PeerRejected)
+            && self.cadence_runtime.stage == CadenceRunStage::Failed
         {
             CADENCE_FLAG_REJECT
         } else if stage == CadenceStage::Report
@@ -2387,13 +2423,10 @@ impl<P: Phy> LinkCore<P> {
                 }
             }
             (false, CadenceStage::Offer)
-                if matches!(
+                if cadence_offer_generation_allowed(
                     self.cadence_runtime.stage,
-                    CadenceRunStage::Idle
-                        | CadenceRunStage::Request
-                        | CadenceRunStage::Stable
-                        | CadenceRunStage::Failed
-                        | CadenceRunStage::Accept
+                    self.cadence_runtime.generation,
+                    generation,
                 ) && self.state.lm.tx.inflight == 0
                     && self.pending_drop.is_none()
                     && self.pending_tx_len == 0 =>
@@ -3882,6 +3915,45 @@ mod tests {
         assert!(!cadence_generation_newer(6, 7));
         assert!(cadence_generation_newer(1, 127));
         assert!(!cadence_generation_newer(127, 1));
+    }
+
+    #[test]
+    fn offer_generation_never_rolls_back_retry_state() {
+        assert!(cadence_offer_generation_allowed(
+            CadenceRunStage::Request,
+            7,
+            7
+        ));
+        assert!(!cadence_offer_generation_allowed(
+            CadenceRunStage::Request,
+            7,
+            8
+        ));
+        assert!(cadence_offer_generation_allowed(
+            CadenceRunStage::Accept,
+            7,
+            7
+        ));
+        assert!(cadence_offer_generation_allowed(
+            CadenceRunStage::Accept,
+            7,
+            8
+        ));
+        assert!(!cadence_offer_generation_allowed(
+            CadenceRunStage::Accept,
+            7,
+            6
+        ));
+        assert!(cadence_offer_generation_allowed(
+            CadenceRunStage::Failed,
+            7,
+            8
+        ));
+        assert!(!cadence_offer_generation_allowed(
+            CadenceRunStage::Failed,
+            7,
+            7
+        ));
     }
 
     #[test]

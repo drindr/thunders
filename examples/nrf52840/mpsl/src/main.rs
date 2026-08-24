@@ -174,6 +174,10 @@ async fn main(spawner: Spawner) {
             info!("link ready (Central)");
             #[cfg(feature = "cadence-probe")]
             let mut cadence_requested = false;
+            #[cfg(feature = "cadence-probe")]
+            let mut cadence_attempts: u8 = 0;
+            #[cfg(feature = "cadence-probe")]
+            let mut cadence_retry_at: Option<Instant> = None;
             let mut cadence_draining = false;
             #[cfg(feature = "cadence-probe")]
             let mut cadence_reported = false;
@@ -221,6 +225,27 @@ async fn main(spawner: Spawner) {
 
             loop {
                 #[cfg(feature = "cadence-probe")]
+                if cadence_requested
+                    && !cadence_reported
+                    && matches!(
+                        central.cadence_status(),
+                        thunders::CadenceNegotiationStatus::Failed(
+                            thunders::CadenceError::ControlTimeout
+                        )
+                    )
+                    && cadence_attempts < 4
+                {
+                    let since = cadence_retry_at.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= embassy_time::Duration::from_secs(2) {
+                        info!("CADENCE RETRY after attempt={}", cadence_attempts);
+                        cadence_requested = false;
+                        cadence_draining = true;
+                        cadence_retry_at = None;
+                        cadence_last_bounds = None;
+                        cadence_last_candidate = None;
+                    }
+                }
+                #[cfg(feature = "cadence-probe")]
                 if !cadence_requested && central.status() == thunders::link::LinkStatus::Connected {
                     cadence_draining = true;
                     let policy = thunders::CadenceProbePolicy::new(300, CADENCE_STEP_US, 32, 0);
@@ -229,8 +254,10 @@ async fn main(spawner: Spawner) {
                         policy,
                     ) {
                         cadence_requested = true;
+                        cadence_attempts = cadence_attempts.saturating_add(1);
+                        cadence_retry_at = None;
                         cadence_draining = false;
-                        info!("CADENCE REQUEST gen={}", generation);
+                        info!("CADENCE REQUEST gen={} attempt={}", generation, cadence_attempts);
                     }
                 }
                 #[cfg(feature = "cadence-probe")]

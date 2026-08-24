@@ -318,6 +318,8 @@ pub enum CadenceError {
     /// The caller recorded metrics for a profile other than the current
     /// deterministic candidate.
     WrongCandidate,
+    /// Request/offer/accept exchange made no progress before its deadline.
+    ControlTimeout,
     /// The search is already finalized.
     SearchFinished,
 }
