@@ -59,8 +59,8 @@ pub enum Packet {
         /// The receiver re-syncs its scheduler to this index; hopping is
         /// driven by the central's miss threshold, not one step per slot.
         channel_index: u8,
-        /// Low 7 bits: sender RX window in 16us units. Bit 7 advertises an
-        /// active negotiated phase-0 Beacon/resync slot.
+        /// Low 6 bits: sender RX window in 16us units. Bit 6 marks an exact
+        /// initial profile commit epoch; bit 7 advertises the sync slot.
         flags: u8,
         /// The sender's slot cadence in us (0 = unknown). The follower
         /// adopts it at runtime: no compile-time matching needed.
@@ -156,6 +156,21 @@ pub enum Packet {
         /// The ACK lets the central's window advance from the liveness
         /// traffic itself.
         ack: u16,
+    },
+    /// Peripheral confirms the exact initial profile proposal epoch without
+    /// scheduling it yet.
+    SyncReady {
+        /// Initial MPSL profile generation advertised by the central.
+        generation: u8,
+        /// Exact proposal epoch seen in the Beacon.
+        proposal_epoch: u32,
+    },
+    /// Peripheral scheduled the exact initial profile commit epoch.
+    SyncArmed {
+        /// Initial MPSL profile generation advertised by the central.
+        generation: u8,
+        /// Exact commit epoch scheduled in the peripheral counter mapping.
+        apply_epoch: u32,
     },
     /// API-triggered cadence negotiation/probe control. It is repeated by
     /// the state machine until the peer advances to the next stage and also
@@ -445,6 +460,24 @@ mod tests {
         let n = pkt.to_bytes(&mut buf).unwrap();
         let decoded = Packet::from_bytes(&buf[..n]).unwrap();
         assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn round_trip_initial_sync_epochs() {
+        for pkt in [
+            Packet::SyncReady {
+                generation: 7,
+                proposal_epoch: u32::MAX - 10,
+            },
+            Packet::SyncArmed {
+                generation: 7,
+                apply_epoch: 12,
+            },
+        ] {
+            let mut buf = [0u8; 64];
+            let n = pkt.to_bytes(&mut buf).unwrap();
+            assert_eq!(Packet::from_bytes(&buf[..n]).unwrap(), pkt);
+        }
     }
 
     #[test]

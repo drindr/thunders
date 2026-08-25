@@ -702,13 +702,13 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         sync_slot: bool,
         central_apply_slot: u32,
         local_apply_slot: u32,
-    ) {
+    ) -> bool {
         if self
             .state
             .profile_armed
             .load(core::sync::atomic::Ordering::Acquire)
         {
-            return;
+            return false;
         }
         let short = short_us.max(self.min_short_slot_period_us()) as u32;
         let long = long_us.max(self.min_long_slot_period_us()) as u32;
@@ -728,6 +728,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state
             .profile_armed
             .store(true, core::sync::atomic::Ordering::Release);
+        true
     }
 
     fn schedule_slot_probe(

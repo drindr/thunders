@@ -356,6 +356,7 @@ const CADENCE_FLAG_SYNC_SLOT: u8 = 64;
 const CADENCE_PROBATION_SUPERFRAMES: u32 = 2048;
 const CADENCE_BEACON_WIRE_LEN: u16 = 36;
 const BEACON_FLAG_SYNC_SLOT: u8 = 0x80;
+const BEACON_FLAG_INITIAL_COMMIT: u8 = 0x40;
 const SYNC_PRODUCTION_SHORT_FLOOR_US: u16 = if cfg!(feature = "cadence-fast") {
     450
 } else {
@@ -596,8 +597,14 @@ struct LinkCore<P: Phy> {
     cadence_long_us: u16,
     cadence_short_phases: u16,
     cadence_apply_epoch: u32,
-    /// Peripheral handshake ACK: profile id, with bit 7 set after the armed
-    /// apply epoch has been received and scheduled.
+    /// Exact initial proposal epoch advertised by the central.
+    initial_sync_proposal_epoch: u32,
+    /// Peripheral repeats SyncReady for this proposal.
+    initial_sync_ready_epoch: u32,
+    /// Peripheral repeats SyncArmed for this scheduled commit.
+    initial_sync_armed_epoch: u32,
+    /// Central Beacon currently advertises a commit rather than a proposal.
+    initial_sync_commit: bool,
     cadence_ack: u8,
     /// API-triggered traffic-contract negotiation and bounded probe state.
     cadence_runtime: CadenceRuntime,
@@ -693,6 +700,10 @@ impl<P: Phy> LinkCore<P> {
             cadence_long_us,
             cadence_short_phases: cfg.tx_rx_ratio.0.max(1) as u16,
             cadence_apply_epoch: 0,
+            initial_sync_proposal_epoch: 0,
+            initial_sync_ready_epoch: 0,
+            initial_sync_armed_epoch: 0,
+            initial_sync_commit: false,
             cadence_ack: 0,
             cadence_runtime: CadenceRuntime::new(stable_profile),
             cadence_safe_profile: stable_profile,
@@ -1249,6 +1260,10 @@ impl<P: Phy> LinkCore<P> {
         self.cadence_long_us = self.cadence_safe_profile.long_slot_us;
         self.cadence_short_phases = self.cadence_safe_profile.forward_slots;
         self.cadence_apply_epoch = 0;
+        self.initial_sync_proposal_epoch = 0;
+        self.initial_sync_ready_epoch = 0;
+        self.initial_sync_armed_epoch = 0;
+        self.initial_sync_commit = false;
         self.cadence_ack = 0;
         self.cadence_negotiated = false;
         self.cadence_ok = false;
@@ -1479,6 +1494,14 @@ impl<P: Phy> LinkCore<P> {
 
     fn cadence_tick(&mut self, slot: u32, period: u32) {
         let loss_threshold = self.loss_threshold();
+        if self.state.central
+            && !self.cadence_negotiated
+            && self.cadence_apply_epoch != 0
+            && (slot.wrapping_sub(self.cadence_apply_epoch) as i32) >= 0
+        {
+            self.emergency_cadence_fallback();
+            return;
+        }
         if self.cadence_runtime.releasing {
             if self.cadence_runtime.release_deadline == 0 {
                 self.cadence_runtime.release_deadline =
@@ -1836,10 +1859,36 @@ impl<P: Phy> LinkCore<P> {
         })
     }
 
+    fn acquisition_packet(&self, min_slot_us: u16) -> Packet {
+        if self.initial_sync_armed_epoch != 0 {
+            Packet::SyncArmed {
+                generation: self.cadence_id,
+                apply_epoch: self.initial_sync_armed_epoch,
+            }
+        } else if self.initial_sync_ready_epoch != 0 {
+            Packet::SyncReady {
+                generation: self.cadence_id,
+                proposal_epoch: self.initial_sync_ready_epoch,
+            }
+        } else {
+            Packet::SlotRequest {
+                min_slot_us,
+                min_short_slot_us: self.phy.min_short_slot_period_us(),
+                cadence_ack: self.cadence_ack,
+                ack: self.state.lm.rx.ack(),
+            }
+        }
+    }
+
     fn beacon_packet(&self, step: u32, period: u16, beacon_epoch: u32) -> Packet {
-        let flags = (self.phy.rx_window_us() / 16).min(0x7f) as u8
+        let flags = (self.phy.rx_window_us() / 16).min(0x3f) as u8
             | if self.cadence_active_sync_slot {
                 BEACON_FLAG_SYNC_SLOT
+            } else {
+                0
+            }
+            | if self.initial_sync_commit {
+                BEACON_FLAG_INITIAL_COMMIT
             } else {
                 0
             };
@@ -2090,8 +2139,12 @@ impl<P: Phy> LinkCore<P> {
             // traffic, the TX branch below is identical except for the
             // central burst path.
             let min_slot_us = self.phy.min_slot_period_us();
-            let slotrequest =
-                !central && min_slot_us > 0 && (!self.cadence_ok || !self.state.lm.rx.have);
+            let slotrequest = !central
+                && min_slot_us > 0
+                && (!self.cadence_ok
+                    || !self.state.lm.rx.have
+                    || self.initial_sync_ready_epoch != 0
+                    || self.initial_sync_armed_epoch != 0);
             let cadence_pending = central && !self.cadence_negotiated && min_slot_us > 0;
             let profile_countdown = self.cadence_runtime.stage != CadenceRunStage::Commit
                 && self.cadence_id != 0
@@ -2114,12 +2167,7 @@ impl<P: Phy> LinkCore<P> {
                 // Peripheral acquisition: this slot carries our minimum
                 // cadence instead of data, with the TX delay swept.
                 self.phy.set_tx_delay_sweep(true);
-                let outbound = Packet::SlotRequest {
-                    min_slot_us,
-                    min_short_slot_us: self.phy.min_short_slot_period_us(),
-                    cadence_ack: self.cadence_ack,
-                    ack: self.state.lm.rx.ack(),
-                };
+                let outbound = self.acquisition_packet(min_slot_us);
                 let n = self.encode_packet(&outbound)?;
                 // Acquisition SlotRequests stay on the plain path: they are
                 // isolated TX slots and must not inherit a half-open burst
@@ -2975,7 +3023,10 @@ impl<P: Phy> LinkCore<P> {
                 ack,
             } if central => {
                 if cadence_ack == 0
-                    && (self.cadence_active_contract.is_some() || self.cadence_runtime.releasing)
+                    && (self.cadence_negotiated
+                        || self.initial_sync_commit
+                        || self.cadence_active_contract.is_some()
+                        || self.cadence_runtime.releasing)
                 {
                     // The peer independently entered uniform acquisition
                     // fallback after severe loss. Join it before processing
@@ -3003,13 +3054,9 @@ impl<P: Phy> LinkCore<P> {
                     self.cadence_short_us =
                         self.phy.min_short_slot_period_us().max(min_short_slot_us);
                     self.cadence_long_us = self.phy.min_long_slot_period_us().max(min_slot_us);
-                    // One successful reverse SlotRequest is enough to arm
-                    // the profile. The apply boundary is 16 superframes in
-                    // the future; until then every central TX slot carries
-                    // the armed beacon (~128 delivery opportunities at 8:2).
-                    // Waiting for a second/third SR acknowledgement made the
-                    // fragile acquisition path itself the handshake.
-                    if self.cadence_apply_epoch == 0 {
+                    // First SR only creates a proposal. Neither side changes
+                    // cadence until exact SyncReady/SyncArmed epochs close.
+                    if self.initial_sync_proposal_epoch == 0 {
                         let lead = period.saturating_mul(16).max(period);
                         // Stay in the central hardware-slot coordinate. App
                         // processing can lag the caught SlotRequest by a
@@ -3023,7 +3070,44 @@ impl<P: Phy> LinkCore<P> {
                         } else {
                             candidate.wrapping_add(period - rem)
                         };
-                        self.phy.schedule_slot_profile(
+                        self.initial_sync_proposal_epoch = self.cadence_apply_epoch;
+                        self.initial_sync_commit = false;
+                    }
+                    let _ = cadence_ack; // legacy diagnostic only
+                }
+            }
+            Packet::SyncReady {
+                generation,
+                proposal_epoch,
+            } if central => {
+                if generation == self.cadence_id
+                    && proposal_epoch == self.initial_sync_proposal_epoch
+                    && !self.initial_sync_commit
+                    && !self.cadence_negotiated
+                {
+                    let lead = period.saturating_mul(16).max(period);
+                    let candidate = catch_slot.wrapping_add(lead);
+                    let rem = candidate % period;
+                    self.cadence_apply_epoch = if rem == 0 {
+                        candidate
+                    } else {
+                        candidate.wrapping_add(period - rem)
+                    };
+                    self.initial_sync_commit = true;
+                }
+            }
+            Packet::SyncArmed {
+                generation,
+                apply_epoch,
+            } if central => {
+                if generation == self.cadence_id
+                    && self.initial_sync_commit
+                    && apply_epoch == self.cadence_apply_epoch
+                    && !self.cadence_negotiated
+                {
+                    let lead = apply_epoch.wrapping_sub(catch_slot) as i32;
+                    if lead >= PROBE_ARM_LEAD_SLOTS {
+                        if self.phy.schedule_slot_profile(
                             self.cadence_short_us,
                             self.cadence_long_us,
                             period as u16,
@@ -3033,20 +3117,26 @@ impl<P: Phy> LinkCore<P> {
                             ),
                             self.cadence_safe_profile.sync_slot,
                             profile_central_start(
-                                self.cadence_apply_epoch,
+                                apply_epoch,
                                 period,
                                 self.cadence_safe_profile.sync_slot,
                             ),
-                            self.cadence_apply_epoch,
-                        );
-                        self.cadence_negotiated = true;
-                        self.cadence_runtime.stable.short_slot_us = self.cadence_short_us;
-                        self.cadence_runtime.stable.long_slot_us = self.cadence_long_us;
-                        self.cadence_safe_profile = self.cadence_runtime.stable;
+                            apply_epoch,
+                        ) {
+                            self.cadence_negotiated = true;
+                            self.cadence_runtime.stable.short_slot_us = self.cadence_short_us;
+                            self.cadence_runtime.stable.long_slot_us = self.cadence_long_us;
+                            self.cadence_safe_profile = self.cadence_runtime.stable;
+                            self.initial_sync_proposal_epoch = 0;
+                        } else {
+                            self.emergency_cadence_fallback();
+                        }
+                    } else {
+                        self.emergency_cadence_fallback();
                     }
-                    let _ = cadence_ack; // diagnostic/forward-compatible ACK
                 }
             }
+            Packet::SyncReady { .. } | Packet::SyncArmed { .. } => {}
             Packet::Beacon {
                 epoch: beacon_epoch,
                 channel_index,
@@ -3063,8 +3153,13 @@ impl<P: Phy> LinkCore<P> {
                 short_phases,
                 cadence_apply_epoch,
             } if !central => {
+                let initial_sync_in_flight = self.initial_sync_proposal_epoch != 0
+                    || self.initial_sync_ready_epoch != 0
+                    || self.initial_sync_armed_epoch != 0;
                 if should_join_central_fallback(
-                    self.cadence_active_contract.is_some(),
+                    self.cadence_active_contract.is_some()
+                        || self.cadence_negotiated
+                        || initial_sync_in_flight,
                     cadence_apply_epoch,
                 ) {
                     // An authoritative central reboot/fallback beacon joins the
@@ -3073,7 +3168,8 @@ impl<P: Phy> LinkCore<P> {
                     self.emergency_cadence_fallback();
                 }
                 self.state.scheduler.sync(channel_index);
-                let rx_window_flags = flags & !BEACON_FLAG_SYNC_SLOT;
+                let initial_commit = flags & BEACON_FLAG_INITIAL_COMMIT != 0;
+                let rx_window_flags = flags & 0x3f;
                 if rx_window_flags > 0 {
                     self.phy.set_peer_rx_window(rx_window_flags as u16 * 16);
                 }
@@ -3152,25 +3248,28 @@ impl<P: Phy> LinkCore<P> {
                     self.cadence_short_us = short_slot_us.max(self.phy.min_short_slot_period_us());
                     self.cadence_long_us = long_slot_us.max(self.phy.min_long_slot_period_us());
                     self.cadence_short_phases = short_phases.min(period as u16);
-                    // Once this generation's armed epoch was scheduled, keep
-                    // the high bit across later beacons. After the epoch is
-                    // in the past it is no longer schedulable, but clearing
-                    // the bit would make the next beacon call uniform
-                    // align_slot_period(600) and silently disable the active
-                    // mixed profile on the follower only.
-                    if self.cadence_ack & 0x80 == 0 {
+                    if !initial_commit
+                        && cadence_apply_epoch != 0
+                        && self.state.beacon_anchor_ready
+                        && !self.cadence_negotiated
+                    {
+                        self.initial_sync_proposal_epoch = cadence_apply_epoch;
+                        self.initial_sync_ready_epoch = cadence_apply_epoch;
+                        self.initial_sync_armed_epoch = 0;
+                        self.cadence_apply_epoch = cadence_apply_epoch;
                         self.cadence_ack = cadence_id;
-                    }
-                    if cadence_apply_epoch != 0
+                    } else if initial_commit
+                        && cadence_apply_epoch != 0
+                        && cadence_apply_epoch != self.initial_sync_proposal_epoch
+                        && self.initial_sync_ready_epoch != 0
                         && catch_slot != 0
                         && self.state.beacon_anchor_ready
-                        && (self.cadence_ack & 0x80 == 0
-                            || self.cadence_apply_epoch != cadence_apply_epoch)
+                        && !self.cadence_negotiated
                     {
                         let delta = cadence_apply_epoch.wrapping_sub(beacon_epoch) as i32;
-                        if delta > 0 {
+                        if delta >= PROBE_ARM_LEAD_SLOTS {
                             let local_apply = catch_slot.wrapping_add(delta as u32);
-                            self.phy.schedule_slot_profile(
+                            if self.phy.schedule_slot_profile(
                                 self.cadence_short_us,
                                 self.cadence_long_us,
                                 period as u16,
@@ -3185,13 +3284,16 @@ impl<P: Phy> LinkCore<P> {
                                     self.cadence_safe_profile.sync_slot,
                                 ),
                                 local_apply,
-                            );
-                            self.cadence_apply_epoch = cadence_apply_epoch;
-                            self.cadence_ack = cadence_id | 0x80;
-                            self.cadence_ok = true;
-                            self.cadence_runtime.stable.short_slot_us = self.cadence_short_us;
-                            self.cadence_runtime.stable.long_slot_us = self.cadence_long_us;
-                            self.cadence_safe_profile = self.cadence_runtime.stable;
+                            ) {
+                                self.cadence_apply_epoch = cadence_apply_epoch;
+                                self.initial_sync_ready_epoch = 0;
+                                self.initial_sync_armed_epoch = cadence_apply_epoch;
+                                self.cadence_ack = cadence_id | 0x80;
+                                self.cadence_ok = true;
+                                self.cadence_runtime.stable.short_slot_us = self.cadence_short_us;
+                                self.cadence_runtime.stable.long_slot_us = self.cadence_long_us;
+                                self.cadence_safe_profile = self.cadence_runtime.stable;
+                            }
                         }
                     }
                 }
@@ -3199,6 +3301,23 @@ impl<P: Phy> LinkCore<P> {
             _ => {}
         }
 
+        if central
+            && data_plane_rx
+            && self.initial_sync_commit
+            && (catch_slot.wrapping_sub(self.cadence_apply_epoch) as i32) >= 0
+        {
+            self.initial_sync_commit = false;
+            self.initial_sync_armed_epoch = 0;
+        }
+        if !central
+            && data_plane_rx
+            && self.initial_sync_armed_epoch != 0
+            && (catch_slot.wrapping_sub(self.cadence_apply_epoch) as i32) >= 0
+        {
+            self.initial_sync_armed_epoch = 0;
+            self.initial_sync_proposal_epoch = 0;
+            self.cadence_negotiated = true;
+        }
         if !central
             && data_plane_rx
             && self.cadence_runtime.stage == CadenceRunStage::Applying
@@ -3286,8 +3405,12 @@ impl<P: Phy> LinkCore<P> {
                 0
             };
             let min_slot_us = self.phy.min_slot_period_us();
-            let slotrequest =
-                !central && min_slot_us > 0 && (!self.cadence_ok || !self.state.lm.rx.have);
+            let slotrequest = !central
+                && min_slot_us > 0
+                && (!self.cadence_ok
+                    || !self.state.lm.rx.have
+                    || self.initial_sync_ready_epoch != 0
+                    || self.initial_sync_armed_epoch != 0);
             let cadence_pending = central && !self.cadence_negotiated && min_slot_us > 0;
             let profile_countdown = self.cadence_runtime.stage != CadenceRunStage::Commit
                 && self.cadence_id != 0
@@ -3310,12 +3433,7 @@ impl<P: Phy> LinkCore<P> {
                 // Peripheral acquisition: this slot carries our minimum
                 // cadence instead of data, with the TX delay swept.
                 self.phy.set_tx_delay_sweep(true);
-                let outbound = Packet::SlotRequest {
-                    min_slot_us,
-                    min_short_slot_us: self.phy.min_short_slot_period_us(),
-                    cadence_ack: self.cadence_ack,
-                    ack: self.state.lm.rx.ack(),
-                };
+                let outbound = self.acquisition_packet(min_slot_us);
                 let n = self.encode_packet(&outbound)?;
                 self.phy
                     .op_publish_tx(&self.tx_buf[..n], target, grace)

@@ -433,6 +433,21 @@ Request/Offer/Accept 2048-superframe控制deadline，示例在`ControlTimeout/Fa
 排空TX并用新generation重试，最多4次。无Data的冷启动仍需bench/设备级重启，不能靠cadence
 generation重试修复。
 
+#### 4c-7g. 显式initial SyncReady/SyncArmed
+
+初始mixed profile不再由central收到一颗SlotRequest就单边schedule。新握手为：central Beacon广播
+proposal epoch；peripheral在两Beacon anchor一致后只回`SyncReady{generation,
+proposal_epoch}`；central收到精确Ready后选择新的future commit epoch并以Beacon bit6广播；
+peripheral仅对该commit schedule成功后回`SyncArmed{generation, apply_epoch}`；central收到精确
+Armed且lead足够才schedule。`schedule_slot_profile`改为返回bool，拒绝pending replacement时不会
+伪报Armed；fallback会清空双方initial state，已协商peer发送zero-ack SlotRequest时central也
+重新加入fallback。Sync控制包本身不形成Data Connected。
+
+该协议消除了initial profile单边apply的安全漏洞，但未提高本对硬件的冷启动yield：最终90秒
+8次样本为1/8 Stable，只有3/8建立普通Data；其余失败仍发生在首个Data之前。说明剩余根因在
+初始RADIO/PLL acquisition，而不是initial profile epoch确认。该安全握手保留，yield优化需单独
+重置/随机化PHY acquisition，不能继续靠cadence generation重试。
+
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
 自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收

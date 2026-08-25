@@ -221,7 +221,8 @@ pub trait Phy {
         _sync_slot: bool,
         _central_apply_slot: u32,
         _local_apply_slot: u32,
-    ) {
+    ) -> bool {
+        false
     }
 
     /// Lowest slot period that may be tested by a bounded probe. It may be
