@@ -446,6 +446,22 @@ Armed且lead足够才schedule。`schedule_slot_profile`改为返回bool，拒绝
 初始RADIO/PLL acquisition，而不是initial profile epoch确认。该安全握手保留，yield优化需单独
 重置/随机化PHY acquisition，不能继续靠cadence generation重试。
 
+#### 4c-7h. 长时间双向soak
+
+整理后的`34859a2` safe hold固件做了长窗口验证。bench新增
+`BENCH_STABLE_DEADLINE_SECS`：长soak若在deadline内未进入Stable会提前结束该冷启动，避免把
+整段测量时间浪费在已知的acquisition失败；一旦Stable仍运行完整`SECS`。
+
+| 方向 | 窗口 | Profile | 最终rate | 最终Data RX/TX | df | retx |
+|---|---:|---:|---:|---:|---:|---:|
+| LM20→52840 | 15分钟 | 500/600 | 1895/s | 305582 / 35737 | 0 | 14 |
+| 52840→LM20 | 10分钟 | 500/600 | 1895/s | 199357 / 6326 | 0 | 85 |
+
+两次均无Exit/Release/fallback，所有5秒窗口保持约1886–1895 slots/s，双向Data持续增长。
+反向累计重传较多但10分钟内仅85次、`delivery_failures=0`，不构成稳定性回归。没有观察到可供
+进一步修复的运行期失稳，因此本轮不调整PLL、miss阈值或生产slot floor；剩余问题仍是冷启动
+acquisition yield，而非Stable后的持续性。
+
 最终profile与固定wire codec在同一个apply epoch生效；`frame()`长度只要不等于
 对应方向合同的精确payload长度就返回`PayloadExceedsCadenceProfile`，不会填充、截断、
 自动扩slot或偷偷重协商。协商开始前双方TX窗口必须排空，进入控制状态后也不再接收

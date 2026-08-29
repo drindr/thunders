@@ -218,7 +218,22 @@ run_pair() {
     done
     if grep -q "BENCH READY" "$LOGS/$run.central.log" 2>/dev/null; then
       c_ready=1
-      sleep "$secs"
+      local measured=0
+      local stable_deadline="${BENCH_STABLE_DEADLINE_SECS:-$secs}"
+      if [ "${CADENCE_PROBE:-0}" = "1" ] && [ "$stable_deadline" -lt "$secs" ]; then
+        while [ "$measured" -lt "$stable_deadline" ] && \
+              ! grep -q "CADENCE STABLE" "$LOGS/$run.central.log" 2>/dev/null; do
+          sleep 1
+          measured=$((measured + 1))
+        done
+      fi
+      if [ "${CADENCE_PROBE:-0}" != "1" ] || \
+         grep -q "CADENCE STABLE" "$LOGS/$run.central.log" 2>/dev/null || \
+         [ "$stable_deadline" -ge "$secs" ]; then
+        sleep $((secs - measured))
+      else
+        echo "no Stable within ${stable_deadline}s, ending attempt early"
+      fi
     fi
     kill -INT -- -"$cpid" 2>/dev/null || true
     for _ in 1 2 3 4 5; do
