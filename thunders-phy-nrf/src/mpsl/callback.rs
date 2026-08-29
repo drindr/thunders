@@ -6,29 +6,6 @@ use super::{MPSL_TX_TAIL_US, PLL_GAIN_DEN, PLL_GAIN_NUM, PLL_SWEEP_MISSES, PLL_S
 use core::sync::atomic::Ordering;
 use thunders::phy::SlotProbeStats;
 
-const SYNC_FREQ_MAX_Q8: i32 = 64;
-const SYNC_FREQ_SCALE: i32 = 256;
-
-#[inline(always)]
-fn integrate_sync_frequency(current_q8: i32, correction_sum_us: i32, elapsed: u32) -> i32 {
-    let residual_q8 = (correction_sum_us.saturating_mul(SYNC_FREQ_SCALE) / elapsed.max(1) as i32)
-        .clamp(-SYNC_FREQ_MAX_Q8, SYNC_FREQ_MAX_Q8);
-    (current_q8 + residual_q8 / 8).clamp(-SYNC_FREQ_MAX_Q8, SYNC_FREQ_MAX_Q8)
-}
-
-fn frequency_dither(accum_q8: &mut i32, freq_q8: i32) -> i32 {
-    *accum_q8 = accum_q8.saturating_add(freq_q8);
-    if *accum_q8 >= SYNC_FREQ_SCALE {
-        *accum_q8 -= SYNC_FREQ_SCALE;
-        1
-    } else if *accum_q8 <= -SYNC_FREQ_SCALE {
-        *accum_q8 += SYNC_FREQ_SCALE;
-        -1
-    } else {
-        0
-    }
-}
-
 #[inline(always)]
 fn slot_profile_due(slot: u32, apply: u32) -> bool {
     slot.wrapping_sub(apply) as i32 >= 0
@@ -63,19 +40,6 @@ fn phase_nominal(
 #[inline(always)]
 fn slot_before(slot: u32, end: u32) -> bool {
     (slot.wrapping_sub(end) as i32) < 0
-}
-
-#[inline(always)]
-fn probe_trace_index(state: &MpslState, slot: u32) -> Option<usize> {
-    if state.probe_start_slot == 0 {
-        return None;
-    }
-    match slot.wrapping_sub(state.probe_start_slot) as i32 {
-        -1 => Some(0),
-        0 => Some(1),
-        1 => Some(2),
-        _ => None,
-    }
 }
 
 /// Negotiated period for hardware slot `slot`: bounded probe overlay,
@@ -147,27 +111,15 @@ fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
         state.probe_clock_start_cyc = state.last_start_cyc;
         state.probe_raw_start = raw_probe_stats(state);
         state.probe_started = true;
-        state.sync_prev_anchor_slot = 0;
-        state.sync_phase_correction_sum_us = 0;
-        state.sync_freq_accum_q8 = 0;
-        state.sync_anchor_count = 0;
     }
     if state.profile_armed.load(Ordering::Acquire)
         && slot_profile_due(slot, state.profile_apply_slot)
     {
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-        if state.profile_sync_slot && !state.active_profile_sync_slot {
-            state.sync_freq_q8 = 0;
-        }
-        state.sync_prev_anchor_slot = 0;
-        state.sync_phase_correction_sum_us = 0;
-        state.sync_freq_accum_q8 = 0;
-        state.sync_anchor_count = 0;
         state.active_profile_short_us = state.profile_short_us;
         state.active_profile_long_us = state.profile_long_us;
         state.active_profile_period = state.profile_period;
         state.active_profile_short_phases = state.profile_short_phases;
-        state.active_profile_sync_slot = state.profile_sync_slot;
         state.active_profile_central_apply_slot = state.profile_central_apply_slot;
         state.active_profile_local_apply_slot = state.profile_apply_slot;
         state.active_profile_armed.store(true, Ordering::Release);
@@ -197,10 +149,6 @@ fn promote_profile_if_due(state: &mut MpslState, slot: u32) {
         state.probe_stats_seq.fetch_add(1, Ordering::Release);
         state.probe_started = false;
         state.probe_armed.store(false, Ordering::Release);
-        state.sync_prev_anchor_slot = 0;
-        state.sync_phase_correction_sum_us = 0;
-        state.sync_freq_accum_q8 = 0;
-        state.sync_anchor_count = 0;
     }
 }
 
@@ -266,34 +214,12 @@ pub unsafe extern "C" fn timeslot_cb(
         let executed_kind = exec
             .map(|i| state.ops[i].kind)
             .unwrap_or(OpKind::Idle as u8);
-        let trace_index = probe_trace_index(state, slot);
-        if let Some(ti) = trace_index {
-            state.probe_trace_slot[ti] = slot;
-            state.probe_trace_phase[ti] = state
-                .probe_central_start_slot
-                .wrapping_add(slot.wrapping_sub(state.probe_start_slot))
-                % state.probe_period.max(1);
-            state.probe_trace_nominal[ti] = current_nominal;
-            state.probe_trace_exec_kind[ti] = executed_kind as u32;
-            state.probe_trace_exec_target[ti] = exec.map(|i| state.ops[i].target).unwrap_or(0);
-        }
         if let Some(i) = exec {
             state.ops[i].done_seq = state.ops[i].seq;
             state.ops[i].skipped = false;
         }
 
         radio::timeslot_do_work(state, exec);
-        if let Some(ti) = trace_index {
-            state.probe_trace_event_us[ti] = if executed_kind == OpKind::Tx as u8 {
-                state.tx_en_offset_us
-            } else if executed_kind == OpKind::Rx as u8 && state.addr_seen {
-                state.addr_poll_us
-            } else if executed_kind == OpKind::Rx as u8 {
-                state.rx_en_offset_us
-            } else {
-                0
-            };
-        }
 
         // The follower's phase-lock (the RX catch iter -> the chain distance).
         // Runs only for an RX op that actually executed in THIS slot.
@@ -422,11 +348,6 @@ pub unsafe extern "C" fn timeslot_cb(
                         // Re-calibrate from scratch after a real phase loss.
                         state.addr_target_us = 60;
                         state.calib_count = 0;
-                        state.sync_prev_anchor_slot = 0;
-                        state.sync_phase_correction_sum_us = 0;
-                        state.sync_freq_q8 = 0;
-                        state.sync_freq_accum_q8 = 0;
-                        state.sync_anchor_count = 0;
                     }
                 }
             }
@@ -441,15 +362,6 @@ pub unsafe extern "C" fn timeslot_cb(
             // disabling it drops the working pairs from ~12% to 67-95%
             // loss - the tighter lock helps every pair.)
             if state.follower && state.addr_seen {
-                let sync_anchor = state.active_profile_armed.load(Ordering::Acquire)
-                    && state.active_profile_sync_slot
-                    && !state.probe_armed.load(Ordering::Acquire)
-                    && profile_phase(
-                        slot,
-                        state.active_profile_central_apply_slot,
-                        state.active_profile_local_apply_slot,
-                        state.active_profile_period,
-                    ) == state.active_profile_period.saturating_sub(1);
                 // Calibrate the address target from locked catches. The
                 // first catches after a sweep can be near the window edge,
                 // so only catches while already locked count.
@@ -464,52 +376,12 @@ pub unsafe extern "C" fn timeslot_cb(
                 state.addr_target_us = state.addr_target_us.clamp(50, 180);
                 let err = state.addr_poll_us as i32 - state.addr_target_us as i32;
                 let corr = err * PLL_GAIN_NUM / PLL_GAIN_DEN;
-                let sync_profile_active = state.active_profile_armed.load(Ordering::Acquire)
-                    && state.active_profile_sync_slot
-                    && !state.probe_armed.load(Ordering::Acquire);
-                if cfg!(feature = "pll-sync-servo") && sync_profile_active {
-                    state.sync_phase_correction_sum_us =
-                        state.sync_phase_correction_sum_us.saturating_add(corr);
-                    if sync_anchor {
-                        if state.sync_anchor_count != 0 {
-                            let elapsed = slot.wrapping_sub(state.sync_prev_anchor_slot).max(1);
-                            state.sync_freq_q8 = integrate_sync_frequency(
-                                state.sync_freq_q8,
-                                state.sync_phase_correction_sum_us,
-                                elapsed,
-                            );
-                        }
-                        state.sync_prev_anchor_slot = slot;
-                        state.sync_phase_correction_sum_us = 0;
-                        state.sync_anchor_count = state.sync_anchor_count.wrapping_add(1);
-                    }
-                }
-                // The fast PLL remains a one-shot phase step. The optional
-                // Beacon servo integrates only its residual correction across
-                // the actual number of slots between phase-0 anchors.
                 let nominal = current_nominal as i32;
                 let new_dist = (nominal + corr).clamp(nominal - 20, nominal + 20) as u32;
-                let freeze_probe = cfg!(feature = "pll-probe-freeze")
-                    && state.probe_armed.load(Ordering::Acquire)
-                    && slot_profile_due(slot, state.probe_start_slot)
-                    && slot_before(slot, state.probe_end_slot);
-                if !cfg!(feature = "pll-fixed") && !freeze_probe && new_dist != state.slot_distance
-                {
+                if new_dist != state.slot_distance {
                     state.slot_distance = new_dist;
                 }
             }
-        }
-
-        let sync_servo_active = state.follower
-            && state.active_profile_armed.load(Ordering::Acquire)
-            && state.active_profile_sync_slot
-            && !state.probe_armed.load(Ordering::Acquire)
-            && state.rx_misses < PLL_SWEEP_MISSES;
-        if cfg!(feature = "pll-sync-servo") && sync_servo_active && !cfg!(feature = "pll-fixed") {
-            let step = frequency_dither(&mut state.sync_freq_accum_q8, state.sync_freq_q8);
-            let nominal = current_nominal as i32;
-            state.slot_distance =
-                (state.slot_distance as i32 + step).clamp(nominal - 20, nominal + 20) as u32;
         }
 
         // Chain the next timeslot. Distance describes CURRENT-start to
@@ -548,34 +420,6 @@ pub unsafe extern "C" fn timeslot_cb(
         &mut RET as *mut _
     } else {
         core::ptr::null_mut()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{frequency_dither, integrate_sync_frequency};
-
-    #[test]
-    fn sync_frequency_uses_actual_anchor_interval() {
-        assert_eq!(integrate_sync_frequency(0, 1, 10), 3);
-        assert_eq!(integrate_sync_frequency(0, 1, 20), 1);
-        assert_eq!(integrate_sync_frequency(63, 10, 1), 64);
-    }
-
-    #[test]
-    fn fractional_frequency_dither_is_symmetric() {
-        let mut positive = 0;
-        let mut negative = 0;
-        let mut pos_sum = 0;
-        let mut neg_sum = 0;
-        for _ in 0..16 {
-            pos_sum += frequency_dither(&mut positive, 64);
-            neg_sum += frequency_dither(&mut negative, -64);
-        }
-        assert_eq!(pos_sum, 4);
-        assert_eq!(neg_sum, -4);
-        assert_eq!(positive, 0);
-        assert_eq!(negative, 0);
     }
 }
 

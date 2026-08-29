@@ -218,7 +218,6 @@ pub trait Phy {
         _long_us: u16,
         _period: u16,
         _short_phases: u16,
-        _sync_slot: bool,
         _central_apply_slot: u32,
         _local_apply_slot: u32,
     ) -> bool {
@@ -248,7 +247,6 @@ pub trait Phy {
         _long_us: u16,
         _period: u16,
         _short_phases: u16,
-        _sync_slot: bool,
         _central_apply_slot: u32,
         _local_apply_slot: u32,
     ) -> bool {

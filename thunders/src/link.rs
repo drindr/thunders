@@ -44,10 +44,7 @@ use crate::{
         CadenceProbePolicy, CadenceProfile, CadenceSearch, ProbeDecision, ProbeMetrics,
         TrafficContract,
     },
-    config::{
-        CENTRAL_REPLY_TIMEOUT_US, Config, MAX_PAYLOAD, NACK_BYTES, PERIPHERAL_LISTEN_TIMEOUT_US,
-        Role, WINDOW_SIZE,
-    },
+    config::{Config, MAX_PAYLOAD, NACK_BYTES, PERIPHERAL_LISTEN_TIMEOUT_US, Role, WINDOW_SIZE},
     error::Error,
     link_mgmt::{
         LinkMgmt, RxWindow, TxRunSlot, nack_from_mask, nack_nonzero, nack_set, nack_vec, seq_gt,
@@ -414,16 +411,7 @@ fn required_probe_rx(confirming: bool, expected_rx: u32) -> u32 {
     }
 }
 
-#[cfg(all(feature = "probe-lead-3", feature = "probe-lead-4"))]
-compile_error!("select only one probe lead feature");
-
-const PROBE_ARM_LEAD_SLOTS: i32 = if cfg!(feature = "probe-lead-4") {
-    4
-} else if cfg!(feature = "probe-lead-3") {
-    3
-} else {
-    2
-};
+const PROBE_ARM_LEAD_SLOTS: i32 = 2;
 
 fn probe_has_sufficient_arm_lead(start_delta: i32) -> bool {
     start_delta >= PROBE_ARM_LEAD_SLOTS
@@ -1260,16 +1248,27 @@ impl<P: Phy> LinkCore<P> {
         self.cadence_long_us = self.cadence_safe_profile.long_slot_us;
         self.cadence_short_phases = self.cadence_safe_profile.forward_slots;
         self.cadence_apply_epoch = 0;
-        self.initial_sync_proposal_epoch = 0;
-        self.initial_sync_ready_epoch = 0;
-        self.initial_sync_armed_epoch = 0;
-        self.initial_sync_commit = false;
+        self.reset_initial_sync();
         self.cadence_ack = 0;
         self.cadence_negotiated = false;
         self.cadence_ok = false;
         self.state.lm.rx.have = false;
         self.consecutive_misses = 0;
         self.missed_frames = 0;
+    }
+
+    fn initial_sync_in_flight(&self) -> bool {
+        self.initial_sync_proposal_epoch != 0
+            || self.initial_sync_ready_epoch != 0
+            || self.initial_sync_armed_epoch != 0
+            || self.initial_sync_commit
+    }
+
+    fn reset_initial_sync(&mut self) {
+        self.initial_sync_proposal_epoch = 0;
+        self.initial_sync_ready_epoch = 0;
+        self.initial_sync_armed_epoch = 0;
+        self.initial_sync_commit = false;
     }
 
     fn cadence_auto_exit_due(&self) -> bool {
@@ -2132,7 +2131,7 @@ impl<P: Phy> LinkCore<P> {
         let active_end = local_tx as u32 + local_rx as u32;
 
         if is_tx {
-            let mut tx_payload = tx_payload;
+            let tx_payload = tx_payload;
             let mut offer_rejected = false;
 
             // Role-specific acquisition gating. Once both directions have
@@ -2185,7 +2184,7 @@ impl<P: Phy> LinkCore<P> {
                 } else {
                     offer_rejected = self.enqueue_offer(tx_payload)?;
                     let picked = self.pick_data_seq();
-                    let outbound = if let Some(drop_seq) = self.pending_drop {
+                    let outbound = if self.pending_drop.is_some() {
                         self.drop_packet(local_rx as usize)
                     } else if let Some(seq) = picked {
                         self.data_packet(seq, local_phase as u8, local_rx as usize)
@@ -2315,16 +2314,6 @@ impl<P: Phy> LinkCore<P> {
     /// The follower's current mirror offset (diagnostic).
     pub fn slot_offset(&self) -> u32 {
         self.state.slot_offset
-    }
-
-    /// Data packets decoded from the peer (diagnostic; cumulative).
-    pub fn rx_data(&self) -> u32 {
-        self.rx_data
-    }
-
-    /// Data packets published for TX (diagnostic; cumulative).
-    pub fn tx_data(&self) -> u32 {
-        self.tx_data
     }
 
     /// The current hardware slot's phase, offset applied (diagnostic).
@@ -2793,7 +2782,6 @@ impl<P: Phy> LinkCore<P> {
                                 profile.forward_slots,
                                 self.cadence_runtime.sync_slot,
                             ),
-                            profile.sync_slot,
                             profile_central_start(
                                 start_epoch,
                                 period,
@@ -2839,7 +2827,6 @@ impl<P: Phy> LinkCore<P> {
                             self.cadence_runtime.stable.forward_slots,
                             self.cadence_runtime.sync_slot,
                         ),
-                        self.cadence_runtime.stable.sync_slot,
                         profile_central_start(
                             self.cadence_runtime.apply_epoch,
                             period,
@@ -3115,7 +3102,6 @@ impl<P: Phy> LinkCore<P> {
                                 self.cadence_short_phases,
                                 self.cadence_safe_profile.sync_slot,
                             ),
-                            self.cadence_safe_profile.sync_slot,
                             profile_central_start(
                                 apply_epoch,
                                 period,
@@ -3153,13 +3139,10 @@ impl<P: Phy> LinkCore<P> {
                 short_phases,
                 cadence_apply_epoch,
             } if !central => {
-                let initial_sync_in_flight = self.initial_sync_proposal_epoch != 0
-                    || self.initial_sync_ready_epoch != 0
-                    || self.initial_sync_armed_epoch != 0;
                 if should_join_central_fallback(
                     self.cadence_active_contract.is_some()
                         || self.cadence_negotiated
-                        || initial_sync_in_flight,
+                        || self.initial_sync_in_flight(),
                     cadence_apply_epoch,
                 ) {
                     // An authoritative central reboot/fallback beacon joins the
@@ -3277,7 +3260,6 @@ impl<P: Phy> LinkCore<P> {
                                     self.cadence_short_phases,
                                     self.cadence_safe_profile.sync_slot,
                                 ),
-                                self.cadence_safe_profile.sync_slot,
                                 profile_central_start(
                                     cadence_apply_epoch,
                                     period,

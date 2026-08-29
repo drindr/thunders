@@ -58,39 +58,6 @@ pub fn mpsl_rssi() -> u32 {
     }
 }
 
-/// Callback trace around the most recent Probe start boundary.
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct MpslProbeTrace {
-    /// Absolute hardware slots for start-1/start/start+1.
-    pub slot: [u32; 3],
-    /// Probe profile phase selected in each slot.
-    pub phase: [u32; 3],
-    /// Nominal period selected in each slot.
-    pub nominal: [u32; 3],
-    /// Executed [`OpKind`] numeric value.
-    pub exec_kind: [u32; 3],
-    /// Published op target consumed in each slot.
-    pub exec_target: [u32; 3],
-    /// TXEN offset, RX ADDRESS offset, or RXEN offset for the executed op.
-    pub event_us: [u32; 3],
-}
-
-/// Snapshot the most recent Probe boundary trace.
-pub fn mpsl_probe_trace() -> MpslProbeTrace {
-    unsafe {
-        let s = &*(STATE as *const MpslState);
-        MpslProbeTrace {
-            slot: s.probe_trace_slot,
-            phase: s.probe_trace_phase,
-            nominal: s.probe_trace_nominal,
-            exec_kind: s.probe_trace_exec_kind,
-            exec_target: s.probe_trace_exec_target,
-            event_us: s.probe_trace_event_us,
-        }
-    }
-}
-
 /// A named, ergonomic snapshot of the MPSL phase-lock state.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -134,10 +101,6 @@ pub struct MpslPllSnapshot {
     pub addr_target_us: u32,
     /// Locked catches used for the target calibration.
     pub calib_count: u32,
-    /// Beacon-only slow frequency estimate (Q8 us per slot).
-    pub sync_freq_q8: i32,
-    /// Valid phase-0 anchors consumed by the slow servo.
-    pub sync_anchor_count: u32,
     /// Our measured RXEN offset from slot START (us).
     pub rx_en_offset_us: u32,
     /// Our measured RXEN -> READY ramp (us).
@@ -214,8 +177,6 @@ pub fn mpsl_pll_snapshot() -> MpslPllSnapshot {
             rx_phase_all: s.rx_phase_all,
             addr_target_us: s.addr_target_us,
             calib_count: s.calib_count,
-            sync_freq_q8: s.sync_freq_q8,
-            sync_anchor_count: s.sync_anchor_count,
             rx_en_offset_us: s.rx_en_offset_us,
             rx_ramp_us: s.rx_ramp_us,
             tx_en_offset_us: s.tx_en_offset_us,
@@ -660,7 +621,6 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         long_us: u16,
         period: u16,
         short_phases: u16,
-        sync_slot: bool,
         central_apply_slot: u32,
         local_apply_slot: u32,
     ) -> bool {
@@ -683,7 +643,6 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state.profile_long_us = long_us as u32;
         self.state.profile_period = period;
         self.state.profile_short_phases = (short_phases as u32).min(period);
-        self.state.profile_sync_slot = sync_slot;
         self.state.profile_central_apply_slot = central_apply_slot;
         self.state.profile_apply_slot = local_apply_slot;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
@@ -699,7 +658,6 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         long_us: u16,
         period: u16,
         short_phases: u16,
-        sync_slot: bool,
         central_apply_slot: u32,
         local_apply_slot: u32,
     ) -> bool {
@@ -717,7 +675,6 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state.profile_long_us = long;
         self.state.profile_period = period;
         self.state.profile_short_phases = (short_phases as u32).min(period);
-        self.state.profile_sync_slot = sync_slot;
         self.state.profile_central_apply_slot = central_apply_slot;
         self.state.profile_apply_slot = local_apply_slot;
         // Same-core app -> MPSL IRQ publication: armed is written last. If
@@ -821,11 +778,6 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
             .probe_armed
             .store(false, core::sync::atomic::Ordering::Release);
         self.state.probe_started = false;
-        self.state.sync_prev_anchor_slot = 0;
-        self.state.sync_phase_correction_sum_us = 0;
-        self.state.sync_freq_q8 = 0;
-        self.state.sync_freq_accum_q8 = 0;
-        self.state.sync_anchor_count = 0;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         self.state.slot_nominal = us;
         self.state.slot_distance = us;

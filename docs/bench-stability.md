@@ -297,9 +297,8 @@ baseline，不再依赖app线程恰好在单slot窗口内醒来。错过精确ST
 
 #### 4c-7a. 52840时钟与PLL来源隔离
 
-bench增加`THUNDERS_52840_LFCLK=rc|xtal`以及
-`THUNDERS_PLL_MODE=phase|fixed|probe-freeze`，均为默认关闭的实验feature。8B、step10的
-冷启动A/B如下：
+曾用52840 RC/LFXO以及fixed/probe-freeze PLL实验隔离来源。实验结束后仅保留有诊断价值的
+`THUNDERS_52840_LFCLK=rc|xtal`；无效PLL feature及脚本入口已删除。8B、step10结果如下：
 
 | 方向/配置 | 尝试 | Data链路 | Request | Stable |
 |---|---:|---:|---:|---:|
@@ -320,7 +319,8 @@ Probe epoch→local slot映射、overlay首slot实际op/phase，以及reverse on
 
 #### 4c-7b. Probe arm lead与首slot callback trace
 
-bench增加`THUNDERS_PROBE_ARM_LEAD=2|3|4`。8B、step10的结果：
+曾比较Probe arm lead 2/3/4；lead提升无效，实验feature及脚本入口现已删除并固定为2。8B、
+step10结果：
 
 | 方向 | lead | 尝试 | Data链路 | Request | Stable |
 |---|---:|---:|---:|---:|---:|
@@ -396,10 +396,8 @@ future-boundary重锚，而非只提供长RX窗口。
 `delivery_failures=0`，没有回600。相对500/600基线约1922/s提升约5%，应用吞吐窗口约
 3.6–4.8KB/s。lead4复测也得到完整120秒不回退的450/600 run。
 
-另增加默认关闭的`pll-sync-servo`实验：只在phase-0 anchor按实际elapsed slots积分fast PLL残余，
-以Q8分数微秒dither修正slot distance。8次A/B仅1次Stable且未延长失效时间，因此不启用生产
-默认；当前稳定收益来自专用长同步slot、保守floor、burst-tolerant miss阈值和正确bench窗口，
-不是未经验证的频率积分器。
+phase-0慢速频率积分、fixed PLL和Probe freeze实验均未改善yield，相关feature、状态和遥测已
+删除；生产只保留经硬件验证的一次性phase correction。
 
 #### 4c-7e. Beacon与8:2 Data分配彻底分离
 
