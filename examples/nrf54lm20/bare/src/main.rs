@@ -17,7 +17,7 @@ bind_interrupts!(struct Irqs {
     RADIO_0 => RadioIrqHandler;
 });
 
-const PAYLOAD: usize = 8;
+const PAYLOAD: usize = 6;
 type Mode = OneWayState<PAYLOAD, 32>;
 const PLAN: thunders::FixedSlotPlan =
     fixed_slot_plan::<Mode>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
@@ -53,8 +53,6 @@ async fn main(_spawner: Spawner) {
     loop {
         let payload = [
             b'S',
-            b'T',
-            b'A',
             b'T',
             seq as u8,
             (seq >> 8) as u8,

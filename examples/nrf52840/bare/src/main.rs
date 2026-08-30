@@ -9,8 +9,7 @@ use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
 use thunders::{
     Address, AirTiming, FixedOneWayFrame, OneWayReceiver, OneWayState, SlotOverhead,
-    fixed_slot_plan,
-    phy::Phy,
+    fixed_slot_plan, phy::Phy,
 };
 use thunders_phy_nrf::{NrfRadioPhy, RadioIrqHandler, RadioMode};
 use {defmt_rtt as _, panic_probe as _};
@@ -19,7 +18,7 @@ bind_interrupts!(struct Irqs {
     RADIO => RadioIrqHandler;
 });
 
-const PAYLOAD: usize = 8;
+const PAYLOAD: usize = 6;
 type Mode = OneWayState<PAYLOAD, 32>;
 const PLAN: thunders::FixedSlotPlan =
     fixed_slot_plan::<Mode>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
@@ -60,7 +59,9 @@ async fn main(_spawner: Spawner) {
                 Ok(frame) => match receiver.receive(&frame, 0) {
                     Ok((packet, _time_diff)) => {
                         if have_seq {
-                            lost = lost.wrapping_add(packet.seq.wrapping_sub(last_seq).wrapping_sub(1) as u32);
+                            lost = lost.wrapping_add(
+                                packet.seq.wrapping_sub(last_seq).wrapping_sub(1) as u32,
+                            );
                         }
                         last_seq = packet.seq;
                         have_seq = true;

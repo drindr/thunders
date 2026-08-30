@@ -132,7 +132,8 @@ continuous multi-packet RX grant. The next PHY adapter must keep RADIO in RX
 and collect multiple fixed frames inside that one long receiver window.
 
 This smoke result validates the fixed codec and one-way state semantics, not
-the final slot plan or TimeDiff feedback loop.
+the final slot plan or TimeDiff feedback loop. The retained smoke programs now
+use `OneWayState<6, 32>`; six application bytes produce a nine-byte wire frame.
 
 ## Migration status
 
