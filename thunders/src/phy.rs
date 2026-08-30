@@ -4,6 +4,20 @@ use embassy_time::Duration;
 
 use crate::{config::Address, error::Error};
 
+/// Hardware timestamp paired with a received fixed packet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RxTiming {
+    /// Hardware slot that executed RX.
+    pub local_slot: u32,
+    /// DWT cycle at the slot START callback.
+    pub slot_start_cyc: u32,
+    /// RADIO ADDRESS offset from slot START, in microseconds.
+    pub address_offset_us: u32,
+    /// DWT cycles per microsecond.
+    pub cycles_per_us: u32,
+}
+
 /// Cumulative counters sampled around a bounded cadence probe.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

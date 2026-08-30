@@ -20,12 +20,10 @@ pub enum Error<P> {
     Unsupported,
     /// Encryption or decryption failure.
     Crypto(CryptoError),
-    /// Offered payload does not exactly match the active fixed-length contract.
-    PayloadExceedsCadenceProfile,
-    /// The reliable TX window is full: the caller offered data faster than
-    /// the link could deliver it. Backpressure — retry later (or lower the
-    /// offered rate; reliable delivery needs spare channel capacity).
-    WindowFull,
+    /// Offered payload does not match the mode's compile-time fixed length.
+    PayloadLengthMismatch,
+    /// Reliable one-way mode still awaits feedback for the previous packet.
+    AwaitingAck,
     /// A packet was retransmitted up to [`crate::config::MAX_RETRIES`] without
     /// an ACK. The link dropped it; the delivery-failure counter records it.
     DeliveryFailed,

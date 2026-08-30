@@ -3,11 +3,11 @@
 //! Supports nRF52, nRF53, and nRF54 series chips.
 
 use core::marker::PhantomData;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 use core::task::Poll;
 
 use embassy_nrf::interrupt::typelevel::{self, Binding, Handler, Interrupt};
-use embassy_nrf::{peripherals, Peri};
+use embassy_nrf::{Peri, peripherals};
 
 /// nRF54L HFXO load-cap trim (call once at boot). The 32 MHz crystal's
 /// internal capacitors come from FICR.XOSC32MTRIM + the DK's 15 pF target;
@@ -33,6 +33,12 @@ pub fn hfxo_cap_trim() {
 }
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::Duration;
+#[cfg(not(any(feature = "nrf5340-net", feature = "_nrf54")))]
+use nrf_pac::RADIO as PAC_RADIO;
+#[cfg(feature = "nrf5340-net")]
+use nrf_pac::RADIO_NS as PAC_RADIO;
+#[cfg(feature = "_nrf54")]
+use nrf_pac::RADIO_S as PAC_RADIO;
 use nrf_pac::radio::vals::S1incl;
 #[cfg(not(feature = "_nrf54"))]
 use nrf_pac::radio::vals::{
@@ -40,13 +46,7 @@ use nrf_pac::radio::vals::{
 };
 #[cfg(feature = "_nrf54")]
 use nrf_pac::radio::vals::{Crcinc, Crcstatus, Endian, Len, Mode, Plen, Skipaddr, State, Txpower};
-#[cfg(not(any(feature = "nrf5340-net", feature = "_nrf54")))]
-use nrf_pac::RADIO as PAC_RADIO;
-#[cfg(feature = "nrf5340-net")]
-use nrf_pac::RADIO_NS as PAC_RADIO;
-#[cfg(feature = "_nrf54")]
-use nrf_pac::RADIO_S as PAC_RADIO;
-use thunders::{config::Address, config::Role, error::Error, phy::Phy};
+use thunders::{config::Address, error::Error, phy::Phy};
 
 /// RADIO mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -692,24 +692,6 @@ impl<'d> NrfRadioPhy<'d> {
         }
     }
 
-    /// Enable the bare software slot scheduler with a [`Role`].
-    ///
-    /// The peripheral sweeps for the central's grid and phase-locks once
-    /// frames are caught; the central free-runs on the same fixed period
-    /// and advertises it in its beacons. This is the type-safe, ergonomic
-    /// entry point; [`set_paced`](Self::set_paced) is kept for
-    /// compatibility with the bool form.
-    pub fn set_paced_role(&mut self, role: Role) {
-        self.set_paced(matches!(role, Role::Peripheral));
-    }
-
-    /// Consuming builder form of [`set_paced_role`](Self::set_paced_role).
-    #[must_use]
-    pub fn with_slot_pacing(mut self, role: Role) -> Self {
-        self.set_paced_role(role);
-        self
-    }
-
     /// Enable the bare software slot scheduler.
     ///
     /// `follower` is true on the peripheral: it sweeps for the central's
@@ -781,8 +763,7 @@ impl<'d> NrfRadioPhy<'d> {
             return (0, 0);
         }
         let air = self.airtime_us(len);
-        let target_on_air =
-            BARE_RX_OFFSET_US + self.peer_rx_window_us.saturating_sub(air) / 2;
+        let target_on_air = BARE_RX_OFFSET_US + self.peer_rx_window_us.saturating_sub(air) / 2;
         let peer_tx_air = if self.peer_tx_en_offset_us > 0 && self.peer_tx_ramp_us > 0 {
             self.peer_tx_en_offset_us + self.peer_tx_ramp_us
         } else {
@@ -1587,9 +1568,9 @@ impl<'d> NrfRadioPhy<'d> {
         let buf = unsafe { &mut CCM_BUF };
         let len = payload.len();
         buf[0] = 0; // the S0 header
-                    // The LENGTH byte is the packet length the CCM processes: the
-                    // plaintext alone on encrypt (the hardware appends the 4-byte MIC),
-                    // the ciphertext + MIC on decrypt (the hardware strips the MIC).
+        // The LENGTH byte is the packet length the CCM processes: the
+        // plaintext alone on encrypt (the hardware appends the 4-byte MIC),
+        // the ciphertext + MIC on decrypt (the hardware strips the MIC).
         buf[1] = if encrypt { len } else { len + 4 } as u8;
         buf[2] = 0; // the RFU
         buf[3..3 + len].copy_from_slice(payload);

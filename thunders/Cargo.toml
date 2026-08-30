@@ -11,8 +11,6 @@ postcard = { workspace = true, features = ["heapless"] }
 serde = { workspace = true }
 heapless = { workspace = true, features = ["serde"] }
 embassy-time = { workspace = true }
-embassy-sync = { workspace = true }
-embassy-futures = { workspace = true, optional = true }
 defmt = { workspace = true, optional = true }
 chacha20poly1305 = { version = "0.11", default-features = false, optional = true }
 aead = { version = "0.6", default-features = false, optional = true }
@@ -21,4 +19,3 @@ aead = { version = "0.6", default-features = false, optional = true }
 default = []
 defmt = ["dep:defmt", "heapless/defmt"]
 secure = ["dep:chacha20poly1305", "dep:aead"]
-cadence-fast = []
