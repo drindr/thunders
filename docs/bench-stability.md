@@ -457,7 +457,13 @@ Stable。原因是单个长grant虽容易捕获一包，但停止RX后的local s
 central↔local slot mapping。硬件确认请求、callback接受和profile promotion均发生，且ADDRESS
 能落在校准target附近，但反向Data仍无法持续：90秒8次为0/8 Stable；加入Data pre-apply gate、
 校准address target和11相位逻辑扫描后最好也仅1/8，与基线相比无改善。说明仅重锚MPSL START
-仍不足以重建reverse TX placement/ARQ join。该原型及诊断字段已撤销，保留现有可靠路径。
+仍不足以重建reverse TX placement/ARQ join。继续实现的完整JoinProof/JoinAck事务也未改善：
+apply前禁止Data、target清空run/NACK、peripheral用TX-delay sweep重复reverse proof、central在所有
+non-sync phase监听proof并回带观察phase correction，双方收到proof后才开放Data；90秒8次仍为
+0/8 Stable。原因是post-apply reverse proof本身无法在错误grid上可靠到达，扩大central RX和扫描
+逻辑phase也没有形成闭环。该原型及诊断字段均已撤销，保留现有可靠路径。若继续，应由独立
+硬件定时捕获通道（GPIOTE/PPI capture或外部共同时间源）提供跨RADIO方向的绝对anchor，而不是
+在现有Link op调度上叠加更多控制状态。
 
 #### 4c-7h. 长时间双向soak
 
