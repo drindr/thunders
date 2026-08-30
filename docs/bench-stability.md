@@ -446,6 +446,14 @@ Armed且lead足够才schedule。`schedule_slot_profile`改为返回bool，拒绝
 初始RADIO/PLL acquisition，而不是initial profile epoch确认。该安全握手保留，yield优化需单独
 重置/随机化PHY acquisition，不能继续靠cadence generation重试。
 
+曾实现两种长观察实验。第一种让follower在acquisition期间除最后一个reverse phase外连续发布
+RX（每slot仍保留MPSL gap），90秒8次仅2/8 Stable、3/8建立Data。第二种把follower observation
+slot临时扩为6000µs（覆盖完整5800µs superframe），首个解码包后恢复600µs，90秒8次仅1/8
+Stable。原因是单个长grant虽容易捕获一包，但停止RX后的local slot counter/下一slot边界并未由
+该包的DWT时间戳重新锚到central wall time；仅放大RX窗口不能完成phase join。两种实现均已撤销。
+后续若再做长观察，必须在callback保留Beacon ADDRESS时间戳，并据此安排future MPSL START，
+不能只在app层修改slot offset。
+
 #### 4c-7h. 长时间双向soak
 
 整理后的`34859a2` safe hold固件做了长窗口验证。bench新增
