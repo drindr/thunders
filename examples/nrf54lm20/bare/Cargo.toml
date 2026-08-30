@@ -1,0 +1,33 @@
+[package]
+name = "thunders-bare"
+version = "0.1.0"
+edition = "2021"
+description = "thunders OneWayState transmitter smoke test on nRF54LM20"
+publish = false
+
+[dependencies]
+thunders = { path = "../../../thunders", features = ["defmt"] }
+thunders-phy-nrf = { path = "../../../thunders-phy-nrf", features = ["nrf54l20", "defmt"] }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = { version = "0.5.1" }
+embassy-nrf = { version = "0.11.0", features = ["nrf54lm20-app-s", "rt", "time-driver-grtc"] }
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt = "0.3"
+defmt-rtt = "0.4"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+static_cell = "1.2"
+
+[features]
+default = []
+
+[[bin]]
+name = "thunders-bare"
+path = "src/main.rs"
+
+[patch.crates-io]
+embassy-nrf = { path = "../../../../embassy-nrf54/embassy-nrf" }
+embassy-time-driver = { path = "../../../../embassy-nrf54/embassy-time-driver" }
+
+[profile.release]
+debug = 2

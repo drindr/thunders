@@ -117,6 +117,23 @@ The future first event is relative to the hardware ADDRESS timestamp of the
 received offer, following the BLE model. Free-running slot-counter subtraction
 is not part of the new protocol.
 
+## Hardware smoke test
+
+A first architecture-only smoke test used nRF54LM20 as an unpaced
+`OneWayState<8, 32>` transmitter and nRF52840 as receiver at 2 Mbit. The fixed
+11-byte wire frame decoded without invalid packets and sustained tens of
+thousands of received state snapshots per 5-second window.
+
+Observed loss was approximately 49–50%. This is expected from the temporary
+adapter: `Phy::receive()` stops after one packet and restarts RADIO for every
+call, while the LM20 test transmitter sends continuously. Therefore the
+calculated `receiver_window_us=11168` is currently only a timeout, not yet one
+continuous multi-packet RX grant. The next PHY adapter must keep RADIO in RX
+and collect multiple fixed frames inside that one long receiver window.
+
+This smoke result validates the fixed codec and one-way state semantics, not
+the final slot plan or TimeDiff feedback loop.
+
 ## Migration status
 
 The compile-time mode specification, fixed timing planner, exact codecs,
