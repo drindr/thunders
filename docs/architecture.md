@@ -131,9 +131,30 @@ calculated `receiver_window_us=11168` is currently only a timeout, not yet one
 continuous multi-packet RX grant. The next PHY adapter must keep RADIO in RX
 and collect multiple fixed frames inside that one long receiver window.
 
-This smoke result validates the fixed codec and one-way state semantics, not
-the final slot plan or TimeDiff feedback loop. The retained smoke programs now
-use `OneWayState<6, 32>`; six application bytes produce a nine-byte wire frame.
+This smoke result validates the fixed codec and one-way state semantics. The
+retained smoke programs now use `OneWayState<6, 32>`; six application bytes
+produce a nine-byte wire frame.
+
+### MPSL implementation
+
+The MPSL adapter uses asymmetric schedules with the same 16.8ms cycle:
+
+- LM20 transmitter: 32 × 500us Data events plus one 800us feedback RX event;
+- 52840 receiver: one 16.3ms nominal long event (16.15ms grant after MPSL's
+  150us margin) plus one 500us feedback event.
+
+`RxBatch` keeps RADIO inside one MPSL grant and stores up to 32
+`[len | payload]` cells without returning to the executor between packets.
+For no-ACK mode, every sequence where `seq % 32 == 31` triggers a hardware-
+relative TimeDiff reply at the following 500us sender event boundary. This ties
+feedback to the captured packet rather than to an independently phased receiver
+slot counter.
+
+LM20→52840 hardware validation at 2 Mbit produced approximately 8.3–9.1k valid
+six-byte state packets per five-second window with `invalid=0`; LM20 reported
+`feedback=true` in every five-second window. The current TimeDiff value is zero
+(the capture/PLL correction policy is the next refinement), but the periodic
+reverse path and its packet-relative placement are operational.
 
 ## Migration status
 
