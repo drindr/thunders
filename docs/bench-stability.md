@@ -451,8 +451,13 @@ RX（每slot仍保留MPSL gap），90秒8次仅2/8 Stable、3/8建立Data。第�
 slot临时扩为6000µs（覆盖完整5800µs superframe），首个解码包后恢复600µs，90秒8次仅1/8
 Stable。原因是单个长grant虽容易捕获一包，但停止RX后的local slot counter/下一slot边界并未由
 该包的DWT时间戳重新锚到central wall time；仅放大RX窗口不能完成phase join。两种实现均已撤销。
-后续若再做长观察，必须在callback保留Beacon ADDRESS时间戳，并据此安排future MPSL START，
-不能只在app层修改slot offset。
+随后实现了完整DWT re-anchor原型：每个RX op把`slot_start_cyc + ADDRESS offset`与Beacon内容
+配对，按peer TXEN/ramp和future apply epoch计算绝对cycle；callback延迟到target前一个slot再
+发起one-shot NORMAL distance，并在target START原子安装profile、清空ops、发布新的
+central↔local slot mapping。硬件确认请求、callback接受和profile promotion均发生，且ADDRESS
+能落在校准target附近，但反向Data仍无法持续：90秒8次为0/8 Stable；加入Data pre-apply gate、
+校准address target和11相位逻辑扫描后最好也仅1/8，与基线相比无改善。说明仅重锚MPSL START
+仍不足以重建reverse TX placement/ARQ join。该原型及诊断字段已撤销，保留现有可靠路径。
 
 #### 4c-7h. 长时间双向soak
 
