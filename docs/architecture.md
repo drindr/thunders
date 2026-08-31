@@ -151,25 +151,27 @@ setup/ramp + tail + MPSL gap: 240us
 mathematical Data period: 300us
 steady-state guard: 0us
 5us scheduling quantization: 300us
-feedback period: 310us
-cycle: 128 × 300us + 310us = 38710us
+optional feedback period: 310us
+phase-align off cycle: 128 × 300us = 38400us
+phase-align on cycle: 128 × 300us + 310us = 38710us
 ```
 
-The LM20 transmitter uses 128 Data events plus one feedback RX event. The 52840
-receiver uses one long event and returns a two-byte signed `diff_us`; state mode
-uses neither marker nor protocol sequence. The longer observation cycle
-amortizes MPSL boundary and callback/application handoff costs and gives cold
-acquisition substantially more phase coverage.
+Periodic packet-relative TimeDiff is selected by the MPSL example feature:
+
+```text
+--features phase-align
+```
+
+With the feature disabled, the transmitter cycle contains Data only and the
+receiver never switches to TX. With it enabled, one two-byte TimeDiff event is
+reserved after every 128 Data events.
 
 LM20→52840 validation after acquisition measured:
 
 ```text
-receiver long slots: 26/s
-hardware transmitter packets: 3305–3306/s
-receiver delivered packets: 3281/s
-receiver CRC-valid packets: 3281/s
-invalid frames: 0
-steady receive ratio: about 99.2%
+phase-align off: TX 3333/s, RX 3333–3334/s, invalid 0
+phase-align on:  TX 3305–3306/s, RX 3281/s, invalid 0
+feature cost: about 0.81% transmitter throughput
 TimeDiff feedback: acquired successfully
 ```
 

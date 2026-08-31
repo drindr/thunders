@@ -25,12 +25,13 @@ bind_interrupts!(struct Irqs {
 });
 
 const PAYLOAD: usize = 6;
+const PHASE_ALIGN: bool = cfg!(feature = "phase-align");
 type Mode = OneWayState<PAYLOAD, 128>;
 const PLAN: OneWayMpslPlan =
-    one_way_mpsl_plan::<Mode>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
+    one_way_mpsl_plan::<Mode, PHASE_ALIGN>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
 const DATA_SLOT_US: u16 = PLAN.data_slot_us;
 const FEEDBACK_SLOT_US: u16 = PLAN.feedback_slot_us;
-const PERIOD_SLOTS: u16 = PLAN.batch + 1;
+const PERIOD_SLOTS: u16 = PLAN.transmitter_slots();
 
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {

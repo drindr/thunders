@@ -41,10 +41,19 @@ pub struct OneWayMpslPlan {
     pub receiver_window_us: u16,
     /// Forward Data events per receiver event.
     pub batch: u16,
+    /// Whether a reverse TimeDiff event is reserved.
+    pub phase_align: bool,
+}
+
+impl OneWayMpslPlan {
+    /// Hardware events in one transmitter cycle.
+    pub const fn transmitter_slots(self) -> u16 {
+        self.batch + self.phase_align as u16
+    }
 }
 
 /// Derive the complete MPSL schedule from mode and radio timing constants.
-pub const fn one_way_mpsl_plan<M: LinkMode>(
+pub const fn one_way_mpsl_plan<M: LinkMode, const PHASE_ALIGN: bool>(
     air: AirTiming,
     overhead: SlotOverhead,
 ) -> OneWayMpslPlan {
@@ -58,11 +67,12 @@ pub const fn one_way_mpsl_plan<M: LinkMode>(
         MPSL_SLOT_QUANTUM_US,
     );
     let feedback_min = data.saturating_add(MPSL_FEEDBACK_GUARD_US);
-    let feedback = if feedback_raw < feedback_min {
+    let feedback_candidate = if feedback_raw < feedback_min {
         feedback_min
     } else {
         feedback_raw
     };
+    let feedback = if PHASE_ALIGN { feedback_candidate } else { 0 };
     let cycle = data as u32 * M::FEEDBACK_EVERY as u32 + feedback as u32;
     OneWayMpslPlan {
         data_slot_us: data,
@@ -73,6 +83,7 @@ pub const fn one_way_mpsl_plan<M: LinkMode>(
             cycle as u16
         },
         batch: M::FEEDBACK_EVERY,
+        phase_align: PHASE_ALIGN,
     }
 }
 
@@ -243,7 +254,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
     /// Configure packet-relative TimeDiff timing for a one-way mode.
     pub fn configure_one_way(&mut self, data_slot_us: u16, feedback_every: u16) {
         self.state.one_way_data_slot_us = data_slot_us as u32;
-        self.state.one_way_feedback_every = feedback_every.max(1) as u32;
+        self.state.one_way_feedback_every = feedback_every as u32;
         self.state.one_way_rx_since_feedback = 0;
     }
 

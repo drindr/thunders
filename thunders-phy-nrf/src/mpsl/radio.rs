@@ -255,7 +255,8 @@ unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
             state.crc_bad = state.crc_bad.wrapping_add(1);
         }
 
-        let feedback_due = state.one_way_rx_since_feedback >= state.one_way_feedback_every
+        let feedback_due = state.one_way_feedback_every > 0
+            && state.one_way_rx_since_feedback >= state.one_way_feedback_every
             && address_cyc != 0
             && state.one_way_data_slot_us > 28;
         if feedback_due {
