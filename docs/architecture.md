@@ -1,246 +1,323 @@
-# Thunders fixed-mode architecture
+# Thunders one-way architecture
 
-## Scope
+## 1. Scope
 
-The former symmetric `Central`/`Peripheral`, runtime cadence search, dynamic
-payload contract, and bidirectional selective-repeat scheduler were removed.
-The new core is intentionally compile-time and mode-driven.
+The active protocol is compile-time, fixed-length, and one-way. The former
+symmetric Central/Peripheral link, cadence negotiation, probe/PLL servo, dynamic
+payload contracts, and bidirectional selective-repeat scheduler were removed.
 
-Initial mode family is `OneWay<PAYLOAD, ACK, FEEDBACK_EVERY>`:
+The mode family is:
 
-- `OneWayAck<PAYLOAD>` aliases `OneWay<PAYLOAD, true, 1>`: fixed forward
-  payload, one reverse ACK per packet, one in-flight packet, retransmission on
-  timeout.
-- `OneWayNoAck<PAYLOAD, DIFF_EVERY>` aliases
-  `OneWay<PAYLOAD, false, DIFF_EVERY>`: fixed forward payload, no retained
-  packet and no retransmit API, one reverse `TimeDiff` after a compile-time
-  packet batch.
-
-Future duplex, multicast, burst, or low-power modes implement the same
-`LinkMode` trait instead of adding runtime flags to one state machine.
-
-### Semantic choice: state versus state change
-
-No-ACK mode does **not** guarantee delivery. It is intended for continuously
-refreshed state where a newer packet supersedes every older packet, for example
-position, orientation, sensor samples, actuator target, or current UI state.
-Losing an intermediate packet is acceptable because the next snapshot repairs
-the receiver's view. `OneWayState<PAYLOAD, DIFF_EVERY>` is the semantic alias
-for this mode.
-
-ACK mode is intended for state changes and events that must not disappear, for
-example start/stop, arming, configuration changes, counters, commands, and
-transaction boundaries. The sender retains the change and retransmits until a
-matching ACK. `OneWayChanges<PAYLOAD>` is the semantic alias for this mode.
-
-Neither mode should be selected only for throughput: selection follows the
-meaning of the data.
-
-## Compile-time timing
-
-`fixed_slot_plan::<Mode>(AirTiming, SlotOverhead)` derives:
-
-- state Data wire bytes: exactly the fixed payload, with no marker/sequence;
-- state feedback bytes: one signed `i16 diff_us`;
-- reliable state-change Data: fixed payload plus two-byte sequence;
-- reliable feedback: two-byte sequence plus signed `i16 diff_us`;
-- on-air duration including length and CRC;
-- TX/RX ramp and setup budget;
-- shutdown tail, jitter margin, and mandatory MPSL gap;
-- forward slot period, reverse feedback period, long receiver window, and
-  complete cycle duration.
-
-No payload length is negotiated or transmitted at runtime.
-
-For a 2 Mbit Nordic frame and conservative measured MPSL overhead:
-
-```text
-6-byte state payload
-wire = 6 bytes
-airtime = 64 us
-RX restart allowance = 150 us
-mathematical MPSL period = 479 us
-25 us quantization = 500 us
+```rust
+OneWay<PAYLOAD, ACK, FEEDBACK_EVERY>
 ```
 
-A production adapter may round this mathematical floor upward, but it must not
-recompute packet timing dynamically.
+Public aliases:
 
-## Asymmetric physical schedule
-
-One-way transmission does not require equal transmitter and receiver slot
-chains.
-
-The transmitter uses `N` short Data grants and one reverse feedback RX grant.
-The receiver uses:
-
-1. one long RX grant covering the whole `N`-packet forward batch;
-2. one short reverse TX grant carrying ACK or TimeDiff.
-
-This keeps the receiver listening continuously across forward packet starts and
-removes the old requirement that two free-running symmetric slot grids first
-match by chance.
-
-## ACK mode
-
-The first reliable implementation deliberately permits one in-flight packet:
-
-```text
-Data(seq, fixed payload)
-ACK(seq, diff_us)
+```rust
+OneWayState<PAYLOAD, DIFF_EVERY> // ACK=false; newest state wins
+OneWayChanges<PAYLOAD>           // ACK=true; changes must be delivered
 ```
 
-The sender retains the exact fixed payload until the matching ACK. Timeouts
-rebuild the same fixed frame. Later reliable modes may add a compile-time window
-size without changing `OneWayAck` semantics.
+`OneWayState` does not promise delivery of every snapshot. It is appropriate for
+position, orientation, sensor state, current actuator target, and similar data
+where a newer packet replaces an older packet.
 
-## No-ACK mode
+`OneWayChanges` is for commands and transitions that must not disappear. Its
+current engine is stop-and-wait: retain one payload, retransmit until the
+matching ACK, then accept the next change.
 
-The sender never retains or retransmits Data. The receiver returns:
+## 2. Current hardware test configuration
 
-```text
-TimeDiff(last_seq, diff_us)
+Both MPSL examples currently instantiate:
+
+```rust
+const PAYLOAD: usize = 6;
+type Mode = OneWayState<PAYLOAD, 128>;
 ```
 
-every `DIFF_EVERY` packets. `diff_us` is the measured difference between the
-predicted and captured packet ADDRESS time. The transmitter/follower timing
-adapter uses it only for clock/phase correction; it is not delivery feedback.
-
-## Connection events
-
-Control packets use a small postcard codec:
+Meaning:
 
 ```text
-ConnectOffer(start_after_us, window_us)
-FirstEvent(challenge)
-FirstResponse(challenge)
-Connected(start_epoch)
+application state bytes: 6
+Data events per batch: 128
+radio mode: Nordic proprietary 2 Mbit
+address: E7:E7:E7:E7:E7
+CRC: CRC16-CCITT, polynomial 0x11021, init 0xFFFF
+initial channel: 0 (2400 MHz mapping used by the backend)
 ```
 
-The future first event is relative to the hardware ADDRESS timestamp of the
-received offer, following the BLE model. Free-running slot-counter subtraction
-is not part of the new protocol.
-
-## Hardware smoke test
-
-A first architecture-only smoke test used nRF54LM20 as an unpaced
-`OneWayState<8, 32>` transmitter and nRF52840 as receiver at 2 Mbit. The fixed
-11-byte wire frame decoded without invalid packets and sustained tens of
-thousands of received state snapshots per 5-second window.
-
-Observed loss was approximately 49–50%. This is expected from the temporary
-adapter: `Phy::receive()` stops after one packet and restarts RADIO for every
-call, while the LM20 test transmitter sends continuously. Therefore the
-calculated `receiver_window_us=11168` is currently only a timeout, not yet one
-continuous multi-packet RX grant. The next PHY adapter must keep RADIO in RX
-and collect multiple fixed frames inside that one long receiver window.
-
-This smoke result validates the fixed codec and one-way state semantics. The
-retained smoke programs now use `OneWayState<6, 32>`. State mode has no marker
-or protocol sequence, so six application bytes produce a six-byte wire frame.
-
-### MPSL implementation
-
-The MPSL adapter derives its schedule entirely at compile time. State packets
-contain only the six payload bytes. Runtime cadence fallback and probe logic are
-not part of the schedule:
+The six-byte benchmark state is:
 
 ```text
-2M fixed-STATLEN six-byte state airtime: 60us
-setup/ramp + tail + MPSL gap: 240us
-mathematical Data period: 300us
-steady-state guard: 0us
-5us scheduling quantization: 300us
-optional feedback period: 310us
-phase-align off cycle: 128 × 300us = 38400us
-phase-align on cycle: 128 × 300us + 310us = 38710us
+byte 0: 'S'
+byte 1: 'T'
+byte 2..5: little-endian u32 state counter
 ```
 
-Periodic packet-relative TimeDiff is selected by the MPSL example feature:
+The `u32` counter is benchmark application data. It is not a protocol sequence
+or header.
+
+## 3. State packet format
+
+### 3.1 MPSL Data packet
+
+MPSL configures a fixed packet:
 
 ```text
---features phase-align
+LFLEN=0
+S0LEN=0
+S1LEN=0
+STATLEN=6
+MAXLEN=6
+PLEN=16-bit
+BALEN=4 plus one prefix byte = five-byte address
+CRC length=2
 ```
 
-With the feature disabled, the transmitter cycle contains Data only and the
-receiver never switches to TX. With it enabled, one two-byte TimeDiff event is
-reserved after every 128 Data events.
-
-LM20→52840 validation after acquisition measured:
+Complete on-air state packet:
 
 ```text
-phase-align off: TX 3333/s, RX 3333–3334/s, invalid 0
-phase-align on:  TX 3305–3306/s, RX 3281/s, invalid 0
-feature cost: about 0.81% transmitter throughput
-TimeDiff feedback: acquired successfully
+2-byte preamble     8 us
+5-byte address     20 us
+6-byte state       24 us
+2-byte CRC          8 us
+-------------------------
+total              60 us
 ```
 
-The q305-style receiver keeps RADIO enabled for the complete observation slot,
-reuses one six-byte DMA buffer, and only retains the newest state plus a packet
-count. The former 128 × 64-byte record buffers and per-packet RX ramp are gone.
-This makes 300us the current compile-time floor and shortest validated period;
-shorter values would violate the modeled ramp/airtime/tail/MPSL-gap budget.
+There is no transmitted length, marker, or protocol sequence.
 
-### Optional hopping
+### 3.2 TimeDiff feedback packet
 
-The MPSL examples expose:
+When enabled, reverse feedback is exactly:
 
 ```text
---features hopping
+i16 diff_us, little-endian
 ```
 
-`hopping` depends on `phase-align`. Both peers start on channel 0 and derive the
-batch boundary from the long inter-packet gap before the reserved TimeDiff
-event. A successful TimeDiff establishes the hop epoch, after which both advance
-through the compile-time sequence:
+Its fixed `STATLEN` is two bytes. Complete on-air duration is approximately
+44 us with the same preamble/address/CRC configuration.
+
+### 3.3 Bare exclusive packet
+
+The bare exclusive path additionally uses an eight-bit preamble, so its state
+packet airtime is approximately:
+
+```text
+1-byte preamble + 5-byte address + 6-byte state + 2-byte CRC = 14 bytes
+14 × 4 us at 2 Mbit = 56 us
+```
+
+## 4. Compile-time MPSL timing
+
+The schedule is produced by:
+
+```rust
+const PLAN: OneWayMpslPlan =
+    one_way_mpsl_plan::<Mode, PHASE_ALIGN>(
+        AirTiming::NRF_2MBIT,
+        SlotOverhead::MPSL_CONSERVATIVE,
+    );
+```
+
+Current compile-time arithmetic:
+
+```text
+state airtime:                    60 us
+TX/RX setup+ramp:                 50 us
+radio tail reserve:               40 us
+MPSL mandatory inter-slot gap:   150 us
+compile-time margin:               0 us
+----------------------------------------
+Data event:                      300 us
+```
+
+Feedback receives an additional 10 us window:
+
+```text
+Data event:      300 us
+Feedback event:  310 us
+Batch size:      128 Data events
+```
+
+Cycles:
+
+```text
+phase-align off: 128 × 300                = 38400 us
+phase-align on:  128 × 300 + 310          = 38710 us
+```
+
+The receiver uses one long event per cycle:
+
+```text
+phase-align off RX window: 38400 us nominal
+phase-align on RX window:  38710 us nominal
+```
+
+MPSL subtracts its 150 us hand-back interval from the granted radio work time.
+
+## 5. MPSL receiver model
+
+The receiver follows the q305 latest-state model:
+
+```text
+one six-byte EasyDMA buffer
+one RXEN/ramp at the beginning of the long event
+END -> validate CRC -> increment packet count
+latest state is overwritten in place
+TASKS_START from RXIDLE for the next packet
+```
+
+It does not allocate or preserve 128 historical packet buffers. Application
+context receives:
+
+```text
+latest six-byte state
+number of CRC-valid packets observed in the completed long event
+```
+
+## 6. Optional phase alignment
+
+Build without feedback:
+
+```bash
+cd examples/nrf52840/mpsl
+cargo build --release --no-default-features
+
+cd examples/nrf54lm20/mpsl
+cargo build --release --no-default-features
+```
+
+Build with periodic TimeDiff:
+
+```bash
+cargo build --release --no-default-features --features phase-align
+```
+
+With `phase-align` disabled:
+
+```text
+transmitter cycle contains 128 Data events only
+receiver never switches to TX
+feedback cost is zero
+```
+
+With `phase-align` enabled:
+
+```text
+128 Data events
+one 310 us feedback RX/TX event
+receiver returns two-byte diff_us
+```
+
+The receiver identifies the transmitter batch boundary from the long address
+interval around the reserved feedback event. It then sends TimeDiff only after
+Data phase 127, so the reply lands in the transmitter feedback event.
+
+Measured LM20 -> nRF52840 results:
+
+| Configuration | TX packets/s | RX packets/s | Invalid | TX cost |
+|---|---:|---:|---:|---:|
+| phase-align off | 3333 | 3333-3334 | 0 | baseline |
+| phase-align on | 3305-3306 | 3281 | 0 | about 0.81% |
+
+## 7. Optional hopping
+
+Enable synchronized hopping with:
+
+```bash
+cargo build --release --no-default-features --features hopping
+```
+
+Cargo defines:
+
+```toml
+hopping = ["phase-align"]
+```
+
+Hopping therefore always reserves the TimeDiff boundary. The compile-time
+channel sequence is:
 
 ```text
 0, 13, 29, 43, 57, 71, 89, 97
 ```
 
-The receiver changes channel only at the end of its long batch window. If a
-pending hopped window receives no packets, it resets directly to channel 0 and
-re-enters acquisition.
-
-LM20→52840 hopping validation measured:
+Startup and hop procedure:
 
 ```text
-TX: 3305–3306 packets/s
-steady RX: 3283–3291 packets/s
-invalid: normally 0
-hop indices advance and remain locked
+1. Both peers start on channel 0.
+2. Receiver detects the feedback gap and learns Data phase 0..127.
+3. Receiver sends TimeDiff after phase 127.
+4. Transmitter receives TimeDiff in its feedback event.
+5. Both peers switch channel at that batch boundary.
+6. hop_index advances modulo eight.
 ```
 
-Restarting the transmitter while the receiver was locked caused the receiver to
-reset to channel 0 and reacquire; steady ~3290 packets/s resumed automatically.
-Hopping adds no event beyond the phase-align feedback event.
-
-All durations and packet-relative reply offsets come from
-`one_way_mpsl_plan::<Mode>()` and compile-time PHY timing constants. The old
-symmetric link, cadence probes, PLL servo, runtime alignment, and their debug
-state have been removed.
-
-### Exclusive bare PHY
-
-The original generic per-packet TXEN/RXEN path measured 8812 TX packets/s and
-4406 RX packets/s. The dedicated exclusive path now uses:
+Recovery:
 
 ```text
-LFLEN=0, STATLEN=6
+if a hopped receiver window contains zero valid packets:
+    reset hop_index to 0
+    switch to channel 0
+    clear hop lock and phase history
+    reacquire through the TimeDiff handshake
+```
+
+Measured hopping results after lock:
+
+```text
+TX: 3305-3306 packets/s
+RX: 3283-3291 packets/s
+steady receive ratio: about 99.3-99.5%
+invalid: normally 0
+```
+
+A transmitter restart was tested while the receiver was locked. The receiver
+returned to channel 0, reacquired the restarted transmitter, re-established the
+hop epoch, and resumed approximately 3290 packets/s without resetting the
+receiver.
+
+Hopping adds no slot beyond the existing phase-align feedback event.
+
+## 8. Bare exclusive mode
+
+The generic bare PHY path previously enabled and disabled RADIO for every packet:
+
+```text
+TX: 8812 packets/s
+RX: 4406 packets/s
+```
+
+The dedicated exclusive path configures:
+
+```text
+LFLEN=0
+STATLEN=6
 8-bit preamble
 one initial TXEN/RXEN
 TXIDLE/RXIDLE + TASKS_START between packets
 ```
 
-LM20→52840 hardware measured:
+LM20 -> nRF52840 measured:
 
 ```text
-transmitter: 16177–16178 packets/s
-receiver: 16180–16181 packets/s (independent timer measurement)
+TX: 16177-16178 packets/s
+RX: 16180-16181 packets/s (independent timer measurement)
 steady loss: approximately 0%
 invalid: 0
 ```
 
-With the retained five-byte address, six-byte payload and CRC16, airtime is
-about 56us and the theoretical ceiling is roughly 17857 packets/s. The measured
-61.8us period includes state-buffer copy, event handling and TASKS_START.
+With a five-byte address, six-byte state and CRC16, airtime is approximately
+56 us. The theoretical airtime ceiling is about 17857 packets/s. The measured
+61.8 us period includes state copy, END handling and TASKS_START.
+
+## 9. Current limitations
+
+- The benchmark payload embeds a state counter, but the protocol itself carries
+  no sequence in `OneWayState`.
+- TimeDiff is currently transported and used as the batch/hop synchronization
+  boundary; a full long-term oscillator-frequency servo remains a future
+  refinement.
+- `OneWayChanges` has a core stop-and-wait engine but does not yet have the same
+  optimized MPSL/bare hardware examples as `OneWayState`.
