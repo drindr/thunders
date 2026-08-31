@@ -104,14 +104,15 @@ pub struct SlotOverhead {
 }
 
 impl SlotOverhead {
-    /// Conservative cross-board MPSL budget measured on 52840/5340/LM20.
-    /// It includes the per-packet RX restart observed by the batch receiver.
+    /// Cross-board MPSL timing budget. Packet-to-packet RX restart is kept at
+    /// zero here: backend hot-path overhead must be optimized, not hidden in
+    /// the protocol period.
     pub const MPSL_CONSERVATIVE: Self = Self {
         tx_en_us: 8,
         tx_ramp_us: 42,
         rx_en_us: 8,
         rx_ramp_us: 42,
-        rx_restart_us: 150,
+        rx_restart_us: 0,
         tail_us: 40,
         margin_us: 25,
         interslot_gap_us: 150,
@@ -239,15 +240,15 @@ mod tests {
         const STREAM32: FixedSlotPlan =
             fixed_slot_plan::<Stream32>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
         assert_eq!(ACK8.data_wire_len, 10);
-        assert_eq!(ACK8.data_slot_us, 495);
-        assert_eq!(ACK8.feedback_slot_us, 471);
-        assert_eq!(ACK8.receiver_window_us, 495);
+        assert_eq!(ACK8.data_slot_us, 345);
+        assert_eq!(ACK8.feedback_slot_us, 321);
+        assert_eq!(ACK8.receiver_window_us, 345);
         assert_eq!(ACK8.receiver_physical_slots(), 2);
         assert_eq!(STREAM32.data_wire_len, 32);
-        assert_eq!(STREAM32.data_slot_us, 583);
+        assert_eq!(STREAM32.data_slot_us, 433);
         assert_eq!(STREAM32.feedback_every, 16);
-        assert_eq!(STREAM32.receiver_window_us, 16 * 583);
-        assert_eq!(STREAM32.period_us(), 16 * 583 + 463);
+        assert_eq!(STREAM32.receiver_window_us, 16 * 433);
+        assert_eq!(STREAM32.period_us(), 16 * 433 + 313);
     }
 
     #[test]

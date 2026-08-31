@@ -211,7 +211,9 @@ unsafe fn receive_batch(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
 
     while count < cells && cyc().wrapping_sub(slot_start_cyc) < deadline_cyc {
         let cell = base.add(count * 64);
-        core::slice::from_raw_parts_mut(cell, 64).fill(0);
+        // EasyDMA overwrites length + payload; clearing the full 64-byte cell
+        // consumed a significant fraction of the inter-packet budget.
+        *cell = 0;
         pll_enable(r);
         r.shorts().write_value(shorts_rx());
         r.packetptr().write_value(cell as u32);
@@ -238,9 +240,12 @@ unsafe fn receive_batch(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
         }
         end_ev_clear(r);
         let crc_ok = r.crcstatus().read().0 & 1 == 1;
-        r.tasks_disable().write_value(1);
-        disable_wait(r);
-        if !got_end {
+        if got_end {
+            // END_DISABLE/PHYEND_DISABLE already requested DISABLE.
+            disable_wait(r);
+        } else {
+            r.tasks_disable().write_value(1);
+            disable_wait(r);
             break;
         }
         if crc_ok {
