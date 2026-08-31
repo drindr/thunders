@@ -268,7 +268,7 @@ Measured hopping results after lock:
 
 ```text
 TX: 3305-3306 packets/s
-RX: 3283-3291 packets/s
+RX: 3280-3295 packets/s (30-second validation; average about 3286/s)
 steady receive ratio: about 99.3-99.5%
 invalid: normally 0
 ```
