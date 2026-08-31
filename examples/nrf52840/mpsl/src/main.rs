@@ -28,7 +28,6 @@ const PAYLOAD: usize = 6;
 type Mode = OneWayState<PAYLOAD, 128>;
 const PLAN: OneWayMpslPlan =
     one_way_mpsl_plan::<Mode>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
-const BATCH: usize = PLAN.batch as usize;
 const DATA_SLOT_US: u16 = PLAN.data_slot_us;
 const FEEDBACK_SLOT_US: u16 = PLAN.feedback_slot_us;
 const RX_WINDOW_US: u16 = PLAN.receiver_window_us;
@@ -73,10 +72,10 @@ async fn main(spawner: Spawner) {
     phy.configure_one_way(DATA_SLOT_US, PLAN.batch);
     assert!(phy.schedule_slot_profile(RX_WINDOW_US, RX_WINDOW_US, 1, 1, 0, apply,));
 
-    static RECORDS0: StaticCell<[u8; BATCH * 64]> = StaticCell::new();
-    static RECORDS1: StaticCell<[u8; BATCH * 64]> = StaticCell::new();
-    let records0 = RECORDS0.init([0; BATCH * 64]);
-    let records1 = RECORDS1.init([0; BATCH * 64]);
+    static LATEST0: StaticCell<[u8; PAYLOAD]> = StaticCell::new();
+    static LATEST1: StaticCell<[u8; PAYLOAD]> = StaticCell::new();
+    let latest0 = LATEST0.init([0; PAYLOAD]);
+    let latest1 = LATEST1.init([0; PAYLOAD]);
     let mut last_state = 0u32;
     let mut received = 0u32;
     let mut rx_slots = 0u32;
@@ -91,35 +90,26 @@ async fn main(spawner: Spawner) {
         RX_WINDOW_US, FEEDBACK_SLOT_US, apply
     );
 
-    assert!(phy.publish_rx_batch(&mut records0[..], apply));
-    assert!(phy.publish_rx_batch(&mut records1[..], apply.wrapping_add(1)));
+    phy.publish_state_rx(latest0, apply);
+    phy.publish_state_rx(latest1, apply.wrapping_add(1));
     let mut collected = apply;
     loop {
         {
-            let count = phy.collect_rx_batch(collected).await;
+            let count = phy.collect_state_rx(collected).await;
             rx_slots = rx_slots.wrapping_add(1);
-            let records: &[u8] = if collected & 1 == 0 {
-                &records0[..]
-            } else {
-                &records1[..]
-            };
-            for cell in records.chunks_exact(64).take(count) {
-                let len = cell[0] as usize;
-                if len == PAYLOAD && cell[1] == b'S' && cell[2] == b'T' {
-                    last_state = u32::from_le_bytes([cell[3], cell[4], cell[5], cell[6]]);
-                    received = received.wrapping_add(1);
+            let latest: &[u8; PAYLOAD] = if collected & 1 == 0 { latest0 } else { latest1 };
+            if count > 0 {
+                if latest[0] == b'S' && latest[1] == b'T' {
+                    last_state = u32::from_le_bytes([latest[2], latest[3], latest[4], latest[5]]);
+                    received = received.wrapping_add(count as u32);
                 } else {
-                    invalid = invalid.wrapping_add(1);
+                    invalid = invalid.wrapping_add(count as u32);
                 }
             }
         }
         let target = collected.wrapping_add(2);
-        let records: &mut [u8] = if target & 1 == 0 {
-            &mut records0[..]
-        } else {
-            &mut records1[..]
-        };
-        assert!(phy.publish_rx_batch(records, target));
+        let latest: &mut [u8; PAYLOAD] = if target & 1 == 0 { latest0 } else { latest1 };
+        phy.publish_state_rx(latest, target);
         collected = collected.wrapping_add(1);
 
         if report_at.elapsed() >= Duration::from_secs(5) {

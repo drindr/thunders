@@ -21,8 +21,8 @@ pub enum OpKind {
     Tx = 1,
     /// Receive one packet.
     Rx = 2,
-    /// Receive multiple packets into 64-byte record cells.
-    RxBatch = 3,
+    /// Continuously receive fixed state packets into one latest-value buffer.
+    RxState = 3,
 }
 
 /// One entry in the depth-two absolute-slot operation ring.

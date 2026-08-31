@@ -82,6 +82,20 @@ fn shorts_rx() -> regs::Shorts {
     s
 }
 
+/// State-window RX ramps once and returns to RXIDLE after each packet.
+fn shorts_rx_state() -> regs::Shorts {
+    let mut s = regs::Shorts(0);
+    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
+    {
+        s.set_rxready_start(true);
+    }
+    #[cfg(feature = "_nrf54")]
+    {
+        s.set_ready_start(true);
+    }
+    s
+}
+
 /// The TX shortcuts (same idea, keyed on TXREADY on the 5340/52840).
 fn shorts_tx() -> regs::Shorts {
     let mut s = regs::Shorts(0);
@@ -109,7 +123,7 @@ pub unsafe fn signal_done(state: &mut MpslState) {
 /// Configure the radio (inside a granted timeslot) with the current state.
 /// The BARE-path wire format (CRC-16, balen 4, crcinc-exclude) is used: it is
 /// the verified-working config on this 5340 (the MPSL format was deaf in RX).
-unsafe fn radio_configure(state: &MpslState) {
+unsafe fn radio_configure(state: &MpslState, statlen: u8) {
     let r = state.radio;
 
     // Errata 20/49 (54L): latch constant-latency for the whole session —
@@ -134,17 +148,17 @@ unsafe fn radio_configure(state: &MpslState) {
     #[cfg(feature = "_nrf54")]
     r.mode().write_value(regs::RadioMode(mode_val));
 
-    // The ESB-compatible frame: 8-bit length field, mode-sized preamble,
-    // the CRC excludes the length field.
+    // The mode determines the exact packet size at compile time. No S0/S1 or
+    // length field is transmitted.
     let mut pcnf0 = regs::Pcnf0(0);
-    pcnf0.set_lflen(8);
+    pcnf0.set_lflen(0);
     pcnf0.set_plen(plen);
     pcnf0.set_crcinc(vals::Crcinc::Exclude);
     r.pcnf0().write_value(pcnf0);
 
-    // 255-byte max payload, 4-byte base address, big-endian, no whitening.
     let mut pcnf1 = regs::Pcnf1(0);
-    pcnf1.set_maxlen(255);
+    pcnf1.set_maxlen(statlen);
+    pcnf1.set_statlen(statlen);
     pcnf1.set_balen(4);
     pcnf1.set_endian(vals::Endian::Big);
     pcnf1.set_whiteen(false);
@@ -199,33 +213,27 @@ fn pll_enable(r: Radio) {
     }
 }
 
-unsafe fn receive_batch(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
+unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
     let r = state.radio;
-    let base = state.ops[ei].rx_ptr;
-    let cells = state.ops[ei].rx_cap / 64;
-    let deadline_cyc = state.slot_len.saturating_sub(40) * CPU_MHZ;
+    let latest = state.ops[ei].rx_ptr;
+    let deadline = state.slot_len.saturating_sub(40) * CPU_MHZ;
     let mut count = 0usize;
     state.ops[ei].rx_ok = false;
     state.ops[ei].rx_result = 0;
 
-    while count < cells && cyc().wrapping_sub(slot_start_cyc) < deadline_cyc {
-        let cell = base.add(count * 64);
-        // EasyDMA overwrites length + payload; clearing the full 64-byte cell
-        // consumed a significant fraction of the inter-packet budget.
-        *cell = 0;
-        pll_enable(r);
-        r.shorts().write_value(shorts_rx());
-        r.packetptr().write_value(cell as u32);
-        r.events_ready().write_value(0);
-        r.events_address().write_value(0);
-        r.events_end().write_value(0);
-        r.events_phyend().write_value(0);
-        r.events_disabled().write_value(0);
-        r.tasks_rxen().write_value(1);
+    pll_enable(r);
+    r.shorts().write_value(shorts_rx_state());
+    r.packetptr().write_value(latest as u32);
+    r.events_address().write_value(0);
+    r.events_end().write_value(0);
+    r.events_phyend().write_value(0);
+    r.events_disabled().write_value(0);
+    r.tasks_rxen().write_value(1);
 
-        let mut got_end = false;
+    while cyc().wrapping_sub(slot_start_cyc) < deadline {
         let mut address_cyc = 0u32;
-        while cyc().wrapping_sub(slot_start_cyc) < deadline_cyc {
+        let mut got_end = false;
+        while cyc().wrapping_sub(slot_start_cyc) < deadline {
             if end_ev_set(r) {
                 got_end = true;
                 break;
@@ -234,52 +242,66 @@ unsafe fn receive_batch(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
                 address_cyc = cyc();
             }
         }
-        end_ev_clear(r);
-        let crc_ok = r.crcstatus().read().0 & 1 == 1;
-        if got_end {
-            // END_DISABLE/PHYEND_DISABLE already requested DISABLE.
-            disable_wait(r);
-        } else {
-            r.tasks_disable().write_value(1);
-            disable_wait(r);
+        if !got_end {
             break;
         }
-        if crc_ok {
-            let len = *cell as usize;
-            if len > 0 && len < 64 {
-                count += 1;
-                state.crc_ok = state.crc_ok.wrapping_add(1);
-                state.one_way_rx_since_feedback = state.one_way_rx_since_feedback.wrapping_add(1);
-                if state.one_way_rx_since_feedback >= state.one_way_feedback_every
-                    && address_cyc != 0
-                    && state.one_way_data_slot_us > 28
-                {
-                    let tx_at =
-                        address_cyc.wrapping_add((state.one_way_data_slot_us - 28) * CPU_MHZ);
-                    let wait_cyc = tx_at.wrapping_sub(cyc());
-                    if (wait_cyc as i32) > 0
-                        && cyc().wrapping_sub(slot_start_cyc).wrapping_add(wait_cyc) < deadline_cyc
-                    {
-                        state.one_way_rx_since_feedback = 0;
-                        delay_us(wait_cyc / CPU_MHZ);
-                        let feedback = [2u8, 0, 0];
-                        r.packetptr().write_value(feedback.as_ptr() as u32);
-                        r.shorts().write_value(shorts_tx());
-                        r.events_end().write_value(0);
-                        r.events_phyend().write_value(0);
-                        r.events_disabled().write_value(0);
-                        r.tasks_txen().write_value(1);
-                        while !end_ev_set(r) && cyc().wrapping_sub(slot_start_cyc) < deadline_cyc {}
-                        end_ev_clear(r);
-                        r.tasks_disable().write_value(1);
-                        disable_wait(r);
-                    }
-                }
-            }
+        end_ev_clear(r);
+        r.events_address().write_value(0);
+        if r.crcstatus().read().0 & 1 == 1 {
+            count += 1;
+            state.crc_ok = state.crc_ok.wrapping_add(1);
+            state.one_way_rx_since_feedback = state.one_way_rx_since_feedback.wrapping_add(1);
         } else {
             state.crc_bad = state.crc_bad.wrapping_add(1);
         }
+
+        let feedback_due = state.one_way_rx_since_feedback >= state.one_way_feedback_every
+            && address_cyc != 0
+            && state.one_way_data_slot_us > 28;
+        if feedback_due {
+            let tx_at = address_cyc.wrapping_add((state.one_way_data_slot_us - 28) * CPU_MHZ);
+            let wait = tx_at.wrapping_sub(cyc());
+            if (wait as i32) > 0 && cyc().wrapping_sub(slot_start_cyc).wrapping_add(wait) < deadline
+            {
+                state.one_way_rx_since_feedback = 0;
+                r.tasks_disable().write_value(1);
+                disable_wait(r);
+                delay_us(wait / CPU_MHZ);
+                let feedback = [0u8; 2];
+                radio_configure(state, 2);
+                r.packetptr().write_value(feedback.as_ptr() as u32);
+                r.shorts().write_value(shorts_tx());
+                r.events_end().write_value(0);
+                r.events_phyend().write_value(0);
+                r.events_disabled().write_value(0);
+                r.tasks_txen().write_value(1);
+                while !end_ev_set(r) && cyc().wrapping_sub(slot_start_cyc) < deadline {}
+                end_ev_clear(r);
+                r.tasks_disable().write_value(1);
+                disable_wait(r);
+                if cyc().wrapping_sub(slot_start_cyc) >= deadline {
+                    break;
+                }
+                radio_configure(state, 6);
+                r.shorts().write_value(shorts_rx_state());
+                r.packetptr().write_value(latest as u32);
+                r.events_address().write_value(0);
+                r.events_end().write_value(0);
+                r.events_phyend().write_value(0);
+                r.events_disabled().write_value(0);
+                r.tasks_rxen().write_value(1);
+                continue;
+            }
+        }
+
+        // RADIO remains RXIDLE. Re-arm without DISABLE/PLL/RXEN/ramp.
+        r.events_end().write_value(0);
+        r.events_phyend().write_value(0);
+        r.tasks_start().write_value(1);
     }
+
+    r.tasks_disable().write_value(1);
+    disable_wait(r);
     state.ops[ei].rx_ok = count > 0;
     state.ops[ei].rx_result = count;
 }
@@ -290,17 +312,22 @@ unsafe fn receive_batch(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
 pub unsafe fn timeslot_do_work(state: &mut MpslState, exec: Option<usize>) {
     let slot_start_cyc = cyc();
     let r = state.radio;
-    radio_configure(state);
     let kind = match exec {
         Some(i) => state.ops[i].kind,
         None => OpKind::Idle as u8,
     };
+    let statlen = match kind {
+        x if x == OpKind::Tx as u8 => state.ops[exec.unwrap_or(0)].tx_buf[0],
+        x if x == OpKind::Rx as u8 => 2,
+        x if x == OpKind::RxState as u8 => 6,
+        _ => 6,
+    };
+    radio_configure(state, statlen);
     match kind {
         x if x == OpKind::Tx as u8 => {
-            // The pending TX buffer: [0] = len, [1..=len] = payload.
             let ei = exec.unwrap_or(0);
             let buf: &mut [u8] = &mut state.ops[ei].tx_buf;
-            r.packetptr().write_value(buf.as_ptr() as u32);
+            r.packetptr().write_value(buf.as_ptr().add(1) as u32);
             state.tx_count = state.tx_count.wrapping_add(1);
             pll_enable(r);
 
@@ -317,8 +344,8 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, exec: Option<usize>) {
             r.tasks_disable().write_value(1);
             disable_wait(r);
         }
-        x if x == OpKind::RxBatch as u8 => {
-            receive_batch(state, exec.unwrap_or(0), slot_start_cyc);
+        x if x == OpKind::RxState as u8 => {
+            receive_state(state, exec.unwrap_or(0), slot_start_cyc);
         }
         x if x == OpKind::Rx as u8 => {
             let ei = exec.unwrap_or(0);
@@ -351,10 +378,9 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, exec: Option<usize>) {
             r.tasks_disable().write_value(1);
             disable_wait(r);
             if got_end && crc_ok {
-                let len = buf[0] as usize;
                 state.crc_ok = state.crc_ok.wrapping_add(1);
-                state.ops[ei].rx_ok = len > 0 && len + 1 <= rx_cap;
-                state.ops[ei].rx_result = len.min(63);
+                state.ops[ei].rx_ok = rx_cap >= 2;
+                state.ops[ei].rx_result = 2;
             } else {
                 if got_end {
                     state.crc_bad = state.crc_bad.wrapping_add(1);

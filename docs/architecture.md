@@ -146,13 +146,13 @@ contain only the six payload bytes. Runtime cadence fallback and probe logic are
 not part of the schedule:
 
 ```text
-2M six-byte state airtime: 64us
+2M fixed-STATLEN six-byte state airtime: 60us
 setup/ramp + tail + margin + MPSL gap: 265us
-mathematical Data period: 329us
-steady-state guard: 10us
-10us scheduling quantization: 340us
-feedback period: 340us
-cycle: 128 × 340us + 340us = 43860us
+mathematical Data period: 325us
+steady-state guard: 0us
+10us scheduling quantization: 330us
+feedback period: 330us
+cycle: 128 × 330us + 330us = 42570us
 ```
 
 The LM20 transmitter uses 128 Data events plus one feedback RX event. The 52840
@@ -164,17 +164,19 @@ acquisition substantially more phase coverage.
 LM20→52840 validation after acquisition measured:
 
 ```text
-receiver long slots: 22–23/s
-hardware transmitter packets: 2917–2918/s
-receiver delivered packets: 2897–2898/s
-receiver CRC-valid packets: 2897–2898/s
+receiver long slots: 23/s
+hardware transmitter packets: 3005–3006/s
+receiver delivered packets: 2988–3012/s
+receiver CRC-valid packets: 2988–3012/s
 invalid frames: 0
-steady receive ratio: about 99.3%
+steady receive ratio: about 99.4%
+TimeDiff feedback: acquired successfully
 ```
 
-A 330us zero-guard trial reached 3006 TX packets/s but only 1477–1504 RX
-packets/s and lost TimeDiff feedback. It is therefore rejected; 340us is the
-current shortest validated period.
+The q305-style receiver keeps RADIO enabled for the complete observation slot,
+reuses one six-byte DMA buffer, and only retains the newest state plus a packet
+count. The former 128 × 64-byte record buffers and per-packet RX ramp are gone.
+This makes 330us the current shortest validated period.
 
 All durations and packet-relative reply offsets come from
 `one_way_mpsl_plan::<Mode>()` and compile-time PHY timing constants. The old

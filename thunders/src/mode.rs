@@ -76,9 +76,10 @@ impl AirTiming {
         byte_us: 8,
     };
 
-    /// On-air duration including the one-byte length field and two-byte CRC.
+    /// On-air duration for a fixed-STATLEN frame, including two-byte CRC and
+    /// no transmitted length field.
     pub const fn airtime_us(self, wire_len: usize) -> u32 {
-        self.prefix_us as u32 + self.byte_us as u32 * (wire_len as u32 + 3)
+        self.prefix_us as u32 + self.byte_us as u32 * (wire_len as u32 + 2)
     }
 }
 
@@ -240,15 +241,15 @@ mod tests {
         const STREAM32: FixedSlotPlan =
             fixed_slot_plan::<Stream32>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
         assert_eq!(ACK8.data_wire_len, 10);
-        assert_eq!(ACK8.data_slot_us, 345);
-        assert_eq!(ACK8.feedback_slot_us, 321);
-        assert_eq!(ACK8.receiver_window_us, 345);
+        assert_eq!(ACK8.data_slot_us, 341);
+        assert_eq!(ACK8.feedback_slot_us, 317);
+        assert_eq!(ACK8.receiver_window_us, 341);
         assert_eq!(ACK8.receiver_physical_slots(), 2);
         assert_eq!(STREAM32.data_wire_len, 32);
-        assert_eq!(STREAM32.data_slot_us, 433);
+        assert_eq!(STREAM32.data_slot_us, 429);
         assert_eq!(STREAM32.feedback_every, 16);
-        assert_eq!(STREAM32.receiver_window_us, 16 * 433);
-        assert_eq!(STREAM32.period_us(), 16 * 433 + 313);
+        assert_eq!(STREAM32.receiver_window_us, 16 * 429);
+        assert_eq!(STREAM32.period_us(), 16 * 429 + 309);
     }
 
     #[test]

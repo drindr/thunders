@@ -23,7 +23,7 @@ use crate::radio_phy::RadioMode;
 /// Scheduling granularity applied to mathematically derived slot durations.
 pub const MPSL_SLOT_QUANTUM_US: u16 = 10;
 /// Extra steady-state callback/radio guard beyond the algebraic fit.
-pub const MPSL_STEADY_GUARD_US: u16 = 10;
+pub const MPSL_STEADY_GUARD_US: u16 = 0;
 /// One-shot first callback grant. Session/radio initialization performs more
 /// register work than steady-state events; subsequent grants use the mode plan.
 pub const MPSL_FIRST_CALLBACK_GRANT_US: u32 = 450;
@@ -246,29 +246,24 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
         self.state.one_way_rx_since_feedback = 0;
     }
 
-    /// Publish one long RX grant. `records` is split into 64-byte cells;
-    /// every caught frame is stored as `[len | payload | unused...]`.
-    pub fn publish_rx_batch(&mut self, records: &mut [u8], target: u32) -> bool {
-        if records.len() < 64 || records.len() % 64 != 0 {
-            return false;
-        }
+    /// Publish one long RX grant that repeatedly overwrites the latest state.
+    pub fn publish_state_rx(&mut self, latest: &mut [u8; 6], target: u32) {
         self.note_publish_delay();
         let e = &mut self.state.ops[(target % 2) as usize];
-        e.rx_ptr = records.as_mut_ptr();
-        e.rx_cap = records.len();
+        e.rx_ptr = latest.as_mut_ptr();
+        e.rx_cap = latest.len();
         e.rx_ok = false;
         e.rx_result = 0;
         e.skipped = false;
-        e.kind = state::OpKind::RxBatch as u8;
+        e.kind = state::OpKind::RxState as u8;
         e.target = target;
         e.grace = 0;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         e.seq = e.seq.wrapping_add(1);
-        true
     }
 
-    /// Collect a completed long RX grant and return its packet count.
-    pub async fn collect_rx_batch(&mut self, slot: u32) -> usize {
+    /// Collect a long state RX grant and return its valid packet count.
+    pub async fn collect_state_rx(&mut self, slot: u32) -> usize {
         self.collect(slot).await.unwrap_or(0)
     }
 
@@ -337,7 +332,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
         self.state.ops[i].collected_seq = seq;
         if skipped
             || !rx_ok
-            || (kind != state::OpKind::Rx as u8 && kind != state::OpKind::RxBatch as u8)
+            || (kind != state::OpKind::Rx as u8 && kind != state::OpKind::RxState as u8)
         {
             self.state.coll_empty = self.state.coll_empty.wrapping_add(1);
             return None;
@@ -380,16 +375,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
     ) -> Result<Option<usize>, Error<Self::Error>> {
         let target = self.state.slot_count.wrapping_add(1);
         self.publish_rx(buf, target);
-        match self.collect(target).await {
-            Some(len) => {
-                // The radio left `[len, payload..]`; the Phy contract is
-                // the payload only, so shift it.
-                let n = len.min(buf.len() - 1);
-                buf.copy_within(1..1 + n, 0);
-                Ok(Some(n))
-            }
-            None => Ok(None),
-        }
+        Ok(self.collect(target).await)
     }
 
     async fn flush(&mut self) {}
