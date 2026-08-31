@@ -26,6 +26,7 @@ bind_interrupts!(struct Irqs {
 
 const PAYLOAD: usize = 6;
 const PHASE_ALIGN: bool = cfg!(feature = "phase-align");
+const HOPPING: bool = cfg!(feature = "hopping");
 type Mode = OneWayState<PAYLOAD, 128>;
 const PLAN: OneWayMpslPlan =
     one_way_mpsl_plan::<Mode, PHASE_ALIGN>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
@@ -84,6 +85,12 @@ async fn main(spawner: Spawner) {
     phy.wait_ready().await;
     phy.set_address(&Address([0xE7; 5])).await;
     phy.set_channel(0).await;
+    phy.configure_one_way(
+        DATA_SLOT_US,
+        FEEDBACK_SLOT_US,
+        if PHASE_ALIGN { PLAN.batch } else { 0 },
+        HOPPING,
+    );
 
     let apply = phy.slot_count().wrapping_add(6);
     assert!(phy.schedule_slot_profile(
@@ -135,12 +142,20 @@ async fn main(spawner: Spawner) {
         if report_at.elapsed() >= Duration::from_secs(5) {
             let elapsed_us = report_at.elapsed().as_micros().max(1);
             let tx_slot_rate = sent as u64 * 1_000_000 / elapsed_us;
-            let hw_tx = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().tx_count;
+            let diag = thunders_phy_nrf::mpsl::mpsl_pll_snapshot();
+            let hw_tx = diag.tx_count;
             let hw_delta = hw_tx.wrapping_sub(last_hw_tx);
             let hw_rate = hw_delta as u64 * 1_000_000 / elapsed_us;
             info!(
-                "MPSL ONEWAY TX published={} publish_rate={}/s hw_tx={} hw_rate={}/s state={} feedback={}",
-                sent, tx_slot_rate, hw_delta, hw_rate, state_counter, feedback_seen
+                "MPSL ONEWAY TX published={} publish_rate={}/s hw_tx={} hw_rate={}/s state={} feedback={} hop={} locked={}",
+                sent,
+                tx_slot_rate,
+                hw_delta,
+                hw_rate,
+                state_counter,
+                feedback_seen,
+                diag.hop_index,
+                diag.hop_locked
             );
             last_hw_tx = hw_tx;
             sent = 0;

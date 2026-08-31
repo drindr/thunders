@@ -37,6 +37,24 @@ pub(crate) fn cyc() -> u32 {
     unsafe { (0xE000_1004 as *const u32).read_volatile() }
 }
 
+const HOP_SEQUENCE: [u8; 8] = [0, 13, 29, 43, 57, 71, 89, 97];
+
+fn hop_next(state: &mut MpslState) {
+    if state.one_way_hopping {
+        state.hop_index = (state.hop_index + 1) % HOP_SEQUENCE.len() as u8;
+        state.cur_channel = HOP_SEQUENCE[state.hop_index as usize];
+    }
+}
+
+fn hop_reset(state: &mut MpslState) {
+    state.hop_index = 0;
+    state.cur_channel = HOP_SEQUENCE[0];
+    state.hop_pending = false;
+    state.hop_locked = false;
+    state.one_way_last_address_cyc = 0;
+    state.one_way_phase_valid = false;
+}
+
 fn delay_us(us: u32) {
     let start = cyc();
     let cycles = us * CPU_MHZ;
@@ -218,6 +236,9 @@ unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
     let latest = state.ops[ei].rx_ptr;
     let deadline = state.slot_len.saturating_sub(40) * CPU_MHZ;
     let mut count = 0usize;
+    let mut sync_feedback_sent = false;
+    let pending_on_entry = state.hop_pending;
+    let hop_index_on_entry = state.hop_index;
     state.ops[ei].rx_ok = false;
     state.ops[ei].rx_result = 0;
 
@@ -247,16 +268,33 @@ unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
         }
         end_ev_clear(r);
         r.events_address().write_value(0);
-        if r.crcstatus().read().0 & 1 == 1 {
+        let crc_ok = r.crcstatus().read().0 & 1 == 1;
+        if crc_ok {
             count += 1;
             state.crc_ok = state.crc_ok.wrapping_add(1);
-            state.one_way_rx_since_feedback = state.one_way_rx_since_feedback.wrapping_add(1);
+            if state.one_way_feedback_every > 0 && address_cyc != 0 {
+                if state.one_way_last_address_cyc != 0 {
+                    let delta_us =
+                        address_cyc.wrapping_sub(state.one_way_last_address_cyc) / CPU_MHZ;
+                    let gap_threshold =
+                        state.one_way_data_slot_us + state.one_way_feedback_slot_us / 2;
+                    if delta_us > gap_threshold {
+                        state.one_way_data_phase = 0;
+                        state.one_way_phase_valid = true;
+                    } else if state.one_way_phase_valid {
+                        state.one_way_data_phase =
+                            (state.one_way_data_phase + 1) % state.one_way_feedback_every as u16;
+                    }
+                }
+                state.one_way_last_address_cyc = address_cyc;
+            }
         } else {
             state.crc_bad = state.crc_bad.wrapping_add(1);
         }
 
-        let feedback_due = state.one_way_feedback_every > 0
-            && state.one_way_rx_since_feedback >= state.one_way_feedback_every
+        let feedback_due = crc_ok
+            && state.one_way_phase_valid
+            && state.one_way_data_phase + 1 == state.one_way_feedback_every as u16
             && address_cyc != 0
             && state.one_way_data_slot_us > 28;
         if feedback_due {
@@ -264,7 +302,6 @@ unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
             let wait = tx_at.wrapping_sub(cyc());
             if (wait as i32) > 0 && cyc().wrapping_sub(slot_start_cyc).wrapping_add(wait) < deadline
             {
-                state.one_way_rx_since_feedback = 0;
                 r.tasks_disable().write_value(1);
                 disable_wait(r);
                 delay_us(wait / CPU_MHZ);
@@ -280,6 +317,11 @@ unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
                 end_ev_clear(r);
                 r.tasks_disable().write_value(1);
                 disable_wait(r);
+                if state.one_way_hopping {
+                    // Stay on the current channel for the remainder of this
+                    // long RX window. Both peers switch at the batch boundary.
+                    sync_feedback_sent = true;
+                }
                 if cyc().wrapping_sub(slot_start_cyc) >= deadline {
                     break;
                 }
@@ -303,6 +345,16 @@ unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
 
     r.tasks_disable().write_value(1);
     disable_wait(r);
+    if sync_feedback_sent && state.one_way_hopping {
+        hop_next(state);
+        state.hop_pending = true;
+        state.hop_locked = true;
+    }
+    if state.one_way_hopping && count == 0 {
+        hop_reset(state);
+    } else if pending_on_entry && state.hop_index == hop_index_on_entry {
+        state.hop_pending = false;
+    }
     state.ops[ei].rx_ok = count > 0;
     state.ops[ei].rx_result = count;
 }
@@ -380,6 +432,8 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, exec: Option<usize>) {
             disable_wait(r);
             if got_end && crc_ok {
                 state.crc_ok = state.crc_ok.wrapping_add(1);
+                hop_next(state);
+                state.hop_locked = true;
                 state.ops[ei].rx_ok = rx_cap >= 2;
                 state.ops[ei].rx_result = 2;
             } else {

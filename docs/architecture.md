@@ -181,6 +181,40 @@ count. The former 128 × 64-byte record buffers and per-packet RX ramp are gone.
 This makes 300us the current compile-time floor and shortest validated period;
 shorter values would violate the modeled ramp/airtime/tail/MPSL-gap budget.
 
+### Optional hopping
+
+The MPSL examples expose:
+
+```text
+--features hopping
+```
+
+`hopping` depends on `phase-align`. Both peers start on channel 0 and derive the
+batch boundary from the long inter-packet gap before the reserved TimeDiff
+event. A successful TimeDiff establishes the hop epoch, after which both advance
+through the compile-time sequence:
+
+```text
+0, 13, 29, 43, 57, 71, 89, 97
+```
+
+The receiver changes channel only at the end of its long batch window. If a
+pending hopped window receives no packets, it resets directly to channel 0 and
+re-enters acquisition.
+
+LM20→52840 hopping validation measured:
+
+```text
+TX: 3305–3306 packets/s
+steady RX: 3283–3291 packets/s
+invalid: normally 0
+hop indices advance and remain locked
+```
+
+Restarting the transmitter while the receiver was locked caused the receiver to
+reset to channel 0 and reacquire; steady ~3290 packets/s resumed automatically.
+Hopping adds no event beyond the phase-align feedback event.
+
 All durations and packet-relative reply offsets come from
 `one_way_mpsl_plan::<Mode>()` and compile-time PHY timing constants. The old
 symmetric link, cadence probes, PLL servo, runtime alignment, and their debug

@@ -26,6 +26,7 @@ bind_interrupts!(struct Irqs {
 
 const PAYLOAD: usize = 6;
 const PHASE_ALIGN: bool = cfg!(feature = "phase-align");
+const HOPPING: bool = cfg!(feature = "hopping");
 type Mode = OneWayState<PAYLOAD, 128>;
 const PLAN: OneWayMpslPlan =
     one_way_mpsl_plan::<Mode, PHASE_ALIGN>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
@@ -70,7 +71,12 @@ async fn main(spawner: Spawner) {
     phy.set_channel(0).await;
 
     let apply = phy.slot_count().wrapping_add(6);
-    phy.configure_one_way(DATA_SLOT_US, if PHASE_ALIGN { PLAN.batch } else { 0 });
+    phy.configure_one_way(
+        DATA_SLOT_US,
+        FEEDBACK_SLOT_US,
+        if PHASE_ALIGN { PLAN.batch } else { 0 },
+        HOPPING,
+    );
     assert!(phy.schedule_slot_profile(RX_WINDOW_US, RX_WINDOW_US, 1, 1, 0, apply,));
 
     static LATEST0: StaticCell<[u8; PAYLOAD]> = StaticCell::new();
@@ -122,7 +128,7 @@ async fn main(spawner: Spawner) {
             let crc_ok = diag.crc_ok.wrapping_sub(last_crc_ok);
             let crc_bad = diag.crc_bad.wrapping_sub(last_crc_bad);
             info!(
-                "MPSL ONEWAY RX slots={} slot_rate={}/s frames={} frame_rate={}/s addr={} crcok={} crcbad={} invalid={} state={}",
+                "MPSL ONEWAY RX slots={} slot_rate={}/s frames={} frame_rate={}/s addr={} crcok={} crcbad={} invalid={} state={} hop={} locked={}",
                 rx_slots,
                 rx_slot_rate,
                 received,
@@ -131,7 +137,9 @@ async fn main(spawner: Spawner) {
                 crc_ok,
                 crc_bad,
                 invalid,
-                last_state
+                last_state,
+                diag.hop_index,
+                diag.hop_locked
             );
             last_addr = diag.addr_events;
             last_crc_ok = diag.crc_ok;

@@ -23,6 +23,7 @@ static_cell = "1.2"
 [features]
 default = []
 phase-align = []
+hopping = ["phase-align"]
 
 [[bin]]
 name = "thunders-mpsl"

@@ -99,6 +99,12 @@ pub struct MpslStats {
     pub crc_ok: u32,
     /// CRC failures.
     pub crc_bad: u32,
+    /// Current index in the compile-time hopping sequence.
+    pub hop_index: u8,
+    /// Whether hopping is enabled.
+    pub hopping: bool,
+    /// Whether the initial hop epoch handshake completed.
+    pub hop_locked: bool,
 }
 
 /// Read cumulative MPSL counters.
@@ -110,6 +116,9 @@ pub fn mpsl_pll_snapshot() -> MpslStats {
             tx_count: state.tx_count,
             crc_ok: state.crc_ok,
             crc_bad: state.crc_bad,
+            hop_index: state.hop_index,
+            hopping: state.one_way_hopping,
+            hop_locked: state.hop_locked,
         }
     }
 }
@@ -252,10 +261,23 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
     }
 
     /// Configure packet-relative TimeDiff timing for a one-way mode.
-    pub fn configure_one_way(&mut self, data_slot_us: u16, feedback_every: u16) {
+    pub fn configure_one_way(
+        &mut self,
+        data_slot_us: u16,
+        feedback_slot_us: u16,
+        feedback_every: u16,
+        hopping: bool,
+    ) {
         self.state.one_way_data_slot_us = data_slot_us as u32;
+        self.state.one_way_feedback_slot_us = feedback_slot_us as u32;
         self.state.one_way_feedback_every = feedback_every as u32;
-        self.state.one_way_rx_since_feedback = 0;
+        self.state.one_way_last_address_cyc = 0;
+        self.state.one_way_data_phase = 0;
+        self.state.one_way_phase_valid = false;
+        self.state.one_way_hopping = hopping;
+        self.state.hop_index = 0;
+        self.state.hop_pending = false;
+        self.state.hop_locked = false;
     }
 
     /// Publish one long RX grant that repeatedly overwrites the latest state.
