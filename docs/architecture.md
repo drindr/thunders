@@ -329,6 +329,39 @@ With a five-byte address, six-byte state and CRC16, airtime is approximately
 56 us. The theoretical airtime ceiling is about 17857 packets/s. The measured
 61.8 us period includes state copy, END handling and TASKS_START.
 
+### Bare hopping
+
+Build both bare examples with:
+
+```bash
+cargo build --release --no-default-features --features hopping
+```
+
+The bare path uses 512 Data packets per hop. The transmitter inserts one bounded
+feedback RX window, and the receiver detects that long inter-packet gap to learn
+phase 0..511 before returning TimeDiff. Both then advance through the same
+eight-channel sequence used by MPSL.
+
+```text
+Data packets per hop: 512
+hop interval: about 32.2 ms
+hop frequency: about 31.0 hops/s
+feedback RX timeout: 700 us
+```
+
+LM20 -> nRF52840 measured:
+
+```text
+TX: 15892-15897 packets/s
+RX: 15893-15901 packets/s
+lost: typically 0-20 per ~79,500 packets
+invalid: 0
+hopping overhead versus no-hop bare: about 1.7-1.8%
+```
+
+If feedback is missed, the transmitter returns to channel 0. A locked receiver
+that times out also returns to channel 0, clears its phase state, and reacquires.
+
 ## 9. Current limitations
 
 - The benchmark payload embeds a state counter, but the protocol itself carries

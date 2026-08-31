@@ -986,7 +986,7 @@ impl<'d> NrfRadioPhy<'d> {
         Ok(())
     }
 
-    fn configure_fixed_state(&mut self) {
+    fn configure_fixed_len(&mut self, len: u8) {
         self.r.pcnf0().modify(|w| {
             w.set_lflen(0);
             w.set_s0len(false);
@@ -994,8 +994,8 @@ impl<'d> NrfRadioPhy<'d> {
             w.set_plen(Plen::_8bit);
         });
         self.r.pcnf1().modify(|w| {
-            w.set_maxlen(6);
-            w.set_statlen(6);
+            w.set_maxlen(len);
+            w.set_statlen(len);
         });
     }
 
@@ -1004,7 +1004,7 @@ impl<'d> NrfRadioPhy<'d> {
         self.disable();
         #[cfg(feature = "_nrf54")]
         self.pll_enable();
-        self.configure_fixed_state();
+        self.configure_fixed_len(6);
         let tx_buf = unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) };
         tx_buf[..6].copy_from_slice(state);
         self.set_packet_ptr(tx_buf.as_ptr());
@@ -1038,7 +1038,7 @@ impl<'d> NrfRadioPhy<'d> {
         self.disable();
         #[cfg(feature = "_nrf54")]
         self.pll_enable();
-        self.configure_fixed_state();
+        self.configure_fixed_len(6);
         let rx_ptr = core::ptr::addr_of_mut!(RX_BUF) as *mut u8;
         self.set_packet_ptr(rx_ptr);
         self.r.shorts().write(|w| {
@@ -1054,9 +1054,19 @@ impl<'d> NrfRadioPhy<'d> {
         while self.r.events_ready().read() == 0 {}
     }
 
-    /// Receive the next state and immediately re-arm from RXIDLE.
-    pub fn state_rx_next(&mut self, state: &mut [u8; 6]) -> bool {
-        while !self.rx_end_set() {}
+    /// Receive the next state with a bounded wait and immediately re-arm.
+    pub fn state_rx_next_timeout(
+        &mut self,
+        state: &mut [u8; 6],
+        timeout_us: u32,
+    ) -> Option<(bool, u32)> {
+        let start = dwt_cycles();
+        while !self.rx_end_set() {
+            if dwt_cycles().wrapping_sub(start) >= timeout_us * CPU_MHZ {
+                return None;
+            }
+        }
+        let stamp = dwt_cycles();
         compiler_fence(Ordering::Acquire);
         let crc_ok = self.r.crcstatus().read().0 & 1 == 1;
         if crc_ok {
@@ -1066,7 +1076,97 @@ impl<'d> NrfRadioPhy<'d> {
         self.rx_end_clear();
         self.r.events_address().write_value(0);
         self.r.tasks_start().write_value(1);
+        Some((crc_ok, stamp))
+    }
+
+    /// Receive the next state without a timeout.
+    pub fn state_rx_next(&mut self, state: &mut [u8; 6]) -> bool {
+        loop {
+            if let Some((crc_ok, _)) = self.state_rx_next_timeout(state, u32::MAX / CPU_MHZ) {
+                return crc_ok;
+            }
+        }
+    }
+
+    /// Send one fixed two-byte feedback frame and leave RADIO disabled.
+    pub fn state_rx_send_feedback(&mut self, diff_us: i16) {
+        self.disable();
+        #[cfg(feature = "_nrf54")]
+        self.pll_enable();
+        self.configure_fixed_len(2);
+        let tx_buf = unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) };
+        tx_buf[..2].copy_from_slice(&diff_us.to_le_bytes());
+        self.set_packet_ptr(tx_buf.as_ptr());
+        self.r.shorts().write(|w| {
+            #[cfg(not(feature = "_nrf54"))]
+            {
+                w.set_txready_start(true);
+                w.set_end_disable(true);
+            }
+            #[cfg(feature = "_nrf54")]
+            {
+                w.set_ready_start(true);
+                w.set_phyend_disable(true);
+            }
+        });
+        self.r.events_disabled().write_value(0);
+        self.rx_end_clear();
+        self.r.tasks_txen().write_value(1);
+        while !self.rx_end_set() {}
+        self.rx_end_clear();
+        while self.state() != State::Disabled {}
+    }
+
+    /// Listen for one two-byte feedback frame and leave RADIO disabled.
+    pub fn state_tx_receive_feedback(&mut self, timeout_us: u32) -> bool {
+        self.disable();
+        #[cfg(feature = "_nrf54")]
+        self.pll_enable();
+        self.configure_fixed_len(2);
+        let rx_ptr = core::ptr::addr_of_mut!(RX_BUF) as *mut u8;
+        self.set_packet_ptr(rx_ptr);
+        self.r.shorts().write(|w| {
+            #[cfg(not(feature = "_nrf54"))]
+            {
+                w.set_rxready_start(true);
+                w.set_end_disable(true);
+            }
+            #[cfg(feature = "_nrf54")]
+            {
+                w.set_ready_start(true);
+                w.set_phyend_disable(true);
+            }
+        });
+        self.r.events_disabled().write_value(0);
+        self.r.events_address().write_value(0);
+        self.rx_end_clear();
+        let start = dwt_cycles();
+        self.r.tasks_rxen().write_value(1);
+        while !self.rx_end_set() {
+            if dwt_cycles().wrapping_sub(start) >= timeout_us * CPU_MHZ {
+                self.disable();
+                return false;
+            }
+        }
+        let crc_ok = self.r.crcstatus().read().0 & 1 == 1;
+        self.rx_end_clear();
+        while self.state() != State::Disabled {}
         crc_ok
+    }
+
+    /// Change channel while the exclusive state RADIO is disabled.
+    pub fn state_set_channel(&mut self, ch: u8) {
+        let freq = ch % 101;
+        #[cfg(not(feature = "_nrf54"))]
+        self.r.frequency().write(|w| {
+            w.set_frequency(freq);
+            w.set_map(Map::Default);
+        });
+        #[cfg(feature = "_nrf54")]
+        self.r.frequency().write(|w| {
+            w.set_frequency(freq);
+            w.set_map(false);
+        });
     }
 }
 

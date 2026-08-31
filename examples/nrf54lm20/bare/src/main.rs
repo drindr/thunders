@@ -17,6 +17,9 @@ bind_interrupts!(struct Irqs {
 });
 
 const PAYLOAD: usize = 6;
+const HOPPING: bool = cfg!(feature = "hopping");
+const HOP_EVERY: u32 = 512;
+const HOP_SEQUENCE: [u8; 8] = [0, 13, 29, 43, 57, 71, 89, 97];
 type Mode = OneWayState<PAYLOAD, 32>;
 const PLAN: thunders::FixedSlotPlan =
     fixed_slot_plan::<Mode>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
@@ -39,6 +42,9 @@ async fn main(_spawner: Spawner) {
     phy.state_tx_begin(&first);
     let mut seq = 1u32;
     let mut report_frames = 1u32;
+    let mut tx_active = true;
+    let mut hop_index = 0usize;
+    let mut feedback_seen = false;
     let mut report_at = Instant::now();
 
     info!(
@@ -59,18 +65,36 @@ async fn main(_spawner: Spawner) {
             (seq >> 16) as u8,
             (seq >> 24) as u8,
         ];
-        phy.state_tx_send(&payload);
+        if tx_active {
+            phy.state_tx_send(&payload);
+        } else {
+            phy.state_tx_begin(&payload);
+            tx_active = true;
+        }
         seq = seq.wrapping_add(1);
         report_frames = report_frames.wrapping_add(1);
+
+        if HOPPING && seq % HOP_EVERY == 0 {
+            let got_feedback = phy.state_tx_receive_feedback(700);
+            tx_active = false;
+            feedback_seen |= got_feedback;
+            if got_feedback {
+                hop_index = (hop_index + 1) % HOP_SEQUENCE.len();
+            } else {
+                hop_index = 0;
+            }
+            phy.state_set_channel(HOP_SEQUENCE[hop_index]);
+        }
 
         if report_at.elapsed() >= Duration::from_secs(5) {
             let elapsed_us = report_at.elapsed().as_micros().max(1);
             let rate = report_frames as u64 * 1_000_000 / elapsed_us;
             info!(
-                "ONEWAY TX frames={} rate={}/s seq={}",
-                report_frames, rate, seq
+                "ONEWAY TX frames={} rate={}/s seq={} feedback={} hop={}",
+                report_frames, rate, seq, feedback_seen, hop_index
             );
             report_frames = 0;
+            feedback_seen = false;
             report_at = Instant::now();
         }
     }
