@@ -21,9 +21,11 @@ use thunders::phy::Phy;
 use crate::radio_phy::RadioMode;
 
 /// Scheduling granularity applied to mathematically derived slot durations.
-pub const MPSL_SLOT_QUANTUM_US: u16 = 10;
+pub const MPSL_SLOT_QUANTUM_US: u16 = 5;
 /// Extra steady-state callback/radio guard beyond the algebraic fit.
 pub const MPSL_STEADY_GUARD_US: u16 = 0;
+/// Additional window for the reverse TimeDiff RX event.
+pub const MPSL_FEEDBACK_GUARD_US: u16 = 10;
 /// One-shot first callback grant. Session/radio initialization performs more
 /// register work than steady-state events; subsequent grants use the mode plan.
 pub const MPSL_FIRST_CALLBACK_GRANT_US: u32 = 450;
@@ -55,10 +57,9 @@ pub const fn one_way_mpsl_plan<M: LinkMode>(
         fixed.feedback_slot_us.saturating_add(MPSL_STEADY_GUARD_US),
         MPSL_SLOT_QUANTUM_US,
     );
-    // The callback's two-duration profile requires short <= long. Keeping the
-    // feedback event at least as long as Data also leaves room for RX ramp.
-    let feedback = if feedback_raw < data {
-        data
+    let feedback_min = data.saturating_add(MPSL_FEEDBACK_GUARD_US);
+    let feedback = if feedback_raw < feedback_min {
+        feedback_min
     } else {
         feedback_raw
     };

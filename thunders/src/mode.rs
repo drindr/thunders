@@ -115,7 +115,7 @@ impl SlotOverhead {
         rx_ramp_us: 42,
         rx_restart_us: 0,
         tail_us: 40,
-        margin_us: 25,
+        margin_us: 0,
         interslot_gap_us: 150,
     };
 
@@ -241,15 +241,15 @@ mod tests {
         const STREAM32: FixedSlotPlan =
             fixed_slot_plan::<Stream32>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
         assert_eq!(ACK8.data_wire_len, 10);
-        assert_eq!(ACK8.data_slot_us, 341);
-        assert_eq!(ACK8.feedback_slot_us, 317);
-        assert_eq!(ACK8.receiver_window_us, 341);
+        assert_eq!(ACK8.data_slot_us, 316);
+        assert_eq!(ACK8.feedback_slot_us, 292);
+        assert_eq!(ACK8.receiver_window_us, 316);
         assert_eq!(ACK8.receiver_physical_slots(), 2);
         assert_eq!(STREAM32.data_wire_len, 32);
-        assert_eq!(STREAM32.data_slot_us, 429);
+        assert_eq!(STREAM32.data_slot_us, 404);
         assert_eq!(STREAM32.feedback_every, 16);
-        assert_eq!(STREAM32.receiver_window_us, 16 * 429);
-        assert_eq!(STREAM32.period_us(), 16 * 429 + 309);
+        assert_eq!(STREAM32.receiver_window_us, 16 * 404);
+        assert_eq!(STREAM32.period_us(), 16 * 404 + 284);
     }
 
     #[test]
