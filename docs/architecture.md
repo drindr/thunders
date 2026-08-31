@@ -435,6 +435,47 @@ A future shared-epoch TDMA allocator can remove those collisions.
 Current multi-sender RX uses one fixed channel and rejects combination with the
 hopping receiver example.
 
+### Reversed roles: LM20 receiver
+
+The opposite hardware assignment is also available:
+
+```bash
+# receiver: nRF54LM20
+cd examples/nrf54lm20/mpsl
+cargo build --release --no-default-features --features multi-receiver
+
+# sender 0: nRF52840, prefix E7, divisor two
+cd examples/nrf52840/mpsl
+cargo build --release --no-default-features --features multi-sender-bench
+
+# sender 1: nRF5340 network core, prefix C3, divisor three
+cd examples/nrf5340/mpsl
+cargo build --release --no-default-features
+```
+
+Measured hardware TX rates:
+
+```text
+nRF52840 sender 0: 1383-1384 packets/s
+nRF5340 sender 1: 1111 packets/s
+aggregate offered: about 2495 packets/s
+```
+
+Measured LM20 receiver rates:
+
+```text
+sender 0: 1175-1192 packets/s (average about 1183/s)
+sender 1:  831-846 packets/s  (average about 840/s)
+aggregate: about 2023 packets/s
+aggregate delivery: about 81.1%
+```
+
+Both sender states were independently decoded and advanced. This orientation is
+less efficient than the 52840-receiver result: the free-running sender grids
+still collide, and the 52840 transmitter's actual MPSL publication rate in this
+configuration is 1384/s rather than the nominal 1666/s. These measurements are
+for the current asynchronous divisor schedule, not synchronized TDMA.
+
 ## 10. Current limitations
 
 - The benchmark payload embeds a state counter, but the protocol itself carries

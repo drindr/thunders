@@ -29,6 +29,7 @@ const PHASE_ALIGN: bool = cfg!(feature = "phase-align");
 const HOPPING: bool = cfg!(feature = "hopping");
 const SENDER_1: bool = cfg!(feature = "sender-1");
 const MULTI_SENDER_BENCH: bool = cfg!(feature = "multi-sender-bench");
+const MULTI_RECEIVER: bool = cfg!(feature = "multi-receiver");
 const FEEDBACK_EVERY: u16 = if HOPPING { 120 } else { 128 };
 type Mode = OneWayState<PAYLOAD, FEEDBACK_EVERY>;
 const PLAN: OneWayMpslPlan =
@@ -43,6 +44,62 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
     loop {
         unsafe { raw::mpsl_low_priority_process() };
         embassy_futures::yield_now().await;
+    }
+}
+
+async fn run_multi_receiver(mut phy: MpslRadioPhy<'static, { DATA_SLOT_US as u32 }, 1400>) -> ! {
+    assert!(!PHASE_ALIGN && !HOPPING);
+    assert!(phy.configure_state_senders(&[
+        Address([0xE7, 0xE7, 0xE7, 0xE7, 0xE7]),
+        Address([0xC3, 0xE7, 0xE7, 0xE7, 0xE7]),
+    ]));
+    phy.set_channel(0).await;
+    phy.configure_one_way(DATA_SLOT_US, 0, 0, false);
+    let apply = phy.slot_count().wrapping_add(6);
+    assert!(phy.schedule_slot_profile(
+        PLAN.receiver_window_us,
+        PLAN.receiver_window_us,
+        1,
+        1,
+        0,
+        apply,
+    ));
+    static LATEST0: StaticCell<[u8; PAYLOAD]> = StaticCell::new();
+    static LATEST1: StaticCell<[u8; PAYLOAD]> = StaticCell::new();
+    let latest0 = LATEST0.init([0; PAYLOAD]);
+    let latest1 = LATEST1.init([0; PAYLOAD]);
+    phy.publish_state_rx(latest0, apply);
+    phy.publish_state_rx(latest1, apply.wrapping_add(1));
+    let mut collected = apply;
+    let mut last_counts = [0u32; 2];
+    let mut report_at = Instant::now();
+    info!(
+        "MPSL MULTI RX READY receiver=LM20 window={} apply={}",
+        PLAN.receiver_window_us, apply
+    );
+    loop {
+        let _ = phy.collect_state_rx(collected).await;
+        let target = collected.wrapping_add(2);
+        let latest: &mut [u8; PAYLOAD] = if target & 1 == 0 { latest0 } else { latest1 };
+        phy.publish_state_rx(latest, target);
+        collected = collected.wrapping_add(1);
+        if report_at.elapsed() >= Duration::from_secs(5) {
+            let elapsed_us = report_at.elapsed().as_micros().max(1);
+            let mut sender0 = [0u8; PAYLOAD];
+            let mut sender1 = [0u8; PAYLOAD];
+            let count0 = phy.sender_state(0, &mut sender0).unwrap_or(0);
+            let count1 = phy.sender_state(1, &mut sender1).unwrap_or(0);
+            let rate0 = count0.wrapping_sub(last_counts[0]) as u64 * 1_000_000 / elapsed_us;
+            let rate1 = count1.wrapping_sub(last_counts[1]) as u64 * 1_000_000 / elapsed_us;
+            let state0 = u32::from_le_bytes([sender0[2], sender0[3], sender0[4], sender0[5]]);
+            let state1 = u32::from_le_bytes([sender1[2], sender1[3], sender1[4], sender1[5]]);
+            info!(
+                "MPSL MULTI RX sender0={}/s state={} sender1={}/s state={}",
+                rate0, state0, rate1, state1
+            );
+            last_counts = [count0, count1];
+            report_at = Instant::now();
+        }
     }
 }
 
@@ -86,6 +143,9 @@ async fn main(spawner: Spawner) {
     let mut phy = MpslRadioPhy::<{ DATA_SLOT_US as u32 }, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
+    if MULTI_RECEIVER {
+        run_multi_receiver(phy).await;
+    }
     assert!(
         !MULTI_SENDER_BENCH || (!PHASE_ALIGN && !HOPPING && !SENDER_1),
         "multi-sender-bench uses sender 0 without feedback/hopping"

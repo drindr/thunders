@@ -28,6 +28,7 @@ const PAYLOAD: usize = 6;
 const PHASE_ALIGN: bool = cfg!(feature = "phase-align");
 const HOPPING: bool = cfg!(feature = "hopping");
 const MULTI_SENDER: bool = cfg!(feature = "multi-sender");
+const MULTI_SENDER_BENCH: bool = cfg!(feature = "multi-sender-bench");
 const FEEDBACK_EVERY: u16 = if HOPPING { 120 } else { 128 };
 type Mode = OneWayState<PAYLOAD, FEEDBACK_EVERY>;
 const PLAN: OneWayMpslPlan =
@@ -42,6 +43,54 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
     loop {
         unsafe { raw::mpsl_low_priority_process() };
         embassy_futures::yield_now().await;
+    }
+}
+
+async fn run_sender0(mut phy: MpslRadioPhy<'static, { DATA_SLOT_US as u32 }, 1400>) -> ! {
+    phy.set_address(&Address([0xE7; 5])).await;
+    phy.set_channel(0).await;
+    phy.configure_one_way(DATA_SLOT_US, 0, 0, false);
+    let apply = phy.slot_count().wrapping_add(6);
+    assert!(phy.schedule_slot_profile(DATA_SLOT_US, DATA_SLOT_US, 1, 1, 0, apply));
+    let mut state_counter = 0u32;
+    let mut sent = 0u32;
+    let mut last_hw_tx = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().tx_count;
+    let mut report_at = Instant::now();
+    info!(
+        "MPSL MULTI TX READY sender=0 divisor=2 data={} apply={}",
+        DATA_SLOT_US, apply
+    );
+    loop {
+        let hw = phy.slot_count();
+        let target = hw.wrapping_add(2);
+        if (target.wrapping_sub(apply) as i32) >= 0 && target.wrapping_sub(apply) % 2 == 0 {
+            let payload = [
+                b'S',
+                b'T',
+                state_counter as u8,
+                (state_counter >> 8) as u8,
+                (state_counter >> 16) as u8,
+                (state_counter >> 24) as u8,
+            ];
+            phy.op_publish_tx(&payload, target, 0).await.unwrap();
+            state_counter = state_counter.wrapping_add(1);
+            sent = sent.wrapping_add(1);
+        }
+        let _ = phy.op_collect(hw.wrapping_add(1)).await;
+        if report_at.elapsed() >= Duration::from_secs(5) {
+            let elapsed_us = report_at.elapsed().as_micros().max(1);
+            let published_rate = sent as u64 * 1_000_000 / elapsed_us;
+            let hw_tx = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().tx_count;
+            let hw_delta = hw_tx.wrapping_sub(last_hw_tx);
+            let hw_rate = hw_delta as u64 * 1_000_000 / elapsed_us;
+            info!(
+                "MPSL MULTI TX sender=0 published={}/s hw={}/s state={}",
+                published_rate, hw_rate, state_counter
+            );
+            last_hw_tx = hw_tx;
+            sent = 0;
+            report_at = Instant::now();
+        }
     }
 }
 
@@ -69,6 +118,9 @@ async fn main(spawner: Spawner) {
     let mut phy = MpslRadioPhy::<{ DATA_SLOT_US as u32 }, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
+    if MULTI_SENDER_BENCH {
+        run_sender0(phy).await;
+    }
     if MULTI_SENDER {
         assert!(!HOPPING, "multi-sender RX currently uses one fixed channel");
         assert!(phy.configure_state_senders(&[
