@@ -158,9 +158,9 @@ relative TimeDiff reply at the following compile-time Data event boundary.
 LM20→52840 hardware validation at 2 Mbit measured:
 
 ```text
-receiver collected long-RX slots: 65–66/s
-transmitter Data slots: 2710–2711/s
-received Data frames: 1273–1400/s after acquisition
+receiver collected long-RX slots: 66–68/s
+transmitter Data slots: 2769–2770/s
+received Data frames: 1393–1562/s after acquisition
 invalid frames: 0
 TimeDiff feedback: true
 ```
