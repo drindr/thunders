@@ -151,21 +151,24 @@ setup/ramp + tail + margin + MPSL gap: 265us
 mathematical Data period: 329us
 25us scheduling quantization: 350us
 feedback period: 350us
-cycle: 32 × 350us + 350us = 11550us
+cycle: 128 × 350us + 350us = 45150us
 ```
 
-The LM20 transmitter uses 32 Data events plus one feedback RX event. The 52840
+The LM20 transmitter uses 128 Data events plus one feedback RX event. The 52840
 receiver uses one long event and returns a two-byte signed `diff_us`; state mode
-uses neither marker nor protocol sequence.
+uses neither marker nor protocol sequence. The longer observation cycle
+amortizes MPSL boundary and callback/application handoff costs and gives cold
+acquisition substantially more phase coverage.
 
-Completed callback results remain available until application context marks the
-exact publication sequence collected. LM20→52840 validation measured:
+LM20→52840 validation after acquisition measured:
 
 ```text
-hardware transmitter slots: 2769–2770/s
-receiver delivered frames: 1299–1308/s
-receiver CRC-valid catches: 1300–1308/s
+receiver long slots: 22/s
+hardware transmitter packets: 2834–2835/s
+receiver delivered packets: 2816–2818/s
+receiver CRC-valid packets: 2816–2818/s
 invalid frames: 0
+steady receive ratio: about 99.4%
 ```
 
 All durations and packet-relative reply offsets come from

@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-//! nRF54LM20 MPSL transmitter for `OneWayState<6, 32>`.
+//! nRF54LM20 MPSL transmitter for a compile-time `OneWayState` batch.
 
 use defmt::info;
 use embassy_executor::Spawner;
@@ -25,11 +25,12 @@ bind_interrupts!(struct Irqs {
 });
 
 const PAYLOAD: usize = 6;
-type Mode = OneWayState<PAYLOAD, 32>;
+type Mode = OneWayState<PAYLOAD, 128>;
 const PLAN: OneWayMpslPlan =
     one_way_mpsl_plan::<Mode>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
 const DATA_SLOT_US: u16 = PLAN.data_slot_us;
 const FEEDBACK_SLOT_US: u16 = PLAN.feedback_slot_us;
+const PERIOD_SLOTS: u16 = PLAN.batch + 1;
 
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
@@ -84,7 +85,14 @@ async fn main(spawner: Spawner) {
     phy.set_channel(0).await;
 
     let apply = phy.slot_count().wrapping_add(6);
-    assert!(phy.schedule_slot_profile(DATA_SLOT_US, FEEDBACK_SLOT_US, 33, 32, 0, apply,));
+    assert!(phy.schedule_slot_profile(
+        DATA_SLOT_US,
+        FEEDBACK_SLOT_US,
+        PERIOD_SLOTS,
+        PLAN.batch,
+        0,
+        apply,
+    ));
 
     let mut feedback = [0u8; 64];
     let mut state_counter = 0u32;
@@ -101,8 +109,8 @@ async fn main(spawner: Spawner) {
         let hw = phy.slot_count();
         let target = hw.wrapping_add(2);
         if (target.wrapping_sub(apply) as i32) >= 0 {
-            let phase = target.wrapping_sub(apply) % 33;
-            if phase < 32 {
+            let phase = target.wrapping_sub(apply) % PERIOD_SLOTS as u32;
+            if phase < PLAN.batch as u32 {
                 let payload = [
                     b'S',
                     b'T',

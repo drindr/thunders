@@ -250,7 +250,7 @@ unsafe fn receive_batch(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
                 count += 1;
                 state.crc_ok = state.crc_ok.wrapping_add(1);
                 state.one_way_rx_since_feedback = state.one_way_rx_since_feedback.wrapping_add(1);
-                if state.one_way_rx_since_feedback >= 32
+                if state.one_way_rx_since_feedback >= state.one_way_feedback_every
                     && address_cyc != 0
                     && state.one_way_data_slot_us > 28
                 {

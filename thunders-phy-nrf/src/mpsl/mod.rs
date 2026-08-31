@@ -231,10 +231,11 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
         e.seq = e.seq.wrapping_add(1);
     }
 
-    /// Configure the sender Data event duration used by packet-relative
-    /// TimeDiff replies in long RX grants.
-    pub fn set_one_way_data_slot_us(&mut self, us: u16) {
-        self.state.one_way_data_slot_us = us as u32;
+    /// Configure packet-relative TimeDiff timing for a one-way mode.
+    pub fn configure_one_way(&mut self, data_slot_us: u16, feedback_every: u16) {
+        self.state.one_way_data_slot_us = data_slot_us as u32;
+        self.state.one_way_feedback_every = feedback_every.max(1) as u32;
+        self.state.one_way_rx_since_feedback = 0;
     }
 
     /// Publish one long RX grant. `records` is split into 64-byte cells;

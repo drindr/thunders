@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-//! nRF52840 MPSL long-window receiver for `OneWayState<6, 32>`.
+//! nRF52840 MPSL long-window receiver for a compile-time `OneWayState` batch.
 
 use defmt::info;
 use embassy_executor::Spawner;
@@ -25,10 +25,10 @@ bind_interrupts!(struct Irqs {
 });
 
 const PAYLOAD: usize = 6;
-const BATCH: usize = 32;
-type Mode = OneWayState<PAYLOAD, 32>;
+type Mode = OneWayState<PAYLOAD, 128>;
 const PLAN: OneWayMpslPlan =
     one_way_mpsl_plan::<Mode>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
+const BATCH: usize = PLAN.batch as usize;
 const DATA_SLOT_US: u16 = PLAN.data_slot_us;
 const FEEDBACK_SLOT_US: u16 = PLAN.feedback_slot_us;
 const RX_WINDOW_US: u16 = PLAN.receiver_window_us;
@@ -70,7 +70,7 @@ async fn main(spawner: Spawner) {
     phy.set_channel(0).await;
 
     let apply = phy.slot_count().wrapping_add(6);
-    phy.set_one_way_data_slot_us(DATA_SLOT_US);
+    phy.configure_one_way(DATA_SLOT_US, PLAN.batch);
     assert!(phy.schedule_slot_profile(RX_WINDOW_US, RX_WINDOW_US, 1, 1, 0, apply,));
 
     static RECORDS0: StaticCell<[u8; BATCH * 64]> = StaticCell::new();

@@ -69,6 +69,7 @@ pub struct MpslState {
     pub(crate) slot_len: u32,
     pub(crate) rx_poll: u32,
     pub(crate) one_way_data_slot_us: u32,
+    pub(crate) one_way_feedback_every: u32,
     pub(crate) one_way_rx_since_feedback: u32,
 
     pub(crate) active_profile_short_us: u32,
@@ -125,6 +126,7 @@ impl MpslState {
             slot_len: 0,
             rx_poll: 0,
             one_way_data_slot_us: 0,
+            one_way_feedback_every: 1,
             one_way_rx_since_feedback: 0,
             active_profile_short_us: 0,
             active_profile_long_us: 0,
