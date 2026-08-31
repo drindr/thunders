@@ -149,9 +149,10 @@ not part of the schedule:
 2M six-byte state airtime: 64us
 setup/ramp + tail + margin + MPSL gap: 265us
 mathematical Data period: 329us
-25us scheduling quantization: 350us
-feedback period: 350us
-cycle: 128 × 350us + 350us = 45150us
+steady-state guard: 10us
+10us scheduling quantization: 340us
+feedback period: 340us
+cycle: 128 × 340us + 340us = 43860us
 ```
 
 The LM20 transmitter uses 128 Data events plus one feedback RX event. The 52840
@@ -163,13 +164,17 @@ acquisition substantially more phase coverage.
 LM20→52840 validation after acquisition measured:
 
 ```text
-receiver long slots: 22/s
-hardware transmitter packets: 2834–2835/s
-receiver delivered packets: 2816–2818/s
-receiver CRC-valid packets: 2816–2818/s
+receiver long slots: 22–23/s
+hardware transmitter packets: 2917–2918/s
+receiver delivered packets: 2897–2898/s
+receiver CRC-valid packets: 2897–2898/s
 invalid frames: 0
-steady receive ratio: about 99.4%
+steady receive ratio: about 99.3%
 ```
+
+A 330us zero-guard trial reached 3006 TX packets/s but only 1477–1504 RX
+packets/s and lost TimeDiff feedback. It is therefore rejected; 340us is the
+current shortest validated period.
 
 All durations and packet-relative reply offsets come from
 `one_way_mpsl_plan::<Mode>()` and compile-time PHY timing constants. The old

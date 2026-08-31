@@ -21,7 +21,9 @@ use thunders::phy::Phy;
 use crate::radio_phy::RadioMode;
 
 /// Scheduling granularity applied to mathematically derived slot durations.
-pub const MPSL_SLOT_QUANTUM_US: u16 = 25;
+pub const MPSL_SLOT_QUANTUM_US: u16 = 10;
+/// Extra steady-state callback/radio guard beyond the algebraic fit.
+pub const MPSL_STEADY_GUARD_US: u16 = 10;
 /// One-shot first callback grant. Session/radio initialization performs more
 /// register work than steady-state events; subsequent grants use the mode plan.
 pub const MPSL_FIRST_CALLBACK_GRANT_US: u32 = 450;
@@ -45,8 +47,14 @@ pub const fn one_way_mpsl_plan<M: LinkMode>(
     overhead: SlotOverhead,
 ) -> OneWayMpslPlan {
     let fixed = fixed_slot_plan::<M>(air, overhead);
-    let data = round_up_us(fixed.data_slot_us, MPSL_SLOT_QUANTUM_US);
-    let feedback_raw = round_up_us(fixed.feedback_slot_us, MPSL_SLOT_QUANTUM_US);
+    let data = round_up_us(
+        fixed.data_slot_us.saturating_add(MPSL_STEADY_GUARD_US),
+        MPSL_SLOT_QUANTUM_US,
+    );
+    let feedback_raw = round_up_us(
+        fixed.feedback_slot_us.saturating_add(MPSL_STEADY_GUARD_US),
+        MPSL_SLOT_QUANTUM_US,
+    );
     // The callback's two-duration profile requires short <= long. Keeping the
     // feedback event at least as long as Data also leaves room for RX ramp.
     let feedback = if feedback_raw < data {
