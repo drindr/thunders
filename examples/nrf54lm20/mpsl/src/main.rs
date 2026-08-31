@@ -28,6 +28,7 @@ const PAYLOAD: usize = 6;
 const PHASE_ALIGN: bool = cfg!(feature = "phase-align");
 const HOPPING: bool = cfg!(feature = "hopping");
 const SENDER_1: bool = cfg!(feature = "sender-1");
+const MULTI_SENDER_BENCH: bool = cfg!(feature = "multi-sender-bench");
 const FEEDBACK_EVERY: u16 = if HOPPING { 120 } else { 128 };
 type Mode = OneWayState<PAYLOAD, FEEDBACK_EVERY>;
 const PLAN: OneWayMpslPlan =
@@ -85,6 +86,10 @@ async fn main(spawner: Spawner) {
     let mut phy = MpslRadioPhy::<{ DATA_SLOT_US as u32 }, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
+    assert!(
+        !MULTI_SENDER_BENCH || (!PHASE_ALIGN && !HOPPING && !SENDER_1),
+        "multi-sender-bench uses sender 0 without feedback/hopping"
+    );
     let address = if SENDER_1 {
         Address([0xC3, 0xE7, 0xE7, 0xE7, 0xE7])
     } else {
@@ -125,7 +130,9 @@ async fn main(spawner: Spawner) {
         let target = hw.wrapping_add(2);
         if (target.wrapping_sub(apply) as i32) >= 0 {
             let phase = target.wrapping_sub(apply) % PERIOD_SLOTS as u32;
-            if phase < PLAN.batch as u32 {
+            let sender_slot = target.wrapping_sub(apply);
+            let transmit_this_slot = !MULTI_SENDER_BENCH || sender_slot % 2 == 0;
+            if phase < PLAN.batch as u32 && transmit_this_slot {
                 let payload = [
                     b'S',
                     b'T',
@@ -137,7 +144,7 @@ async fn main(spawner: Spawner) {
                 phy.op_publish_tx(&payload, target, 0).await.unwrap();
                 state_counter = state_counter.wrapping_add(1);
                 sent = sent.wrapping_add(1);
-            } else {
+            } else if phase >= PLAN.batch as u32 {
                 feedback.fill(0);
                 phy.op_publish_rx(&mut feedback, target).await;
             }

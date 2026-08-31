@@ -394,25 +394,44 @@ cd examples/nrf52840/mpsl
 cargo build --release --no-default-features --features multi-sender
 ```
 
-The alternate-prefix sender example is built with:
+The simultaneous benchmark senders are built with:
 
 ```bash
+# sender 0: nRF54LM20, prefix E7, one transmission per two local slots
 cd examples/nrf54lm20/mpsl
-cargo build --release --no-default-features --features sender-1
+cargo build --release --no-default-features --features multi-sender-bench
+
+# sender 1: nRF5340 network core, prefix C3, one transmission per three local slots
+cd examples/nrf5340/mpsl
+cargo build --release --no-default-features
 ```
 
-A sender-1 hardware smoke test measured:
+The 2-TX/1-RX hardware setup is:
 
 ```text
-sender 0 rate: 0/s
-sender 1 rate: 3333/s
-sender 1 state updated correctly
+sender 0: nRF54LM20 -> 1666 packets/s hardware TX
+sender 1: nRF5340 net core -> 1111 packets/s hardware TX
+receiver: nRF52840 multi-sender long RX
+channel: 0
 ```
 
-This validates address demultiplexing but is not a simultaneous two-radio
-throughput test. Multiple active senders on the same channel must use a shared
-compile-time TDMA allocation or another collision-free schedule; unique RADIO
-addresses identify packets but do not prevent overlapping transmissions.
+Measured steady receiver rates:
+
+```text
+sender 0: 1637-1672 packets/s
+sender 1:  853-869 packets/s
+aggregate: 2506-2532 packets/s
+aggregate offered rate: 2777 packets/s
+aggregate delivery: about 90.7%
+```
+
+Both latest states and counters advanced independently with the correct
+`RXMATCH` sender index. The two senders currently use free-running local slot
+grids with divisors two and three, so overlapping transmissions are expected;
+the lower sender-1 delivery rate is collision loss, not address-demultiplexing
+failure. Unique RADIO addresses identify packets but do not prevent overlap.
+A future shared-epoch TDMA allocator can remove those collisions.
+
 Current multi-sender RX uses one fixed channel and rejects combination with the
 hopping receiver example.
 

@@ -25,6 +25,7 @@ default = []
 phase-align = []
 hopping = ["phase-align"]
 sender-1 = []
+multi-sender-bench = []
 
 [[bin]]
 name = "thunders-mpsl"
