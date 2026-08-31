@@ -27,7 +27,8 @@ bind_interrupts!(struct Irqs {
 const PAYLOAD: usize = 6;
 const PHASE_ALIGN: bool = cfg!(feature = "phase-align");
 const HOPPING: bool = cfg!(feature = "hopping");
-type Mode = OneWayState<PAYLOAD, 128>;
+const FEEDBACK_EVERY: u16 = if HOPPING { 120 } else { 128 };
+type Mode = OneWayState<PAYLOAD, FEEDBACK_EVERY>;
 const PLAN: OneWayMpslPlan =
     one_way_mpsl_plan::<Mode, PHASE_ALIGN>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
 const DATA_SLOT_US: u16 = PLAN.data_slot_us;

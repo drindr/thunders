@@ -33,14 +33,16 @@ Both MPSL examples currently instantiate:
 
 ```rust
 const PAYLOAD: usize = 6;
-type Mode = OneWayState<PAYLOAD, 128>;
+const HOPPING: bool = cfg!(feature = "hopping");
+const FEEDBACK_EVERY: u16 = if HOPPING { 120 } else { 128 };
+type Mode = OneWayState<PAYLOAD, FEEDBACK_EVERY>;
 ```
 
 Meaning:
 
 ```text
 application state bytes: 6
-Data events per batch: 128
+Data events per batch: 128 normally, 120 with hopping
 radio mode: Nordic proprietary 2 Mbit
 address: E7:E7:E7:E7:E7
 CRC: CRC16-CCITT, polynomial 0x11021, init 0xFFFF
@@ -247,8 +249,8 @@ Startup and hop procedure:
 
 ```text
 1. Both peers start on channel 0.
-2. Receiver detects the feedback gap and learns Data phase 0..127.
-3. Receiver sends TimeDiff after phase 127.
+2. Receiver detects the feedback gap and learns Data phase 0..119.
+3. Receiver sends TimeDiff after phase 119.
 4. Transmitter receives TimeDiff in its feedback event.
 5. Both peers switch channel at that batch boundary.
 6. hop_index advances modulo eight.
@@ -264,19 +266,34 @@ if a hopped receiver window contains zero valid packets:
     reacquire through the TimeDiff handshake
 ```
 
-Measured hopping results after lock:
+Hopping uses 120 Data packets per batch:
 
 ```text
-TX: 3305-3306 packets/s
-RX: 3280-3295 packets/s (30-second validation; average about 3286/s)
-steady receive ratio: about 99.3-99.5%
-invalid: normally 0
+hop cycle: 120 × 300us + 310us = 36310us
+hop frequency: about 27.5 hops/s
+previous 128-packet frequency: about 25.8 hops/s
+increase: about 6.7%
 ```
 
-A transmitter restart was tested while the receiver was locked. The receiver
-returned to channel 0, reacquired the restarted transmitter, re-established the
-hop epoch, and resumed approximately 3290 packets/s without resetting the
-receiver.
+Measured 120-packet hopping results after lock:
+
+```text
+TX: 3304-3305 packets/s
+RX: 3229-3268 packets/s (average about 3251/s)
+steady receive ratio: about 98.4%
+invalid: 0 in most windows
+```
+
+A 112-packet trial occasionally lost hop lock. A 124-packet trial acquired only
+the first hop and then stopped receiving feedback. A 96-packet trial remained
+locked but had a larger steady receive-rate penalty. The 120-packet setting is
+therefore retained as the moderate frequency increase.
+
+A transmitter restart recovery test was performed with the original 128-packet
+setting. The receiver returned to channel 0, reacquired the restarted
+transmitter, re-established the hop epoch, and resumed approximately 3290
+packets/s without resetting the receiver. The same channel-zero recovery state
+machine is used by the 120-packet setting.
 
 Hopping adds no slot beyond the existing phase-align feedback event.
 
