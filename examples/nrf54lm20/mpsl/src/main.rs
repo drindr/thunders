@@ -126,9 +126,12 @@ async fn main(spawner: Spawner) {
             let diff = (feedback_len > 0 && feedback_len < feedback.len())
                 .then(|| FixedOneWayFrame::decode::<PAYLOAD>(&feedback[1..1 + feedback_len]).ok())
                 .flatten();
+            let elapsed_us = report_at.elapsed().as_micros().max(1);
+            let tx_slot_rate = sent as u64 * 1_000_000 / elapsed_us;
             info!(
-                "MPSL ONEWAY TX frames={} seq={} feedback={}",
+                "MPSL ONEWAY TX slots={} slot_rate={}/s seq={} feedback={}",
                 sent,
+                tx_slot_rate,
                 seq,
                 diff.is_some()
             );

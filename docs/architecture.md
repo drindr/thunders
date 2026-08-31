@@ -150,9 +150,19 @@ relative TimeDiff reply at the following 500us sender event boundary. This ties
 feedback to the captured packet rather than to an independently phased receiver
 slot counter.
 
-LM20→52840 hardware validation at 2 Mbit produced approximately 8.3–9.1k valid
-six-byte state packets per five-second window with `invalid=0`; LM20 reported
-`feedback=true` in every five-second window. The current TimeDiff value is zero
+LM20→52840 hardware validation at 2 Mbit measured:
+
+```text
+receiver long-RX slots: 59/s
+transmitter Data slots: 1903–1905/s
+received Data frames: 1427–1669/s after acquisition
+invalid frames: 0
+TimeDiff feedback: true
+```
+
+The 59/s receiver rate is expected from one 16.3ms RX event plus one 500us
+feedback event per 16.8ms cycle. One receiver slot collects many transmitter
+slots; receiver slot rate and packet rate are intentionally different. The current TimeDiff value is zero
 (the capture/PLL correction policy is the next refinement), but the periodic
 reverse path and its packet-relative placement are operational.
 

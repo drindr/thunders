@@ -78,6 +78,7 @@ async fn main(spawner: Spawner) {
     let mut feedback_wire = [0u8; 64];
     let mut last_seq = 0u16;
     let mut received = 0u32;
+    let mut rx_slots = 0u32;
     let mut invalid = 0u32;
     let mut report_at = Instant::now();
 
@@ -113,6 +114,7 @@ async fn main(spawner: Spawner) {
         let collected = hw.wrapping_add(1);
         if (collected.wrapping_sub(apply) as i32) >= 0 && collected.wrapping_sub(apply) % 2 == 0 {
             let count = phy.collect_rx_batch(collected).await;
+            rx_slots = rx_slots.wrapping_add(1);
             let records: &[u8] = if collected & 1 == 0 {
                 &records0[..]
             } else {
@@ -134,11 +136,15 @@ async fn main(spawner: Spawner) {
         }
 
         if report_at.elapsed() >= Duration::from_secs(5) {
+            let elapsed_us = report_at.elapsed().as_micros().max(1);
+            let rx_slot_rate = rx_slots as u64 * 1_000_000 / elapsed_us;
+            let frame_rate = received as u64 * 1_000_000 / elapsed_us;
             info!(
-                "MPSL ONEWAY RX frames={} invalid={} last={}",
-                received, invalid, last_seq
+                "MPSL ONEWAY RX slots={} slot_rate={}/s frames={} frame_rate={}/s invalid={} last={}",
+                rx_slots, rx_slot_rate, received, frame_rate, invalid, last_seq
             );
             received = 0;
+            rx_slots = 0;
             invalid = 0;
             report_at = Instant::now();
         }
