@@ -15,21 +15,54 @@ pub use state::{MpslState, Pkt};
 use embassy_time::Duration;
 use thunders::config::Address;
 use thunders::error::Error;
+use thunders::mode::{AirTiming, LinkMode, SlotOverhead, fixed_slot_plan, round_up_us};
 use thunders::phy::{Phy, SlotProbeStats};
 
 use crate::radio_phy::RadioMode;
 
-/// The MPSL slot cadence floor.
-///
-/// The physical board minimum is 500 us, but at that cadence the 350 us MPSL
-/// grant leaves only ~129 us of legal delay for a 19-byte Data echo after TX
-/// setup/ramp/airtime/tail.  Acquisition can measure a peer window that needs
-/// 150-180 us of follower delay, so the short SlotRequest still fits while the
-/// longer echo is physically impossible to place; the pair then remains in a
-/// run-level acquisition dead state.  A 600 us cadence gives a 450 us grant
-/// and ~229 us of legal delay, covering the complete 0-210 us acquisition
-/// sweep at a 17% cadence cost.
-pub const MPSL_FALLBACK_SLOT_US: u32 = 600;
+/// Scheduling granularity applied to mathematically derived slot durations.
+pub const MPSL_SLOT_QUANTUM_US: u16 = 25;
+
+/// Compile-time MPSL schedule for a fixed one-way mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OneWayMpslPlan {
+    /// Nominal forward Data event duration.
+    pub data_slot_us: u16,
+    /// Reverse feedback event duration.
+    pub feedback_slot_us: u16,
+    /// One long receiver event covering Data and immediate feedback.
+    pub receiver_window_us: u16,
+    /// Forward Data events per receiver event.
+    pub batch: u16,
+}
+
+/// Derive the complete MPSL schedule from mode and radio timing constants.
+pub const fn one_way_mpsl_plan<M: LinkMode>(
+    air: AirTiming,
+    overhead: SlotOverhead,
+) -> OneWayMpslPlan {
+    let fixed = fixed_slot_plan::<M>(air, overhead);
+    let data = round_up_us(fixed.data_slot_us, MPSL_SLOT_QUANTUM_US);
+    let feedback_raw = round_up_us(fixed.feedback_slot_us, MPSL_SLOT_QUANTUM_US);
+    // The callback's two-duration profile requires short <= long. Keeping the
+    // feedback event at least as long as Data also leaves room for RX ramp.
+    let feedback = if feedback_raw < data {
+        data
+    } else {
+        feedback_raw
+    };
+    let cycle = data as u32 * M::FEEDBACK_EVERY as u32 + feedback as u32;
+    OneWayMpslPlan {
+        data_slot_us: data,
+        feedback_slot_us: feedback,
+        receiver_window_us: if cycle > u16::MAX as u32 {
+            u16::MAX
+        } else {
+            cycle as u16
+        },
+        batch: M::FEEDBACK_EVERY,
+    }
+}
 
 // The phase-lock (the proportional controller on the peripheral).
 pub(crate) const PLL_SWEEP_US: u32 = 2;
@@ -231,13 +264,11 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
             let dwt_ctrl = 0xE000_1000 as *mut u32;
             dwt_ctrl.write_volatile(dwt_ctrl.read_volatile() | 1); // CYCCNTENA
         }
-        // Start at the fallback cadence every board can sustain. The
-        // const generics still describe this board's physical minimum
-        // (SLOT_US) and its RX poll iteration cap (RX_POLL).
-        state.slot_nominal = MPSL_FALLBACK_SLOT_US;
-        state.slot_len = MPSL_FALLBACK_SLOT_US.saturating_sub(150);
+        // The compile-time mode plan is authoritative from the first request.
+        state.slot_nominal = SLOT_US;
+        state.slot_len = SLOT_US.saturating_sub(150);
         state.rx_poll = RX_POLL;
-        state.slot_distance = MPSL_FALLBACK_SLOT_US;
+        state.slot_distance = SLOT_US;
         state.radio_mode = _radio_mode;
         let (air_prefix_us, air_byte_us) = _radio_mode.air_timing();
         state.air_prefix_us = air_prefix_us;
@@ -342,6 +373,12 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
         // half-written op.
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         e.seq = e.seq.wrapping_add(1);
+    }
+
+    /// Configure the sender Data event duration used by packet-relative
+    /// TimeDiff replies in long RX grants.
+    pub fn set_one_way_data_slot_us(&mut self, us: u16) {
+        self.state.one_way_data_slot_us = us as u32;
     }
 
     /// Publish one long RX grant. `records` is split into 64-byte cells;
@@ -599,17 +636,11 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
     }
 
     fn min_short_slot_period_us(&self) -> u16 {
-        // Capability, not a theoretical airtime bound. A 450-us experiment
-        // left enough nominal RX budget but the 5340 follower's MPSL chain
-        // could sustain only 1820-1925 slots/s (central stayed at 2082/s),
-        // producing 2/8 deterministic desync failures. Current 2M boards
-        // therefore advertise their verified 500-us floor; a future backend
-        // may lower its const generic after hardware validation.
         SLOT_US as u16
     }
 
     fn min_long_slot_period_us(&self) -> u16 {
-        (SLOT_US as u16).max(MPSL_FALLBACK_SLOT_US as u16)
+        SLOT_US as u16
     }
 
     fn min_probe_short_slot_period_us(&self) -> u16 {
@@ -632,10 +663,8 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         let rx_grant = rx_ramp
             .saturating_add(air)
             .saturating_add(MPSL_TX_TAIL_US as u32);
-        // Hardware measurements need ~25us beyond the algebraic fit for MPSL
-        // publication and phase jitter. At 2M this is 265 + airtime, making
-        // 1/4/8/16-byte contracts meaningfully probeable below 500us while a
-        // 32-byte contract remains conservatively near the known-safe anchor.
+        // Hardware measurements require 25us beyond the algebraic fit for
+        // publication and callback jitter.
         let empirical_margin = air.saturating_add(265);
         tx_grant
             .max(rx_grant)
@@ -707,8 +736,8 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.state.profile_central_apply_slot = central_apply_slot;
         self.state.profile_apply_slot = local_apply_slot;
         // Same-core app -> MPSL IRQ publication: armed is written last. If
-        // the IRQ preempts any earlier write it still sees false and uses the
-        // uniform fallback; after true, the compiler fence guarantees the
+        // the IRQ preempts any earlier write it still sees the compile-time
+        // initial period; after true, the compiler fence guarantees the
         // complete immutable profile is visible.
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         self.state
@@ -785,16 +814,12 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
             .load(core::sync::atomic::Ordering::Acquire)
     }
 
-    fn fallback_slot_period_us(&self) -> u16 {
-        MPSL_FALLBACK_SLOT_US as u16
+    fn initial_slot_period_us(&self) -> u16 {
+        SLOT_US as u16
     }
 
     fn align_slot_period(&mut self, us: u16) {
-        // Never adopt a cadence faster than this board's physical minimum or
-        // the MPSL echo-placement floor.  Negotiation used to shrink the
-        // 600-us acquisition cadence back to the boards' 500-us physical
-        // minimum, recreating the too-short 350-us grant.
-        let us = us.max(SLOT_US as u16).max(MPSL_FALLBACK_SLOT_US as u16) as u32;
+        let us = us.max(SLOT_US as u16) as u32;
         // Disarm first: an IRQ that preempts the uniform-field writes below
         // must keep using the old complete profile rather than a mixed state.
         self.state

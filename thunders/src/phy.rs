@@ -219,8 +219,7 @@ pub trait Phy {
     /// follower's delayed Data echo and must include its complete placement
     /// range.
     fn min_long_slot_period_us(&self) -> u16 {
-        self.fallback_slot_period_us()
-            .max(self.min_slot_period_us())
+        self.initial_slot_period_us().max(self.min_slot_period_us())
     }
 
     /// Arm a phase-indexed short/long slot profile at `local_apply_slot`.
@@ -300,11 +299,8 @@ pub trait Phy {
         0
     }
 
-    /// The fallback slot period used before cadence negotiation completes.
-    /// This must be a period every board in the network can sustain; both
-    /// sides start here, exchange [`Packet::SlotRequest`], and then switch
-    /// to `max(central_min, peripheral_min)`.
-    fn fallback_slot_period_us(&self) -> u16 {
+    /// Compile-time initial slot period selected by the active mode adapter.
+    fn initial_slot_period_us(&self) -> u16 {
         0
     }
 

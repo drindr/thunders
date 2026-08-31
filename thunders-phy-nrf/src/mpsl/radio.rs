@@ -251,11 +251,16 @@ unsafe fn receive_batch(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
                 // No-ACK alignment feedback is tied to the packet itself,
                 // not to an independently phased receiver slot chain. After
                 // every 32nd fixed Data frame, transmit TimeDiff at the next
-                // 500us sender event boundary while still inside this grant.
-                if len >= 3 && *cell.add(1) == 0xF0 && address_cyc != 0 {
+                // configured sender event boundary while still in this grant.
+                if len >= 3
+                    && *cell.add(1) == 0xF0
+                    && address_cyc != 0
+                    && state.one_way_data_slot_us > 28
+                {
                     let seq = u16::from_le_bytes([*cell.add(2), *cell.add(3)]);
                     if seq & 31 == 31 {
-                        let tx_at = address_cyc.wrapping_add(472 * CPU_MHZ);
+                        let tx_at =
+                            address_cyc.wrapping_add((state.one_way_data_slot_us - 28) * CPU_MHZ);
                         let wait_cyc = tx_at.wrapping_sub(cyc());
                         if (wait_cyc as i32) > 0
                             && cyc().wrapping_sub(slot_start_cyc).wrapping_add(wait_cyc)

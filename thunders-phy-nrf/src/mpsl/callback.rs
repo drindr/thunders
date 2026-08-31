@@ -42,9 +42,8 @@ fn slot_before(slot: u32, end: u32) -> bool {
     (slot.wrapping_sub(end) as i32) < 0
 }
 
-/// Negotiated period for hardware slot `slot`: bounded probe overlay,
-/// pending commit after its apply epoch, current active profile, then the
-/// uniform acquisition fallback.
+/// Compile-time nominal period with an optional mode profile applied at an
+/// exact hardware slot.
 #[inline(always)]
 fn nominal_for_slot(state: &MpslState, slot: u32) -> u32 {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);

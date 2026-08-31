@@ -145,6 +145,8 @@ pub struct MpslState {
     pub(crate) slot_nominal: u32,
     pub(crate) slot_len: u32,
     pub(crate) rx_poll: u32,
+    /// Sender Data event duration used for packet-relative TimeDiff replies.
+    pub(crate) one_way_data_slot_us: u32,
     /// Currently active negotiated phase profile. Before the first commit,
     /// `active_profile_armed` is false and the uniform `slot_nominal` applies.
     pub(crate) active_profile_short_us: u32,
@@ -275,8 +277,7 @@ pub struct MpslState {
     /// ADDRESS events seen in RX polls: a packet with our address arrived
     /// (regardless of CRC). Diagnostic for deaf-RX questions.
     pub addr_events: u32,
-    /// Learned follower PLL address target (us from RXEN). Starts at the
-    /// legacy default and is calibrated from the first locked catches.
+    /// Learned follower PLL address target in microseconds from RXEN.
     pub addr_target_us: u32,
     /// RXEN offset from slot START, measured on the last RX op (us).
     pub(crate) rx_en_offset_us: u32,
@@ -353,6 +354,7 @@ impl MpslState {
             slot_nominal: 0,
             slot_len: 0,
             rx_poll: 0,
+            one_way_data_slot_us: 0,
             active_profile_short_us: 0,
             active_profile_long_us: 0,
             active_profile_period: 0,

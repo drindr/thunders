@@ -176,6 +176,20 @@ pub const ONE_WAY_DATA_OVERHEAD: usize = 3;
 /// Fixed ACK/TimeDiff marker + sequence + signed diff overhead.
 pub const ONE_WAY_FEEDBACK_LEN: usize = 5;
 
+/// Round a compile-time duration upward to a hardware scheduling quantum.
+pub const fn round_up_us(value: u16, quantum: u16) -> u16 {
+    if quantum == 0 {
+        value
+    } else {
+        let rem = value % quantum;
+        if rem == 0 {
+            value
+        } else {
+            value.saturating_add(quantum - rem)
+        }
+    }
+}
+
 /// Build a const timing plan from a mode's associated constants.
 pub const fn fixed_slot_plan<M: LinkMode>(air: AirTiming, overhead: SlotOverhead) -> FixedSlotPlan {
     let data_wire = M::PAYLOAD_LEN.saturating_add(ONE_WAY_DATA_OVERHEAD);

@@ -137,34 +137,37 @@ produce a nine-byte wire frame.
 
 ### MPSL implementation
 
-The MPSL adapter uses asymmetric schedules with the same 16.8ms cycle:
+The MPSL adapter derives its schedule entirely at compile time:
 
-- LM20 transmitter: 32 × 500us Data events plus one 800us feedback RX event;
-- 52840 receiver: one 16.3ms nominal long event (16.15ms grant after MPSL's
-  150us margin) plus one 500us feedback event.
+```text
+mathematical Data floor: 341us
+25us scheduling quantization: 350us
+feedback floor: 325us, raised to the 350us profile minimum
+cycle: 32 × 350us + 350us = 11550us
+```
+
+The LM20 transmitter uses 32 short Data events plus one feedback RX event. The
+52840 receiver uses one 11550us nominal long event; TimeDiff is transmitted
+inside that same grant, so there is no separately phased receiver feedback slot.
 
 `RxBatch` keeps RADIO inside one MPSL grant and stores up to 32
 `[len | payload]` cells without returning to the executor between packets.
 For no-ACK mode, every sequence where `seq % 32 == 31` triggers a hardware-
-relative TimeDiff reply at the following 500us sender event boundary. This ties
-feedback to the captured packet rather than to an independently phased receiver
-slot counter.
+relative TimeDiff reply at the following compile-time Data event boundary.
 
 LM20→52840 hardware validation at 2 Mbit measured:
 
 ```text
-receiver long-RX slots: 59/s
-transmitter Data slots: 1903–1905/s
-received Data frames: 1427–1669/s after acquisition
+receiver collected long-RX slots: 65–66/s
+transmitter Data slots: 2710–2711/s
+received Data frames: 1273–1400/s after acquisition
 invalid frames: 0
 TimeDiff feedback: true
 ```
 
-The 59/s receiver rate is expected from one 16.3ms RX event plus one 500us
-feedback event per 16.8ms cycle. One receiver slot collects many transmitter
-slots; receiver slot rate and packet rate are intentionally different. The current TimeDiff value is zero
-(the capture/PLL correction policy is the next refinement), but the periodic
-reverse path and its packet-relative placement are operational.
+The sender event, feedback event, receiver window, and packet-relative reply
+offset all come from `one_way_mpsl_plan::<Mode>()`; no 500us compatibility or
+fallback constant remains.
 
 ## Migration status
 

@@ -1480,7 +1480,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         }
     }
 
-    fn fallback_slot_period_us(&self) -> u16 {
+    fn initial_slot_period_us(&self) -> u16 {
         if self.paced {
             self.min_period_us.min(u16::MAX as u32) as u16
         } else {

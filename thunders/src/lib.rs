@@ -19,7 +19,7 @@ pub use config::{Address, DeviceId, MAX_PAYLOAD};
 pub use error::Error;
 pub use mode::{
     AirTiming, FixedSlotPlan, LinkMode, LinkModeKind, OneWay, OneWayAck, OneWayChanges,
-    OneWayNoAck, OneWayState, SlotOverhead, fixed_slot_plan,
+    OneWayNoAck, OneWayState, SlotOverhead, fixed_slot_plan, round_up_us,
 };
 pub use one_way::{
     FeedbackUpdate, OneWayReceive, OneWayReceiver, OneWaySendError, OneWaySender, TimeDiffAligner,

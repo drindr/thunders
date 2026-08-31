@@ -9,10 +9,12 @@ use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, raw};
 use static_cell::StaticCell;
-use thunders::{Address, FixedOneWayFrame, OneWayReceiver, OneWayState, phy::Phy};
+use thunders::{
+    Address, AirTiming, FixedOneWayFrame, OneWayReceiver, OneWayState, SlotOverhead, phy::Phy,
+};
 use thunders_phy_nrf::{
     RadioMode,
-    mpsl::{MpslRadioPhy, MpslState},
+    mpsl::{MpslRadioPhy, MpslState, OneWayMpslPlan, one_way_mpsl_plan},
 };
 use {defmt_rtt as _, panic_probe as _};
 
@@ -26,10 +28,12 @@ bind_interrupts!(struct Irqs {
 
 const PAYLOAD: usize = 6;
 const BATCH: usize = 32;
-const DATA_SLOT_US: u16 = 500;
-const FEEDBACK_SLOT_US: u16 = 500;
-const RX_WINDOW_US: u16 = 16_300;
 type Mode = OneWayState<PAYLOAD, 32>;
+const PLAN: OneWayMpslPlan =
+    one_way_mpsl_plan::<Mode>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
+const DATA_SLOT_US: u16 = PLAN.data_slot_us;
+const FEEDBACK_SLOT_US: u16 = PLAN.feedback_slot_us;
+const RX_WINDOW_US: u16 = PLAN.receiver_window_us;
 
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
@@ -61,21 +65,21 @@ async fn main(spawner: Spawner) {
         MPSL.init(MultiprotocolServiceLayer::with_timeslots(mpsl_p, Irqs, lfclk_cfg, mem).unwrap());
     static STATE: StaticCell<MpslState> = StaticCell::new();
     let state = STATE.init(MpslState::new(embassy_nrf::pac::RADIO, false));
-    let mut phy = MpslRadioPhy::<500, 1400>::new(RadioMode::Nrf2Mbit, state);
+    let mut phy = MpslRadioPhy::<{ DATA_SLOT_US as u32 }, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
     phy.set_address(&Address([0xE7; 5])).await;
     phy.set_channel(0).await;
 
     let apply = phy.slot_count().wrapping_add(6);
-    assert!(phy.schedule_slot_profile(FEEDBACK_SLOT_US, RX_WINDOW_US, 2, 1, 1, apply,));
+    phy.set_one_way_data_slot_us(DATA_SLOT_US);
+    assert!(phy.schedule_slot_profile(RX_WINDOW_US, RX_WINDOW_US, 1, 1, 0, apply,));
 
     static RECORDS0: StaticCell<[u8; BATCH * 64]> = StaticCell::new();
     static RECORDS1: StaticCell<[u8; BATCH * 64]> = StaticCell::new();
     let records0 = RECORDS0.init([0; BATCH * 64]);
     let records1 = RECORDS1.init([0; BATCH * 64]);
     let mut receiver = OneWayReceiver::<PAYLOAD, Mode>::new();
-    let mut feedback_wire = [0u8; 64];
     let mut last_seq = 0u16;
     let mut received = 0u32;
     let mut rx_slots = 0u32;
@@ -91,28 +95,16 @@ async fn main(spawner: Spawner) {
         let hw = phy.slot_count();
         let target = hw.wrapping_add(2);
         if (target.wrapping_sub(apply) as i32) >= 0 {
-            let phase = target.wrapping_sub(apply) % 2;
-            if phase == 0 {
-                let records: &mut [u8] = if target & 1 == 0 {
-                    &mut records0[..]
-                } else {
-                    &mut records1[..]
-                };
-                assert!(phy.publish_rx_batch(records, target));
+            let records: &mut [u8] = if target & 1 == 0 {
+                &mut records0[..]
             } else {
-                let feedback = FixedOneWayFrame::TimeDiff {
-                    seq: last_seq,
-                    diff_us: 0,
-                };
-                let n = feedback.encode::<PAYLOAD>(&mut feedback_wire).unwrap();
-                phy.op_publish_tx(&feedback_wire[..n], target, 0)
-                    .await
-                    .unwrap();
-            }
+                &mut records1[..]
+            };
+            assert!(phy.publish_rx_batch(records, target));
         }
 
         let collected = hw.wrapping_add(1);
-        if (collected.wrapping_sub(apply) as i32) >= 0 && collected.wrapping_sub(apply) % 2 == 0 {
+        if (collected.wrapping_sub(apply) as i32) >= 0 {
             let count = phy.collect_rx_batch(collected).await;
             rx_slots = rx_slots.wrapping_add(1);
             let records: &[u8] = if collected & 1 == 0 {

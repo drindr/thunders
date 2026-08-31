@@ -9,10 +9,12 @@ use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, raw};
 use static_cell::StaticCell;
-use thunders::{Address, FixedOneWayFrame, OneWaySender, OneWayState, phy::Phy};
+use thunders::{
+    Address, AirTiming, FixedOneWayFrame, OneWaySender, OneWayState, SlotOverhead, phy::Phy,
+};
 use thunders_phy_nrf::{
     RadioMode,
-    mpsl::{MpslRadioPhy, MpslState},
+    mpsl::{MpslRadioPhy, MpslState, OneWayMpslPlan, one_way_mpsl_plan},
 };
 use {defmt_rtt as _, panic_probe as _};
 
@@ -25,9 +27,11 @@ bind_interrupts!(struct Irqs {
 });
 
 const PAYLOAD: usize = 6;
-const DATA_SLOT_US: u16 = 500;
-const FEEDBACK_SLOT_US: u16 = 800;
 type Mode = OneWayState<PAYLOAD, 32>;
+const PLAN: OneWayMpslPlan =
+    one_way_mpsl_plan::<Mode>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
+const DATA_SLOT_US: u16 = PLAN.data_slot_us;
+const FEEDBACK_SLOT_US: u16 = PLAN.feedback_slot_us;
 
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
@@ -75,7 +79,7 @@ async fn main(spawner: Spawner) {
         MPSL.init(MultiprotocolServiceLayer::with_timeslots(mpsl_p, Irqs, lfclk_cfg, mem).unwrap());
     static STATE: StaticCell<MpslState> = StaticCell::new();
     let state = STATE.init(MpslState::new(embassy_nrf::pac::RADIO_S, false));
-    let mut phy = MpslRadioPhy::<500, 1400>::new(RadioMode::Nrf2Mbit, state);
+    let mut phy = MpslRadioPhy::<{ DATA_SLOT_US as u32 }, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
     phy.set_address(&Address([0xE7; 5])).await;
@@ -89,6 +93,7 @@ async fn main(spawner: Spawner) {
     let mut feedback = [0u8; 64];
     let mut seq = 0u32;
     let mut sent = 0u32;
+    let mut feedback_seen = false;
     let mut report_at = Instant::now();
     info!(
         "MPSL ONEWAY TX READY payload=6 data={} feedback={} apply={}",
@@ -120,22 +125,19 @@ async fn main(spawner: Spawner) {
             }
         }
         let collected = hw.wrapping_add(1);
-        let _ = phy.op_collect(collected).await;
+        if let Some(feedback_len) = phy.op_collect(collected).await {
+            feedback_seen |= feedback_len < feedback.len()
+                && FixedOneWayFrame::decode::<PAYLOAD>(&feedback[1..1 + feedback_len]).is_ok();
+        }
         if report_at.elapsed() >= Duration::from_secs(5) {
-            let feedback_len = feedback[0] as usize;
-            let diff = (feedback_len > 0 && feedback_len < feedback.len())
-                .then(|| FixedOneWayFrame::decode::<PAYLOAD>(&feedback[1..1 + feedback_len]).ok())
-                .flatten();
             let elapsed_us = report_at.elapsed().as_micros().max(1);
             let tx_slot_rate = sent as u64 * 1_000_000 / elapsed_us;
             info!(
                 "MPSL ONEWAY TX slots={} slot_rate={}/s seq={} feedback={}",
-                sent,
-                tx_slot_rate,
-                seq,
-                diff.is_some()
+                sent, tx_slot_rate, seq, feedback_seen
             );
             sent = 0;
+            feedback_seen = false;
             report_at = Instant::now();
         }
     }
