@@ -104,6 +104,8 @@ pub struct OpEntry {
     pub(crate) tx_buf: [u8; 64],
     /// The last seq the callback consumed (executed or skipped).
     pub(crate) done_seq: u32,
+    /// The last completed seq returned to application context.
+    pub(crate) collected_seq: u32,
     /// The consumption was a skip (late), not an execution.
     pub(crate) skipped: bool,
     /// RX result (valid once done_seq covers seq).
@@ -122,6 +124,7 @@ impl OpEntry {
             rx_cap: 0,
             tx_buf: [0u8; 64],
             done_seq: 0,
+            collected_seq: 0,
             skipped: false,
             rx_ok: false,
             rx_result: 0,

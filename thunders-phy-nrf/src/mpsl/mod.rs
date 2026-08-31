@@ -440,10 +440,10 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
         let seq = self.state.ops[i].seq;
         if self.state.ops[i].target != slot {
             self.state.coll_noop = self.state.coll_noop.wrapping_add(1);
-        } else if self.state.ops[i].done_seq == seq {
+        } else if self.state.ops[i].collected_seq == seq {
             self.state.coll_late = self.state.coll_late.wrapping_add(1);
         }
-        if self.state.ops[i].target != slot || self.state.ops[i].done_seq == seq {
+        if self.state.ops[i].target != slot || self.state.ops[i].collected_seq == seq {
             // No op was ever published for this slot (an idle slot, or the
             // app stalled and skipped one). Still pace across one START
             // unless the slot has already passed: without this the frame
@@ -466,16 +466,23 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
             }
             self.state.done_signal.wait().await;
         }
-        let e = &self.state.ops[i];
-        if e.skipped
-            || !e.rx_ok
-            || (e.kind != state::OpKind::Rx as u8 && e.kind != state::OpKind::RxBatch as u8)
+        if self.state.ops[i].done_seq != seq {
+            return None;
+        }
+        let skipped = self.state.ops[i].skipped;
+        let rx_ok = self.state.ops[i].rx_ok;
+        let kind = self.state.ops[i].kind;
+        let result = self.state.ops[i].rx_result;
+        self.state.ops[i].collected_seq = seq;
+        if skipped
+            || !rx_ok
+            || (kind != state::OpKind::Rx as u8 && kind != state::OpKind::RxBatch as u8)
         {
             self.state.coll_empty = self.state.coll_empty.wrapping_add(1);
             return None;
         }
         self.state.coll_catch = self.state.coll_catch.wrapping_add(1);
-        Some(e.rx_result)
+        Some(result)
     }
 }
 
