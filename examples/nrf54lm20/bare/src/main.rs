@@ -6,6 +6,7 @@
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
+use embassy_time::{Duration, Instant};
 
 use thunders::{Address, AirTiming, OneWayState, SlotOverhead, fixed_slot_plan, phy::Phy};
 use thunders_phy_nrf::{NrfRadioPhy, RadioIrqHandler, RadioMode};
@@ -34,8 +35,11 @@ async fn main(_spawner: Spawner) {
     phy.set_address(&Address([0xE7; 5])).await;
     phy.set_channel(0).await;
 
-    let mut seq = 0u32;
-    let mut report_frames = 0u32;
+    let first = [b'S', b'T', 0, 0, 0, 0];
+    phy.state_tx_begin(&first);
+    let mut seq = 1u32;
+    let mut report_frames = 1u32;
+    let mut report_at = Instant::now();
 
     info!(
         "ONEWAY TX READY payload={} wire={} slot={} rx_window={} cycle={}",
@@ -55,13 +59,19 @@ async fn main(_spawner: Spawner) {
             (seq >> 16) as u8,
             (seq >> 24) as u8,
         ];
-        phy.transmit(&payload).await.unwrap();
+        phy.state_tx_send(&payload);
         seq = seq.wrapping_add(1);
         report_frames = report_frames.wrapping_add(1);
 
-        if report_frames >= 5_000 {
-            info!("ONEWAY TX frames={} seq={}", report_frames, seq);
+        if report_at.elapsed() >= Duration::from_secs(5) {
+            let elapsed_us = report_at.elapsed().as_micros().max(1);
+            let rate = report_frames as u64 * 1_000_000 / elapsed_us;
+            info!(
+                "ONEWAY TX frames={} rate={}/s seq={}",
+                report_frames, rate, seq
+            );
             report_frames = 0;
+            report_at = Instant::now();
         }
     }
 }

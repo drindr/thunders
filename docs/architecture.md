@@ -184,19 +184,27 @@ All durations and packet-relative reply offsets come from
 symmetric link, cadence probes, PLL servo, runtime alignment, and their debug
 state have been removed.
 
-### Exclusive bare-PHY baseline
+### Exclusive bare PHY
 
-With LM20 transmitting as fast as the current per-packet TXEN/disable path and
-52840 restarting RX for every packet, hardware measured approximately:
+The original generic per-packet TXEN/RXEN path measured 8812 TX packets/s and
+4406 RX packets/s. The dedicated exclusive path now uses:
 
 ```text
-transmitter: 8812 packets/s (113.5us per packet)
-receiver: 4406 packets/s
+LFLEN=0, STATLEN=6
+8-bit preamble
+one initial TXEN/RXEN
+TXIDLE/RXIDLE + TASKS_START between packets
+```
+
+LM20→52840 hardware measured:
+
+```text
+transmitter: 16177–16178 packets/s
+receiver: 16180–16181 packets/s (independent timer measurement)
+steady loss: approximately 0%
 invalid: 0
 ```
 
-The exact current bare frame occupies 64us on air, so keeping RADIO in TXIDLE
-would have a 15625 packets/s airtime ceiling. Removing the length field with
-fixed STATLEN reduces it to 60us, or 16667 packets/s. The present 50% receiver
-ratio is the deterministic per-packet RX disable/ramp blind interval, not RF
-corruption.
+With the retained five-byte address, six-byte payload and CRC16, airtime is
+about 56us and the theoretical ceiling is roughly 17857 packets/s. The measured
+61.8us period includes state-buffer copy, event handling and TASKS_START.

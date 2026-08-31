@@ -31,14 +31,14 @@ async fn main(_spawner: Spawner) {
     phy.set_address(&Address([0xE7; 5])).await;
     phy.set_channel(0).await;
 
-    let mut wire = [0u8; 64];
+    let mut wire = [0u8; PAYLOAD];
+    phy.state_rx_begin();
     let mut report_at = Instant::now();
     let mut received = 0u32;
     let mut lost = 0u32;
     let mut invalid = 0u32;
     let mut have_state = false;
     let mut last_state = 0u32;
-    let window = Duration::from_micros(PLAN.receiver_window_us as u64);
 
     info!(
         "ONEWAY RX READY payload={} wire={} slot={} long_window={} cycle={}",
@@ -50,19 +50,21 @@ async fn main(_spawner: Spawner) {
     );
 
     loop {
-        match phy.receive(&mut wire, window).await {
-            Ok(Some(len)) if len == PAYLOAD && wire[0] == b'S' && wire[1] == b'T' => {
+        if phy.state_rx_next(&mut wire) {
+            if wire[0] == b'S' && wire[1] == b'T' {
                 let state = u32::from_le_bytes([wire[2], wire[3], wire[4], wire[5]]);
                 if have_state {
-                    lost = lost.wrapping_add(state.wrapping_sub(last_state).wrapping_sub(1));
+                    let delta = state.wrapping_sub(last_state);
+                    if delta < 0x8000_0000 {
+                        lost = lost.wrapping_add(delta.saturating_sub(1));
+                    }
                 }
                 last_state = state;
                 have_state = true;
                 received = received.wrapping_add(1);
+            } else {
+                invalid = invalid.wrapping_add(1);
             }
-            Ok(Some(_)) => invalid = invalid.wrapping_add(1),
-            Ok(None) => {}
-            Err(_) => invalid = invalid.wrapping_add(1),
         }
 
         if report_at.elapsed() >= Duration::from_secs(5) {
@@ -72,9 +74,11 @@ async fn main(_spawner: Spawner) {
             } else {
                 lost.saturating_mul(100) / total
             };
+            let elapsed_us = report_at.elapsed().as_micros().max(1);
+            let rate = received as u64 * 1_000_000 / elapsed_us;
             info!(
-                "ONEWAY RX frames={} lost={} loss={}% invalid={} last={}",
-                received, lost, loss_pct, invalid, last_state
+                "ONEWAY RX frames={} rate={}/s lost={} loss={}% invalid={} last={}",
+                received, rate, lost, loss_pct, invalid, last_state
             );
             received = 0;
             lost = 0;

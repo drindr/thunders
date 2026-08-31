@@ -985,6 +985,89 @@ impl<'d> NrfRadioPhy<'d> {
         );
         Ok(())
     }
+
+    fn configure_fixed_state(&mut self) {
+        self.r.pcnf0().modify(|w| {
+            w.set_lflen(0);
+            w.set_s0len(false);
+            w.set_s1len(0);
+            w.set_plen(Plen::_8bit);
+        });
+        self.r.pcnf1().modify(|w| {
+            w.set_maxlen(6);
+            w.set_statlen(6);
+        });
+    }
+
+    /// Start exclusive fixed-state TX and leave RADIO in TXIDLE.
+    pub fn state_tx_begin(&mut self, state: &[u8; 6]) {
+        self.disable();
+        #[cfg(feature = "_nrf54")]
+        self.pll_enable();
+        self.configure_fixed_state();
+        let tx_buf = unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) };
+        tx_buf[..6].copy_from_slice(state);
+        self.set_packet_ptr(tx_buf.as_ptr());
+        self.r.shorts().write(|w| {
+            #[cfg(not(feature = "_nrf54"))]
+            w.set_txready_start(true);
+            #[cfg(feature = "_nrf54")]
+            w.set_ready_start(true);
+        });
+        self.r.events_ready().write_value(0);
+        self.rx_end_clear();
+        self.r.tasks_txen().write_value(1);
+        while !self.rx_end_set() {}
+        self.rx_end_clear();
+    }
+
+    /// Transmit the next state without DISABLE, PLL or TXEN ramp.
+    pub fn state_tx_send(&mut self, state: &[u8; 6]) {
+        let tx_buf = unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) };
+        tx_buf[..6].copy_from_slice(state);
+        compiler_fence(Ordering::Release);
+        self.set_packet_ptr(tx_buf.as_ptr());
+        self.rx_end_clear();
+        self.r.tasks_start().write_value(1);
+        while !self.rx_end_set() {}
+        self.rx_end_clear();
+    }
+
+    /// Start exclusive fixed-state RX and leave RADIO listening.
+    pub fn state_rx_begin(&mut self) {
+        self.disable();
+        #[cfg(feature = "_nrf54")]
+        self.pll_enable();
+        self.configure_fixed_state();
+        let rx_ptr = core::ptr::addr_of_mut!(RX_BUF) as *mut u8;
+        self.set_packet_ptr(rx_ptr);
+        self.r.shorts().write(|w| {
+            #[cfg(not(feature = "_nrf54"))]
+            w.set_rxready_start(true);
+            #[cfg(feature = "_nrf54")]
+            w.set_ready_start(true);
+        });
+        self.r.events_ready().write_value(0);
+        self.r.events_address().write_value(0);
+        self.rx_end_clear();
+        self.r.tasks_rxen().write_value(1);
+        while self.r.events_ready().read() == 0 {}
+    }
+
+    /// Receive the next state and immediately re-arm from RXIDLE.
+    pub fn state_rx_next(&mut self, state: &mut [u8; 6]) -> bool {
+        while !self.rx_end_set() {}
+        compiler_fence(Ordering::Acquire);
+        let crc_ok = self.r.crcstatus().read().0 & 1 == 1;
+        if crc_ok {
+            let rx_ptr = core::ptr::addr_of!(RX_BUF) as *const u8;
+            unsafe { core::ptr::copy_nonoverlapping(rx_ptr, state.as_mut_ptr(), 6) };
+        }
+        self.rx_end_clear();
+        self.r.events_address().write_value(0);
+        self.r.tasks_start().write_value(1);
+        crc_ok
+    }
 }
 
 impl<'d> Phy for NrfRadioPhy<'d> {
