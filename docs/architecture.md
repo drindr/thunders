@@ -142,41 +142,33 @@ or protocol sequence, so six application bytes produce a six-byte wire frame.
 ### MPSL implementation
 
 The MPSL adapter derives its schedule entirely at compile time. State packets
-contain only the six payload bytes. The timing model includes the measured
-per-packet receiver DISABLE/PLL/RXEN turnaround:
+contain only the six payload bytes. Runtime cadence fallback and probe logic are
+not part of the schedule:
 
 ```text
 2M six-byte state airtime: 64us
-RX restart allowance: 150us
-mathematical Data period: 479us
-25us scheduling quantization: 500us
-feedback period: 500us
-cycle: 32 × 500us + 500us = 16500us
+setup/ramp + tail + margin + MPSL gap: 265us
+mathematical Data period: 329us
+25us scheduling quantization: 350us
+feedback period: 350us
+cycle: 32 × 350us + 350us = 11550us
 ```
 
 The LM20 transmitter uses 32 Data events plus one feedback RX event. The 52840
 receiver uses one long event and returns a two-byte signed `diff_us`; state mode
 uses neither marker nor protocol sequence.
 
-The receiver collects a completed batch before republishing the same parity
-buffer, preventing callback results from being overwritten by a future op.
-LM20→52840 validation measured:
+Completed callback results remain available until application context marks the
+exact publication sequence collected. LM20→52840 validation measured:
 
 ```text
-hardware transmitter slots: 1938–1939/s
-receiver delivered frames: 1193–1269/s
-receiver CRC-valid catches: 1680–1830/s
+hardware transmitter slots: 2769–2770/s
+receiver delivered frames: 1299–1308/s
+receiver CRC-valid catches: 1300–1308/s
 invalid frames: 0
-TimeDiff feedback observed: true
 ```
 
 All durations and packet-relative reply offsets come from
-`one_way_mpsl_plan::<Mode>()` and compile-time PHY timing constants.
-
-## Migration status
-
-The compile-time mode specification, fixed timing planner, exact codecs,
-one-way sender/receiver engines, connection-event wire format, and RX timing
-metadata are implemented. Hardware scheduling adapters for long receiver
-windows and first-event timing are the next layer; old symmetric examples and
-bench tooling were intentionally deleted rather than kept as a second protocol.
+`one_way_mpsl_plan::<Mode>()` and compile-time PHY timing constants. The old
+symmetric link, cadence probes, PLL servo, runtime alignment, and their debug
+state have been removed.

@@ -6,7 +6,6 @@ description = "thunders link over MPSL timeslots (nRF52840) - role-agnostic (cen
 publish = false
 
 [dependencies]
-heapless = "0.9.3"
 thunders = { path = "../../../thunders", features = ["defmt"] }
 thunders-phy-nrf = { path = "../../../thunders-phy-nrf", features = ["nrf52840", "mpsl", "defmt"] }
 nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "f54b6389ffa2750d4d3a4f5435660cb66b47e51a", features = ["nrf52840", "critical-section-impl"] }

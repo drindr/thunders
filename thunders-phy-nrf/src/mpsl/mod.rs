@@ -16,7 +16,7 @@ use embassy_time::Duration;
 use thunders::config::Address;
 use thunders::error::Error;
 use thunders::mode::{AirTiming, LinkMode, SlotOverhead, fixed_slot_plan, round_up_us};
-use thunders::phy::{Phy, SlotProbeStats};
+use thunders::phy::Phy;
 
 use crate::radio_phy::RadioMode;
 
@@ -67,177 +67,29 @@ pub const fn one_way_mpsl_plan<M: LinkMode>(
     }
 }
 
-// The phase-lock (the proportional controller on the peripheral).
-pub(crate) const PLL_SWEEP_US: u32 = 2;
-pub(crate) const PLL_SWEEP_MISSES: u32 = 8;
-/// TX tail margin after the on-air frame (END -> DISABLE hand-back).
-pub(crate) const MPSL_TX_TAIL_US: i32 = 40;
-// The phase error is in exact us (DWT); gain 1/4 converges in a few catches.
-pub(crate) const PLL_GAIN_NUM: i32 = 1;
-pub(crate) const PLL_GAIN_DEN: i32 = 4;
-
-/// The current MPSL slot count (0 before the first timeslot START).
-/// The examples use this to decide TX/RX slots in step with the actual
-/// timeslot cadence instead of their own loop counter.
-pub fn mpsl_slot_count() -> u32 {
-    unsafe {
-        let s = &*(STATE as *const MpslState);
-        s.slot_count
-    }
-}
-
-/// Snapshot the last RSSI sample (the RADIO RSSISAMPLE register).
-pub fn mpsl_rssi() -> u32 {
-    unsafe {
-        let s = &*(STATE as *const MpslState);
-        s.rssi_last
-    }
-}
-
-/// A named, ergonomic snapshot of the MPSL phase-lock state.
-#[derive(Clone, Copy, Debug)]
+/// Minimal cumulative MPSL counters used by smoke tests.
+#[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct MpslPllSnapshot {
-    /// Last chained timeslot distance (us).
-    pub distance_us: u32,
-    /// END-event stamp of the last catch (us from poll start).
-    pub catch_poll_us: u32,
-    /// Our measured RX listen window (us).
-    pub rx_window_us: u32,
-    /// The peer's advertised RX listen window (us).
-    pub peer_rx_window_us: u32,
-    /// Address events seen in RX polls.
+pub struct MpslStats {
+    /// Address matches observed by ordinary RX ops.
     pub addr_events: u32,
-    /// First bytes of the last address-matched packet.
-    pub last_rx_hdr: [u8; 14],
-    /// Address-event stamp of the last catch (us from poll start).
-    pub addr_poll_us: u32,
-    /// Completed TX ops.
+    /// Completed hardware transmissions.
     pub tx_count: u32,
-    /// Echo TX delay from slot start (us).
-    pub tx_delay_us: u32,
-    /// Consecutive RX misses.
-    pub rx_misses: u32,
-    /// RX polls that ended with CRC ok.
+    /// CRC-valid received packets.
     pub crc_ok: u32,
-    /// RX polls that ended without CRC ok.
+    /// CRC failures.
     pub crc_bad: u32,
-    /// RX polls with an address match, a length byte >= 10, and a bad CRC.
-    pub crc_bad_long: u32,
-    /// TX length histogram: short (<10) and long (>=10) on-air packets.
-    pub tx_short: u32,
-    pub tx_long: u32,
-    /// Long-packet TX count by slot phase (slot_count % 10).
-    pub tx_long_phase: [u32; 10],
-    /// All TX ops by raw slot phase.
-    pub tx_phase_all: [u32; 10],
-    /// All RX ops by raw slot phase.
-    pub rx_phase_all: [u32; 10],
-    /// Learned follower PLL address target (us from RXEN).
-    pub addr_target_us: u32,
-    /// Locked catches used for the target calibration.
-    pub calib_count: u32,
-    /// Our measured RXEN offset from slot START (us).
-    pub rx_en_offset_us: u32,
-    /// Our measured RXEN -> READY ramp (us).
-    pub rx_ramp_us: u32,
-    /// Our measured TXEN offset from slot START (us).
-    pub tx_en_offset_us: u32,
-    /// Our measured TXEN -> READY ramp (us).
-    pub tx_ramp_us: u32,
-    /// The peer's advertised RXEN offset from its slot START (us).
-    pub peer_rx_en_offset_us: u32,
-    /// The peer's advertised RXEN -> READY ramp (us).
-    pub peer_rx_ramp_us: u32,
-    /// The peer's advertised TXEN offset from its slot START (us).
-    pub peer_tx_en_offset_us: u32,
-    /// The peer's advertised TXEN -> READY ramp (us).
-    pub peer_tx_ramp_us: u32,
-    /// Last address-matched RX poll that failed CRC (diagnostics).
-    pub last_rx_got_end: bool,
-    pub last_rx_addr_us: u32,
-    pub last_rx_end_us: u32,
-    pub last_rx_slot_len: u32,
-    pub last_rx_crc: u32,
-    pub last_rx_in_flight: bool,
-    pub last_rx_len: u32,
-    /// Cumulative RSSI sum/count over CRC-ok catches (diff for a
-    /// per-window average; dBm = -value).
-    pub rssi_catch_sum: u32,
-    pub rssi_catch_cnt: u32,
-    /// Weakest catch since the previous snapshot (dBm = -value); the
-    /// snapshot read resets it.
-    pub rssi_catch_max: u32,
-    /// Ops skipped because their target slot had already passed (app-loop
-    /// lateness counter; cumulative).
-    pub op_late: u32,
-    /// collect() return-path counters (cumulative): no-op-for-slot /
-    /// already-done / catch / empty-listen-or-skip.
-    pub coll_noop: u32,
-    pub coll_late: u32,
-    pub coll_catch: u32,
-    pub coll_empty: u32,
-    /// TX ops that executed inside their grace slot (cumulative).
-    pub op_grace_used: u32,
-    /// Max op-publish delay since the previous snapshot (us from slot
-    /// START); the snapshot read resets it.
-    pub op_publish_max_us: u32,
 }
 
-/// Snapshot the phase-lock state as a named struct.
-pub fn mpsl_pll_snapshot() -> MpslPllSnapshot {
+/// Read cumulative MPSL counters.
+pub fn mpsl_pll_snapshot() -> MpslStats {
     unsafe {
-        let s = &mut *(STATE as *mut MpslState);
-        let rssi_catch_max = s.rssi_catch_max;
-        s.rssi_catch_max = 0; // self-resetting "weakest since last read"
-        let op_publish_max_us = s.op_publish_max_us;
-        s.op_publish_max_us = 0; // self-resetting "tightest budget" probe
-        MpslPllSnapshot {
-            distance_us: s.slot_distance,
-            catch_poll_us: s.catch_poll_us,
-            rx_window_us: s.rx_window_us,
-            peer_rx_window_us: s.peer_rx_window_us,
-            addr_events: s.addr_events,
-            last_rx_hdr: s.last_rx_hdr,
-            addr_poll_us: s.addr_poll_us,
-            tx_count: s.tx_count,
-            tx_delay_us: s.tx_delay_us,
-            rx_misses: s.rx_misses,
-            crc_ok: s.crc_ok,
-            crc_bad: s.crc_bad,
-            crc_bad_long: s.crc_bad_long,
-            tx_short: s.tx_short,
-            tx_long: s.tx_long,
-            tx_long_phase: s.tx_long_phase,
-            tx_phase_all: s.tx_phase_all,
-            rx_phase_all: s.rx_phase_all,
-            addr_target_us: s.addr_target_us,
-            calib_count: s.calib_count,
-            rx_en_offset_us: s.rx_en_offset_us,
-            rx_ramp_us: s.rx_ramp_us,
-            tx_en_offset_us: s.tx_en_offset_us,
-            tx_ramp_us: s.tx_ramp_us,
-            peer_rx_en_offset_us: s.peer_rx_en_offset_us,
-            peer_rx_ramp_us: s.peer_rx_ramp_us,
-            peer_tx_en_offset_us: s.peer_tx_en_offset_us,
-            peer_tx_ramp_us: s.peer_tx_ramp_us,
-            last_rx_got_end: s.last_rx_got_end,
-            last_rx_addr_us: s.last_rx_addr_us,
-            last_rx_end_us: s.last_rx_end_us,
-            last_rx_slot_len: s.last_rx_slot_len,
-            last_rx_crc: s.last_rx_crc,
-            last_rx_in_flight: s.last_rx_in_flight,
-            last_rx_len: s.last_rx_len,
-            rssi_catch_sum: s.rssi_catch_sum,
-            rssi_catch_cnt: s.rssi_catch_cnt,
-            rssi_catch_max,
-            op_late: s.op_late,
-            coll_noop: s.coll_noop,
-            coll_late: s.coll_late,
-            coll_catch: s.coll_catch,
-            coll_empty: s.coll_empty,
-            op_grace_used: s.op_grace_used,
-            op_publish_max_us,
+        let state = &*(STATE as *const MpslState);
+        MpslStats {
+            addr_events: state.addr_events,
+            tx_count: state.tx_count,
+            crc_ok: state.crc_ok,
+            crc_bad: state.crc_bad,
         }
     }
 }
@@ -272,11 +124,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
         state.slot_nominal = SLOT_US;
         state.slot_len = MPSL_FIRST_CALLBACK_GRANT_US;
         state.rx_poll = RX_POLL;
-        state.slot_distance = SLOT_US;
         state.radio_mode = _radio_mode;
-        let (air_prefix_us, air_byte_us) = _radio_mode.air_timing();
-        state.air_prefix_us = air_prefix_us;
-        state.air_byte_us = air_byte_us;
 
         unsafe {
             STATE = state as *mut MpslState as *mut ();
@@ -299,9 +147,11 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
                 .radio
                 .modecnf0()
                 .modify(|w| w.set_ru(nrf_pac::radio::vals::Ru::Fast));
-            let ru = state.radio.modecnf0().read().ru().to_bits();
             #[cfg(feature = "defmt")]
-            defmt::info!("modecnf0 ru={} (1=Fast)", ru);
+            defmt::info!(
+                "modecnf0 ru={} (1=Fast)",
+                state.radio.modecnf0().read().ru().to_bits()
+            );
         }
 
         let mut session_id: u8 = 0;
@@ -314,9 +164,11 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
         } else {
             state.session_id = session_id;
             state.first_request = true;
-            let ret = callback::mpsl_request_timeslot(state);
+            let request_result = callback::mpsl_request_timeslot(state);
             #[cfg(feature = "defmt")]
-            defmt::info!("first request ret={}", ret);
+            defmt::info!("first request ret={}", request_result);
+            #[cfg(not(feature = "defmt"))]
+            let _ = request_result;
         }
 
         // The nRF54L needs its RADIO/TIMER NVIC lines + the RRAM out of
@@ -506,8 +358,6 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
     }
 
     async fn transmit(&mut self, pkt: &[u8]) -> Result<(), Error<Self::Error>> {
-        // Legacy one-slot-ahead synchronous path (composed from the ring
-        // primitives): publish for the next slot, wait its completion.
         let target = self.state.slot_count.wrapping_add(1);
         self.publish_tx(pkt, target, 0)?;
         self.collect(target).await;
@@ -535,41 +385,6 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
 
     async fn flush(&mut self) {}
 
-    async fn wait_slot(&mut self) {
-        // Pace the app loop across one full slot without a radio op.
-        let start_before = self.state.slot_count;
-        for _ in 0..10_000 {
-            if self.state.slot_count != start_before {
-                break;
-            }
-            self.state.start_signal.wait().await;
-        }
-        let start_done = self.state.slot_start_done;
-        for _ in 0..10_000 {
-            if self
-                .state
-                .done_count
-                .load(core::sync::atomic::Ordering::Acquire)
-                != start_done
-            {
-                break;
-            }
-            self.state.done_signal.wait().await;
-        }
-    }
-
-    fn rx_window_us(&self) -> u16 {
-        self.state.rx_window_us as u16
-    }
-
-    fn set_peer_rx_window(&mut self, us: u16) {
-        self.state.peer_rx_window_us = us as u32;
-    }
-
-    fn op_pipelined(&self) -> bool {
-        true
-    }
-
     async fn op_publish_rx(&mut self, buf: &mut [u8], target: u32) {
         self.publish_rx(buf, target);
     }
@@ -587,138 +402,8 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         self.collect(slot).await
     }
 
-    fn set_peer_rx_en_offset(&mut self, us: u8) {
-        if us > 0 {
-            self.state.peer_rx_en_offset_us = us as u32;
-        }
-    }
-
-    fn rx_en_offset_us(&self) -> u8 {
-        self.state.rx_en_offset_us as u8
-    }
-
-    fn tx_en_offset_us(&self) -> u8 {
-        self.state.tx_en_offset_us as u8
-    }
-
-    fn rx_ramp_us(&self) -> u8 {
-        self.state.rx_ramp_us as u8
-    }
-
-    fn tx_ramp_us(&self) -> u8 {
-        self.state.tx_ramp_us as u8
-    }
-
-    fn set_peer_tx_en_offset(&mut self, us: u8) {
-        if us > 0 {
-            self.state.peer_tx_en_offset_us = us as u32;
-        }
-    }
-
-    fn set_peer_rx_ramp(&mut self, us: u8) {
-        if us > 0 {
-            self.state.peer_rx_ramp_us = us as u32;
-        }
-    }
-
-    fn set_peer_tx_ramp(&mut self, us: u8) {
-        if us > 0 {
-            self.state.peer_tx_ramp_us = us as u32;
-        }
-    }
-
-    fn set_tx_delay_sweep(&mut self, sweep: bool) {
-        if sweep && !self.state.tx_delay_sweep {
-            self.state.tx_delay_sweep_step = 0;
-        }
-        self.state.tx_delay_sweep = sweep;
-    }
-
     fn slot_count(&self) -> u32 {
         self.state.slot_count
-    }
-
-    fn slot_period_us(&self) -> u16 {
-        self.state.slot_nominal as u16
-    }
-
-    fn min_slot_period_us(&self) -> u16 {
-        SLOT_US as u16
-    }
-
-    fn min_short_slot_period_us(&self) -> u16 {
-        SLOT_US as u16
-    }
-
-    fn min_long_slot_period_us(&self) -> u16 {
-        SLOT_US as u16
-    }
-
-    fn min_probe_short_slot_period_us(&self) -> u16 {
-        self.min_probe_slot_period_us(0)
-    }
-
-    fn min_probe_slot_period_us(&self, wire_len: u16) -> u16 {
-        // A NORMAL request grants `period - 150us`.  Bound the candidate by
-        // measured setup/ramp plus actual packet airtime and the 40us radio
-        // hand-back tail.  This is deliberately not a stability claim: the
-        // API negotiation still exercises the exact profile on both chips.
-        let air = self.state.airtime_us(wire_len as usize);
-        let setup = self.state.tx_pre_delay_us.max(8);
-        let tx_ramp = self.state.tx_ramp_us.max(40);
-        let rx_ramp = self.state.rx_ramp_us.max(40);
-        let tx_grant = setup
-            .saturating_add(tx_ramp)
-            .saturating_add(air)
-            .saturating_add(MPSL_TX_TAIL_US as u32);
-        let rx_grant = rx_ramp
-            .saturating_add(air)
-            .saturating_add(MPSL_TX_TAIL_US as u32);
-        // Hardware measurements require 25us beyond the algebraic fit for
-        // publication and callback jitter.
-        let empirical_margin = air.saturating_add(265);
-        tx_grant
-            .max(rx_grant)
-            .saturating_add(150)
-            .max(empirical_margin)
-            .min(u16::MAX as u32) as u16
-    }
-
-    fn schedule_probed_slot_profile(
-        &mut self,
-        short_us: u16,
-        long_us: u16,
-        period: u16,
-        short_phases: u16,
-        central_apply_slot: u32,
-        local_apply_slot: u32,
-    ) -> bool {
-        if short_us < self.min_probe_slot_period_us(0)
-            || long_us < self.min_probe_slot_period_us(0)
-            || short_us > long_us
-            || period == 0
-        {
-            return false;
-        }
-        if self
-            .state
-            .profile_armed
-            .load(core::sync::atomic::Ordering::Acquire)
-        {
-            return false;
-        }
-        let period = period as u32;
-        self.state.profile_short_us = short_us as u32;
-        self.state.profile_long_us = long_us as u32;
-        self.state.profile_period = period;
-        self.state.profile_short_phases = (short_phases as u32).min(period);
-        self.state.profile_central_apply_slot = central_apply_slot;
-        self.state.profile_apply_slot = local_apply_slot;
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        self.state
-            .profile_armed
-            .store(true, core::sync::atomic::Ordering::Release);
-        true
     }
 
     fn schedule_slot_profile(
@@ -737,8 +422,8 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
         {
             return false;
         }
-        let short = short_us.max(self.min_short_slot_period_us()) as u32;
-        let long = long_us.max(self.min_long_slot_period_us()) as u32;
+        let short = short_us.max(SLOT_US as u16) as u32;
+        let long = long_us.max(SLOT_US as u16) as u32;
         let period = period.max(1) as u32;
         self.state.profile_short_us = short.min(long);
         self.state.profile_long_us = long;
@@ -755,99 +440,5 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
             .profile_armed
             .store(true, core::sync::atomic::Ordering::Release);
         true
-    }
-
-    fn schedule_slot_probe(
-        &mut self,
-        short_us: u16,
-        long_us: u16,
-        period: u16,
-        short_phases: u16,
-        central_start_slot: u32,
-        start_slot: u32,
-        end_slot: u32,
-    ) -> bool {
-        if end_slot.wrapping_sub(start_slot) as i32 <= 0
-            || short_us < self.min_probe_slot_period_us(0)
-            || long_us < self.min_probe_slot_period_us(0)
-            || short_us > long_us
-        {
-            return false;
-        }
-        // Explicit publication transition: a changed future descriptor may
-        // replace an old armed one only after readers observe it disarmed.
-        self.state
-            .probe_armed
-            .swap(false, core::sync::atomic::Ordering::AcqRel);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        let period = period.max(1) as u32;
-        self.state.probe_short_us = short_us as u32;
-        self.state.probe_long_us = long_us as u32;
-        self.state.probe_period = period;
-        self.state.probe_short_phases = (short_phases as u32).min(period);
-        self.state.probe_central_start_slot = central_start_slot;
-        self.state.probe_start_slot = start_slot;
-        self.state.probe_end_slot = end_slot;
-        self.state.probe_started = false;
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        self.state
-            .probe_armed
-            .store(true, core::sync::atomic::Ordering::Release);
-        true
-    }
-
-    fn slot_probe_stats(&self) -> SlotProbeStats {
-        loop {
-            let before = self
-                .state
-                .probe_stats_seq
-                .load(core::sync::atomic::Ordering::Acquire);
-            if before & 1 != 0 {
-                core::hint::spin_loop();
-                continue;
-            }
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-            let stats = self.state.probe_stats_total.load();
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-            let after = self
-                .state
-                .probe_stats_seq
-                .load(core::sync::atomic::Ordering::Acquire);
-            if before == after {
-                return stats;
-            }
-        }
-    }
-
-    fn slot_profile_active(&self) -> bool {
-        self.state
-            .active_profile_armed
-            .load(core::sync::atomic::Ordering::Acquire)
-    }
-
-    fn initial_slot_period_us(&self) -> u16 {
-        SLOT_US as u16
-    }
-
-    fn align_slot_period(&mut self, us: u16) {
-        let us = us.max(SLOT_US as u16) as u32;
-        // Disarm first: an IRQ that preempts the uniform-field writes below
-        // must keep using the old complete profile rather than a mixed state.
-        self.state
-            .profile_armed
-            .store(false, core::sync::atomic::Ordering::Release);
-        self.state
-            .active_profile_armed
-            .store(false, core::sync::atomic::Ordering::Release);
-        self.state
-            .probe_armed
-            .store(false, core::sync::atomic::Ordering::Release);
-        self.state.probe_started = false;
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        self.state.slot_nominal = us;
-        self.state.slot_distance = us;
-        // Keep the MPSL inter-slot gap rule (>= 150 us) when the cadence
-        // changes at runtime, and give the RX poll a usable budget.
-        self.state.slot_len = us.saturating_sub(150);
     }
 }

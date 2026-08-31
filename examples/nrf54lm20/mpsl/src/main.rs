@@ -76,7 +76,7 @@ async fn main(spawner: Spawner) {
     let mpsl =
         MPSL.init(MultiprotocolServiceLayer::with_timeslots(mpsl_p, Irqs, lfclk_cfg, mem).unwrap());
     static STATE: StaticCell<MpslState> = StaticCell::new();
-    let state = STATE.init(MpslState::new(embassy_nrf::pac::RADIO_S, false));
+    let state = STATE.init(MpslState::new(embassy_nrf::pac::RADIO_S));
     let mut phy = MpslRadioPhy::<{ DATA_SLOT_US as u32 }, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;

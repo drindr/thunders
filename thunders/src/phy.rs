@@ -1,4 +1,4 @@
-//! PHY abstraction.
+//! Minimal asynchronous PHY abstraction.
 
 use embassy_time::Duration;
 
@@ -18,159 +18,28 @@ pub struct RxTiming {
     pub cycles_per_us: u32,
 }
 
-/// Cumulative counters sampled around a bounded cadence probe.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct SlotProbeStats {
-    /// Hardware timeslot START count.
-    pub slots: u32,
-    /// Monotonic PHY-local microsecond clock (wrapping).
-    pub clock_us: u32,
-    /// Completed radio operations.
-    pub completed: u32,
-    /// Published operations that missed their target START.
-    pub op_late: u32,
-    /// Address-matched RX catches.
-    pub address_events: u32,
-    /// Good CRC decodes.
-    pub crc_ok: u32,
-    /// Bad CRCs on long frames.
-    pub crc_bad_long: u32,
-    /// Completed TX operations.
-    pub tx_count: u32,
-    /// Probe windows whose exact callback START and END were both captured.
-    pub windows: u32,
-    /// Probe windows disarmed at END without an exact START capture.
-    pub aborted_windows: u32,
-}
-
-impl SlotProbeStats {
-    /// Wrapping counter delta from `start` to `self`.
-    pub fn wrapping_delta(self, start: Self) -> Self {
-        Self {
-            slots: self.slots.wrapping_sub(start.slots),
-            clock_us: self.clock_us.wrapping_sub(start.clock_us),
-            completed: self.completed.wrapping_sub(start.completed),
-            op_late: self.op_late.wrapping_sub(start.op_late),
-            address_events: self.address_events.wrapping_sub(start.address_events),
-            crc_ok: self.crc_ok.wrapping_sub(start.crc_ok),
-            crc_bad_long: self.crc_bad_long.wrapping_sub(start.crc_bad_long),
-            tx_count: self.tx_count.wrapping_sub(start.tx_count),
-            windows: self.windows.wrapping_sub(start.windows),
-            aborted_windows: self.aborted_windows.wrapping_sub(start.aborted_windows),
-        }
-    }
-
-    /// Wrapping component-wise accumulation.
-    pub fn wrapping_add(self, delta: Self) -> Self {
-        Self {
-            slots: self.slots.wrapping_add(delta.slots),
-            clock_us: self.clock_us.wrapping_add(delta.clock_us),
-            completed: self.completed.wrapping_add(delta.completed),
-            op_late: self.op_late.wrapping_add(delta.op_late),
-            address_events: self.address_events.wrapping_add(delta.address_events),
-            crc_ok: self.crc_ok.wrapping_add(delta.crc_ok),
-            crc_bad_long: self.crc_bad_long.wrapping_add(delta.crc_bad_long),
-            tx_count: self.tx_count.wrapping_add(delta.tx_count),
-            windows: self.windows.wrapping_add(delta.windows),
-            aborted_windows: self.aborted_windows.wrapping_add(delta.aborted_windows),
-        }
-    }
-}
-
-/// Async interface to a raw radio transceiver.
+/// Radio interface shared by the bare and MPSL adapters.
 #[allow(async_fn_in_trait)]
-///
-/// The link layer owns a type implementing `Phy`.  Implementations are
-/// responsible for channel setup, address filtering, CRC, and
-/// TX/RX turnaround.
 pub trait Phy {
     /// PHY-specific error type.
     type Error;
 
-    /// Set the radio channel.
-    ///
-    /// The meaning of `ch` is PHY-specific. For the Nordic RADIO backend it
-    /// is the 1 MHz offset from 2400 MHz; other implementations may map it
-    /// to a transceiver channel number.
+    /// Select the radio channel.
     async fn set_channel(&mut self, ch: u8);
-
-    /// Set the receive address.
+    /// Set the five-byte radio address.
     async fn set_address(&mut self, addr: &Address);
-
-    /// Transmit a raw packet.
+    /// Transmit one packet.
     async fn transmit(&mut self, pkt: &[u8]) -> Result<(), Error<Self::Error>>;
-
-    /// Wait for a raw packet up to `timeout`.
-    ///
-    /// Returns `Some(n)` when a packet of `n` bytes was written into
-    /// `buf`, or `None` when the timeout expired without a packet.
+    /// Receive one packet or return `None` on timeout.
     async fn receive(
         &mut self,
         buf: &mut [u8],
         timeout: Duration,
     ) -> Result<Option<usize>, Error<Self::Error>>;
 
-    /// The receiver's listen window inside a slot, in microseconds
-    /// (0 = unknown). Advertised in the beacon so the peer can align its
-    /// transmissions to this (possibly poorer) window.
-    fn rx_window_us(&self) -> u16 {
-        0
-    }
-
-    /// The peer's advertised RX window (see [`rx_window_us`](Self::rx_window_us)).
-    fn set_peer_rx_window(&mut self, _us: u16) {}
-
-    /// The peer's measured RXEN offset from slot START, in us (0 = unknown).
-    fn set_peer_rx_en_offset(&mut self, _us: u8) {}
-
-    /// This node's measured RXEN offset from slot START, in us.
-    fn rx_en_offset_us(&self) -> u8 {
-        0
-    }
-
-    /// This node's measured TXEN offset from slot START, in us.
-    fn tx_en_offset_us(&self) -> u8 {
-        0
-    }
-
-    /// This node's measured RXEN -> READY ramp, in us.
-    fn rx_ramp_us(&self) -> u8 {
-        0
-    }
-
-    /// This node's measured TXEN -> READY ramp, in us.
-    fn tx_ramp_us(&self) -> u8 {
-        0
-    }
-
-    /// The peer's measured TXEN offset from slot START, in us (0 = unknown).
-    fn set_peer_tx_en_offset(&mut self, _us: u8) {}
-
-    /// The peer's measured RX ramp, in us (0 = unknown).
-    fn set_peer_rx_ramp(&mut self, _us: u8) {}
-
-    /// The peer's measured TX ramp, in us (0 = unknown).
-    fn set_peer_tx_ramp(&mut self, _us: u8) {}
-
-    /// Pipelined-op API (backends with a hardware slot counter, i.e.
-    /// MPSL): the link publishes each slot's op ~2 slots ahead of its
-    /// target, so the publish deadline is the target slot's START (a
-    /// ~2.5-slot budget) instead of the previous op's completion (~200
-    /// us). `op_pipelined` selects the pipelined `frame` path; the
-    /// default `false` keeps the legacy synchronous transmit/receive
-    /// pacing (software-paced PHYs).
-    fn op_pipelined(&self) -> bool {
-        false
-    }
-
-    /// Publish an RX op for absolute slot `target`; returns immediately.
-    /// The radio DMAs `[len | payload]` into `buf` when the op executes.
+    /// Publish an RX op for an absolute hardware slot.
     async fn op_publish_rx(&mut self, _buf: &mut [u8], _target: u32) {}
-
-    /// Publish a TX op for absolute slot `target`. `grace` allows the
-    /// first TX op of a run to execute one slot late (it still faces a
-    /// listening peer); any other late op idles its slot.
+    /// Publish a TX op for an absolute hardware slot.
     async fn op_publish_tx(
         &mut self,
         _pkt: &[u8],
@@ -179,52 +48,11 @@ pub trait Phy {
     ) -> Result<(), Error<Self::Error>> {
         Ok(())
     }
-
-    /// Wait for the op published for absolute slot `slot` (if any) and
-    /// return its RX result: `Some(len)` on a catch, `None` for a TX op,
-    /// an idle slot, a skipped op, or an empty listen. This is also the
-    /// frame's slot pacing.
+    /// Collect a previously published slot operation.
     async fn op_collect(&mut self, _slot: u32) -> Option<usize> {
         None
     }
-
-    /// Enable/disable the acquisition TX-delay sweep. Used by the peripheral
-    /// while it is still sending SlotRequest and has not received Data yet.
-    fn set_tx_delay_sweep(&mut self, _sweep: bool) {}
-
-    /// Adjust the follower's early TX margin at runtime. The PHY reads this
-    /// on every paced TX, so it can be tuned while the link is running
-    /// (the central role ignores it).
-    fn set_tx_phase_margin_us(&mut self, _margin_us: i32) {}
-
-    /// The sender's slot cadence in us, advertised in the beacon
-    /// (0 = unknown).
-    fn slot_period_us(&self) -> u16 {
-        0
-    }
-
-    /// The minimum uniform slot period this PHY can physically sustain, in us.
-    fn min_slot_period_us(&self) -> u16 {
-        0
-    }
-
-    /// Minimum short-slot cadence supported by this PHY. A short slot carries
-    /// the central's fixed-position TX and the peripheral's locked RX; it does
-    /// not need the follower's long echo-placement delay.
-    fn min_short_slot_period_us(&self) -> u16 {
-        self.min_slot_period_us()
-    }
-
-    /// Minimum long-slot cadence supported by this PHY. Long slots carry the
-    /// follower's delayed Data echo and must include its complete placement
-    /// range.
-    fn min_long_slot_period_us(&self) -> u16 {
-        self.initial_slot_period_us().max(self.min_slot_period_us())
-    }
-
-    /// Arm a phase-indexed short/long slot profile at `local_apply_slot`.
-    /// `central_apply_slot` preserves the full cross-counter mapping across
-    /// independent u32 wraps. Backends without a hardware cadence ignore it.
+    /// Arm a two-duration compile-time profile at an exact slot.
     fn schedule_slot_profile(
         &mut self,
         _short_us: u16,
@@ -236,152 +64,10 @@ pub trait Phy {
     ) -> bool {
         false
     }
-
-    /// Lowest slot period that may be tested by a bounded probe. It may be
-    /// lower than the already verified production floor, but must still fit
-    /// the PHY mode's theoretical grant/airtime constraints.
-    fn min_probe_short_slot_period_us(&self) -> u16 {
-        self.min_short_slot_period_us()
-    }
-
-    /// Lowest theoretically schedulable probe period for a serialized packet
-    /// of `wire_len` bytes. Unlike the production cadence capability, this is
-    /// only a feasibility bound: stability is established by a bounded probe.
-    fn min_probe_slot_period_us(&self, _wire_len: u16) -> u16 {
-        self.min_probe_short_slot_period_us()
-    }
-
-    /// Commit a profile that both peers just measured successfully. Unlike
-    /// acquisition scheduling this must not silently clamp a value; return
-    /// false when the exact descriptor cannot be applied.
-    fn schedule_probed_slot_profile(
-        &mut self,
-        _short_us: u16,
-        _long_us: u16,
-        _period: u16,
-        _short_phases: u16,
-        _central_apply_slot: u32,
-        _local_apply_slot: u32,
-    ) -> bool {
-        false
-    }
-
-    /// Arm a bounded candidate profile. It automatically ceases at
-    /// `end_slot`, restoring the active stable profile without a control
-    /// packet, so a failed probe cannot strand the peers at different rates.
-    fn schedule_slot_probe(
-        &mut self,
-        _short_us: u16,
-        _long_us: u16,
-        _period: u16,
-        _short_phases: u16,
-        _central_start_slot: u32,
-        _start_slot: u32,
-        _end_slot: u32,
-    ) -> bool {
-        false
-    }
-
-    /// Cumulative counters for cadence-probe evaluation.
-    fn slot_probe_stats(&self) -> SlotProbeStats {
-        SlotProbeStats::default()
-    }
-
-    /// True once the initial or final mixed profile crossed its apply epoch.
-    fn slot_profile_active(&self) -> bool {
-        false
-    }
-
-    /// The hardware slot counter, when the PHY has its own slot cadence
-    /// (the MPSL timeslot chain). Returns 0 when the PHY is software-paced
-    /// (the bare radio), so the link layer falls back to its own slot_step.
+    /// Current hardware slot counter, or zero for unpaced PHYs.
     fn slot_count(&self) -> u32 {
         0
     }
-
-    /// Compile-time initial slot period selected by the active mode adapter.
-    fn initial_slot_period_us(&self) -> u16 {
-        0
-    }
-
-    /// Adopt the master's advertised cadence at runtime (the align
-    /// mechanism): no compile-time cadence matching needed.
-    fn align_slot_period(&mut self, _us: u16) {}
-
-    /// Flush any stale RX/TX state.
+    /// Flush stale radio state.
     async fn flush(&mut self);
-
-    /// Wait for the next software slot boundary without a radio op.
-    ///
-    /// Backends with their own slot cadence (the MPSL timeslot chain) do
-    /// nothing: the slot is already paced by hardware. The bare backend uses
-    /// this to keep its software slot grid aligned on empty slots (e.g. the
-    /// peripheral's TX slot when it has no payload queued), so the follower's
-    /// RX grid does not drift one slot earlier per ratio period.
-    async fn wait_slot(&mut self) {}
-
-    /// Begin a TX burst: ramp the radio once, so the following
-    /// [`transmit_burst_send`](Self::transmit_burst_send) packets skip the
-    /// per-packet ramp (the on-air time only - the one-way path).
-    /// Synchronous (no await hop): the burst is the hot loop. Backends
-    /// without the chained TX return [`Error::Unsupported`].
-    fn transmit_burst_begin(&mut self, _pkt: &[u8]) -> Result<(), Error<Self::Error>> {
-        Err(Error::Unsupported)
-    }
-
-    /// Send the next packet in a burst (the radio is already ramped - the
-    /// on-air only). Synchronous; see [`transmit_burst_begin`](Self::transmit_burst_begin).
-    fn transmit_burst_send(&mut self, _pkt: &[u8]) -> Result<(), Error<Self::Error>> {
-        Err(Error::Unsupported)
-    }
-
-    /// Encrypt/decrypt a payload with the hardware AES-CCM (the AEAD: the
-    /// counter-mode encryption + the CBC-MAC). `mic` is the 4-byte tag (the
-    /// output on encrypt, the expected on decrypt); the payload is the
-    /// in-place ciphertext/plaintext (the MIC is appended after it).
-    /// Synchronous. The default returns [`Error::Unsupported`]; the `secure`
-    /// feature's CCM mode uses it.
-    fn ccm_crypt(
-        &mut self,
-        _key: &[u8; 16],
-        _nonce: &[u8; 13],
-        _payload: &mut [u8],
-        _mic: &mut [u8; 4],
-        _encrypt: bool,
-    ) -> Result<(), Error<Self::Error>> {
-        Err(Error::Unsupported)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SlotProbeStats;
-
-    #[test]
-    fn probe_stats_delta_and_accumulation_wrap() {
-        let start = SlotProbeStats {
-            slots: u32::MAX - 1,
-            tx_count: u32::MAX,
-            windows: u32::MAX,
-            ..Default::default()
-        };
-        let end = SlotProbeStats {
-            slots: 1,
-            tx_count: 2,
-            windows: 1,
-            ..Default::default()
-        };
-        let delta = end.wrapping_delta(start);
-        assert_eq!(delta.slots, 3);
-        assert_eq!(delta.tx_count, 3);
-        assert_eq!(delta.windows, 2);
-
-        let total = SlotProbeStats {
-            slots: u32::MAX,
-            ..Default::default()
-        }
-        .wrapping_add(delta);
-        assert_eq!(total.slots, 2);
-        assert_eq!(total.tx_count, 3);
-    }
 }

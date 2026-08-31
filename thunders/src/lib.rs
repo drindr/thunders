@@ -13,9 +13,8 @@ pub mod mode;
 pub mod one_way;
 pub mod packet;
 pub mod phy;
-pub mod security;
 
-pub use config::{Address, DeviceId, MAX_PAYLOAD};
+pub use config::{Address, MAX_PAYLOAD};
 pub use error::Error;
 pub use mode::{
     AirTiming, FixedSlotPlan, LinkMode, LinkModeKind, OneWay, OneWayAck, OneWayChanges,
@@ -24,6 +23,5 @@ pub use mode::{
 pub use one_way::{
     FeedbackUpdate, OneWayReceive, OneWayReceiver, OneWaySendError, OneWaySender, TimeDiffAligner,
 };
-pub use packet::{FixedOneWayFrame, Packet};
+pub use packet::FixedOneWayFrame;
 pub use phy::{Phy, RxTiming};
-pub use security::{Security, make_nonce};

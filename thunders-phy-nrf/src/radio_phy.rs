@@ -4,7 +4,6 @@
 
 use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, compiler_fence};
-use core::task::Poll;
 
 use embassy_nrf::interrupt::typelevel::{self, Binding, Handler, Interrupt};
 use embassy_nrf::{Peri, peripherals};
@@ -31,7 +30,6 @@ pub fn hfxo_cap_trim() {
         (0x5012_071C as *mut u32).write_volatile(cap as u32); // OSCILLATORS.XO32M.CONFIG.INTCAP
     }
 }
-use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::Duration;
 #[cfg(not(any(feature = "nrf5340-net", feature = "_nrf54")))]
 use nrf_pac::RADIO as PAC_RADIO;
@@ -97,8 +95,6 @@ pub enum RadioError {
     CrcFailed,
 }
 
-static WAKER: AtomicWaker = AtomicWaker::new();
-
 /// CPU frequency per chip family (the DWT cycle counter ticks at this rate).
 #[cfg(feature = "nrf5340-net")]
 const CPU_MHZ: u32 = 64;
@@ -114,18 +110,18 @@ const CPU_MHZ: u32 = 64;
 /// the follower phase-locks to the central. It must be large enough for the
 /// slowest slot on the slowest chip (the RX poll + the setup/tail), with
 /// margin for crystal drift between catches.
-pub const BARE_SLOT_PERIOD_US: u32 = 400;
+const BARE_SLOT_PERIOD_US: u32 = 400;
 
 /// The follower's RX window starts this many us after the slot start. It
 /// must be after the follower's RXEN ramp so the radio is listening before
 /// the frame starts, and before the central's on-air start (setup + ramp).
-pub const BARE_RX_OFFSET_US: u32 = 30;
+const BARE_RX_OFFSET_US: u32 = 30;
 
 /// Where the follower expects the central's frame to be on air, relative to
 /// the follower's slot start. The address event is a fixed 28 us after the
 /// on-air start at 2 Mbps (16-bit preamble + 4-byte address), so the target
 /// address stamp is [`BARE_RX_ON_AIR_TARGET_US`] + 28.
-pub const BARE_RX_ON_AIR_TARGET_US: u32 = 50;
+const BARE_RX_ON_AIR_TARGET_US: u32 = 50;
 /// The corresponding address-event target (on-air + 28 us).
 // The address-event target is board-dependent in practice:
 // - nRF54L (LM20) peripheral: the original on-air+28 target (78 us) works
@@ -135,40 +131,40 @@ pub const BARE_RX_ON_AIR_TARGET_US: u32 = 50;
 //   natural phase and reduces catches. 156 us is the centre of the RX
 //   window's useful range.
 #[cfg(feature = "_nrf54")]
-pub const BARE_RX_ADDR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US + 28;
+const BARE_RX_ADDR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US + 28;
 #[cfg(not(feature = "_nrf54"))]
-pub const BARE_RX_ADDR_TARGET_US: u32 = 156;
+const BARE_RX_ADDR_TARGET_US: u32 = 156;
 
 /// Fixed early margin subtracted from the follower's computed on-air start.
 /// Keeps the address event inside the peer's RX window across the measured
 /// board-to-board slot-start offsets.
-pub const BARE_TX_PHASE_MARGIN_US: i32 = 10;
+const BARE_TX_PHASE_MARGIN_US: i32 = 10;
 
 /// The TX ramp after TXEN (the Fast ramp; MODECNF0.RU is set in `new`).
 /// Used by the follower's echo placement to convert the desired on-air time
 /// into the TXEN delay.
-pub const BARE_TX_RAMP_US: u32 = 40;
+const BARE_TX_RAMP_US: u32 = 40;
 
 /// The on-air start target for a paced TX slot, relative to the slot start.
 /// All central TX slots (burst-begin, burst-send, and the nRF54 plain-TX
 /// fallback) are aligned to this offset so the follower's PLL sees the same
 /// phase for every slot, not just the first slot of a burst.
-pub const BARE_TX_ON_AIR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US;
+const BARE_TX_ON_AIR_TARGET_US: u32 = BARE_RX_ON_AIR_TARGET_US;
 
 /// The follower's acquisition sweep walks the grid by +2 us per slot. The
 /// initial sweep starts immediately; after the first catch the follower
 /// re-enables it only after this many consecutive misses.
-pub const BARE_SLOT_RESWEEP_MISSES: u32 = 5_000;
+const BARE_SLOT_RESWEEP_MISSES: u32 = 5_000;
 /// The sweep offset added to the slot period while sweeping.
-pub const BARE_SLOT_SWEEP_US: u32 = 2;
+const BARE_SLOT_SWEEP_US: u32 = 2;
 
 /// The follower's phase-lock gain and clamp (a one-shot phase step, the
 /// software twin of the MPSL PLL).
-pub const BARE_SLOT_GAIN_NUM: i32 = 1;
+const BARE_SLOT_GAIN_NUM: i32 = 1;
 /// The PLL gain denominator (correction = err * NUM / DEN).
-pub const BARE_SLOT_GAIN_DEN: i32 = 4;
+const BARE_SLOT_GAIN_DEN: i32 = 4;
 /// The one-shot phase step clamp (±us).
-pub const BARE_SLOT_CORR_CLAMP_US: i32 = 20;
+const BARE_SLOT_CORR_CLAMP_US: i32 = 20;
 
 /// Interrupt handler for the custom RADIO driver.
 ///
@@ -180,7 +176,6 @@ impl Handler<typelevel::RADIO> for RadioIrqHandler {
     unsafe fn on_interrupt() {
         let r = PAC_RADIO;
         r.intenclr().write(|w| w.0 = 0xffff_ffff);
-        WAKER.wake();
     }
 }
 
@@ -189,7 +184,6 @@ impl Handler<typelevel::RADIO_0> for RadioIrqHandler {
     unsafe fn on_interrupt() {
         let r = PAC_RADIO;
         r.intenclr0(0).write(|w| w.0 = 0xffff_ffff);
-        WAKER.wake();
     }
 }
 
@@ -247,17 +241,15 @@ static mut TX_BUF: [u8; 256] = [0; 256];
 static mut RX_BUF: [u8; 256] = [0; 256];
 
 /// Debug counters for the nRF54 receive path (read from the app).
-pub static RX_STATS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RX_STATS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// 1 = TX END fired within the poll bound, 2 = TX poll timed out.
-pub static TX_STATS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Max TX poll iterations (diagnostics).
-pub static TX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Max RX poll iterations (diagnostics).
-pub static RX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RX_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Last RX poll duration in us (the DWT-capped listen window).
-pub static RX_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RX_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Last RSSI sample from the RADIO RSSISAMPLE register (RX diag).
-pub static RX_RSSI: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RX_RSSI: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// A named, ergonomic snapshot of the bare slot scheduler's state.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -310,83 +302,29 @@ pub fn bare_pll() -> BarePllSnapshot {
 }
 
 /// Bare scheduler diagnostics (read from the app context).
-pub static BARE_ADDR_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static BARE_RX_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static BARE_SWEEP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static BARE_PEER_WINDOW_US: core::sync::atomic::AtomicU32 =
+static BARE_ADDR_POLL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_RX_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_SWEEP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_PEER_WINDOW_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_EFFECTIVE_PERIOD_US: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
-pub static BARE_EFFECTIVE_PERIOD_US: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-pub static BARE_TX_ON_AIR_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static BARE_TX_AIR_MIN: core::sync::atomic::AtomicU32 =
+static BARE_TX_ON_AIR_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_TX_AIR_MIN: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
-pub static BARE_TX_AIR_MAX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static BARE_RX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static BARE_TX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static BARE_ADDR_SLOT_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static BARE_ADDR_EVENTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_TX_AIR_MAX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_RX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_TX_OP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_ADDR_SLOT_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_ADDR_EVENTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Raw paced TX/RX phase histograms (`slot_count % 10`), mirroring the
-/// MPSL `txph`/`rxph` diagnostics.
-pub static BARE_TX_PHASE: [core::sync::atomic::AtomicU32; 10] = [
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-];
-pub static BARE_RX_PHASE: [core::sync::atomic::AtomicU32; 10] = [
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
-];
-pub fn bare_phase_snapshot() -> ([u32; 10], [u32; 10]) {
-    let tx = [
-        BARE_TX_PHASE[0].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_TX_PHASE[1].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_TX_PHASE[2].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_TX_PHASE[3].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_TX_PHASE[4].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_TX_PHASE[5].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_TX_PHASE[6].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_TX_PHASE[7].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_TX_PHASE[8].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_TX_PHASE[9].swap(0, core::sync::atomic::Ordering::Relaxed),
-    ];
-    let rx = [
-        BARE_RX_PHASE[0].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_RX_PHASE[1].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_RX_PHASE[2].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_RX_PHASE[3].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_RX_PHASE[4].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_RX_PHASE[5].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_RX_PHASE[6].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_RX_PHASE[7].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_RX_PHASE[8].swap(0, core::sync::atomic::Ordering::Relaxed),
-        BARE_RX_PHASE[9].swap(0, core::sync::atomic::Ordering::Relaxed),
-    ];
-    (tx, rx)
-}
 
-pub static BARE_PLL_CORR_US: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
-/// Main-loop time outside the frame (the between-frame overhead; diagnostic).
-pub static LOOP_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static RXOK_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BARE_PLL_CORR_US: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+#[cfg(feature = "defmt")]
+static RXOK_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// TX sub-phase cycle counters (the DWT CYCCNT deltas; diagnostic).
-pub static TX_PHASE_DIS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static TX_PHASE_SETUP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static TX_PHASE_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TX_PHASE_DIS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TX_PHASE_SETUP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TX_PHASE_POLL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Read the ARM DWT cycle counter (the CPU cycles; the ground-truth timing).
 #[inline(always)]
 fn dwt_cycles() -> u32 {
@@ -405,9 +343,7 @@ fn dwt_enable() {
 }
 
 /// Cumulative RADIO STATE reads inside disable() (the disable latency proxy).
-pub static DISABLE_READS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static TX_T0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub static RX_T0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static DISABLE_READS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 // bit0: phyend fired, bit1: crc ok, bit2: crc fail, bit3: timeout
 
 impl<'d> NrfRadioPhy<'d> {
@@ -832,20 +768,6 @@ impl<'d> NrfRadioPhy<'d> {
         while ((dwt_cycles().wrapping_sub(target)) as i32) < 0 {}
     }
 
-    fn track_tx_phase(&self) {
-        if self.paced {
-            let idx = (self.slot_count % 10) as usize;
-            BARE_TX_PHASE[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    fn track_rx_phase(&self) {
-        if self.paced {
-            let idx = (self.slot_count % 10) as usize;
-            BARE_RX_PHASE[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
     fn track_tx_air(us: u32) {
         BARE_TX_ON_AIR_US.store(us, core::sync::atomic::Ordering::Relaxed);
         BARE_TX_AIR_MIN.fetch_min(us, core::sync::atomic::Ordering::Relaxed);
@@ -953,24 +875,6 @@ impl<'d> NrfRadioPhy<'d> {
         }
     }
 
-    /// Wait for the END event with interrupt-driven async.
-    async fn wait_end(&self) {
-        let r = self.r;
-        core::future::poll_fn(|cx| {
-            WAKER.register(cx.waker());
-            if r.events_end().read() != 0 {
-                r.events_end().write_value(0);
-                return Poll::Ready(());
-            }
-            #[cfg(not(feature = "_nrf54"))]
-            r.intenset().write(|w| w.set_end(true));
-            #[cfg(feature = "_nrf54")]
-            r.intenset0(0).write(|w| w.set_end(true));
-            Poll::Pending
-        })
-        .await;
-    }
-
     /// Bit-reverse each byte of a 4-byte array (ESB nRF24L01+ compatible).
     fn bytewise_bit_swap(v: u32) -> u32 {
         let mut out = 0u32;
@@ -1005,7 +909,6 @@ impl<'d> NrfRadioPhy<'d> {
             return Err(Error::Phy(RadioError::BufferTooLong));
         }
         self.slot_wait();
-        self.track_tx_phase();
         let c0 = dwt_cycles();
         self.disable();
         let c1 = dwt_cycles();
@@ -1015,7 +918,7 @@ impl<'d> NrfRadioPhy<'d> {
         self.pll_enable();
 
         // ESB format: [S0 = length][payload].
-        let tx_buf = unsafe { &mut TX_BUF };
+        let tx_buf = unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) };
         tx_buf[0] = pkt.len() as u8;
         tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
 
@@ -1055,12 +958,6 @@ impl<'d> NrfRadioPhy<'d> {
                     break;
                 }
             }
-            if t < 40_000 {
-                TX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
-            } else {
-                TX_STATS.fetch_or(2, core::sync::atomic::Ordering::Relaxed);
-            }
-            TX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
             self.r.events_end().write_value(0);
         }
         let c3 = dwt_cycles();
@@ -1087,118 +984,6 @@ impl<'d> NrfRadioPhy<'d> {
             core::sync::atomic::Ordering::Relaxed,
         );
         Ok(())
-    }
-
-    /// Begin a TX burst: ramp the radio once and leave it on across packets
-    /// (no END_DISABLE). The ramp is amortized - the subsequent
-    /// [`transmit_burst_send`] packets skip the TXEN ramp entirely.
-    ///
-    /// The nRF54L burst is not implemented (its SHORTS auto-disable and the
-    /// per-packet PLL/TXD.AMOUNT differ) - return Unsupported so the link
-    /// falls back to the plain per-packet transmit.
-    pub fn transmit_burst_begin(&mut self, pkt: &[u8]) -> Result<(), Error<RadioError>> {
-        #[cfg(feature = "_nrf54")]
-        return Err(Error::Unsupported);
-        if pkt.len() > 255 - 1 {
-            return Err(Error::Phy(RadioError::BufferTooLong));
-        }
-        self.slot_wait();
-        self.track_tx_phase();
-        self.disable();
-        let tx_buf = unsafe { &mut TX_BUF };
-        tx_buf[0] = pkt.len() as u8;
-        tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
-        compiler_fence(Ordering::Release);
-        self.set_packet_ptr(tx_buf.as_ptr());
-        #[cfg(not(feature = "_nrf54"))]
-        self.r.shorts().write(|w| {
-            w.set_txready_start(true);
-            // No end_disable: the radio stays warm (TXIDLE) after the END.
-        });
-        self.r.events_end().write_value(0);
-        if self.paced {
-            // The first slot of a burst pays the TXEN ramp; TXEN must be
-            // early enough for the on-air start to land at the computed
-            // offset (the follower's echo window, or the master anchor).
-            let (txen_offset, _) = self.tx_offsets_us(pkt.len());
-            self.wait_until_slot_offset_us(txen_offset);
-        }
-        let txen_elapsed = dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
-        Self::track_tx_air(txen_elapsed + BARE_TX_RAMP_US);
-        self.r.tasks_txen().write_value(1);
-        self.poll_tx_end();
-        BARE_TX_OP_US.store(
-            dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ,
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        Ok(())
-    }
-
-    /// Send the next packet in a burst: the radio is already ramped, so only
-    /// the packetptr + the START - no TXEN, no ramp (the ~on-air time).
-    pub fn transmit_burst_send(&mut self, pkt: &[u8]) -> Result<(), Error<RadioError>> {
-        #[cfg(feature = "_nrf54")]
-        return Err(Error::Unsupported);
-        if pkt.len() > 255 - 1 {
-            return Err(Error::Phy(RadioError::BufferTooLong));
-        }
-        self.slot_wait();
-        self.track_tx_phase();
-        let tx_buf = unsafe { &mut TX_BUF };
-        tx_buf[0] = pkt.len() as u8;
-        tx_buf[1..1 + pkt.len()].copy_from_slice(pkt);
-        compiler_fence(Ordering::Release);
-        self.set_packet_ptr(tx_buf.as_ptr());
-        self.r.events_end().write_value(0);
-        if self.paced {
-            // The radio is already ramped (TXIDLE): on-air follows START
-            // almost immediately, so START goes at the computed on-air
-            // offset (the follower's echo window, or the master anchor).
-            let (_, on_air_offset) = self.tx_offsets_us(pkt.len());
-            self.wait_until_slot_offset_us(on_air_offset);
-        }
-        let start_elapsed = dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ;
-        Self::track_tx_air(start_elapsed);
-        self.r.tasks_start().write_value(1);
-        self.poll_tx_end();
-        BARE_TX_OP_US.store(
-            dwt_cycles().wrapping_sub(self.slot_start_cyc) / CPU_MHZ,
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        Ok(())
-    }
-
-    /// Poll the TX END event (the packet's on-air completion).
-    #[inline(always)]
-    fn poll_tx_end(&mut self) {
-        #[cfg(not(feature = "_nrf54"))]
-        {
-            let mut t = 0u32;
-            while self.r.events_end().read() == 0 {
-                t += 1;
-                if t > 40_000 {
-                    break;
-                }
-            }
-            if t < 40_000 {
-                TX_STATS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
-            } else {
-                TX_STATS.fetch_or(2, core::sync::atomic::Ordering::Relaxed);
-            }
-            TX_POLL.store(t, core::sync::atomic::Ordering::Relaxed);
-            self.r.events_end().write_value(0);
-        }
-        #[cfg(feature = "_nrf54")]
-        {
-            let mut t = 0u32;
-            while self.r.events_phyend().read() == 0 {
-                t += 1;
-                if t > 40_000 {
-                    break;
-                }
-            }
-            self.r.events_phyend().write_value(0);
-        }
     }
 }
 
@@ -1235,7 +1020,6 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         timeout: Duration,
     ) -> Result<Option<usize>, Error<RadioError>> {
         self.slot_wait();
-        self.track_rx_phase();
 
         // nRF54: the radio auto-disables via the PHYEND_DISABLE short; skip the
         // explicit disable before RX (verified: explicit disable broke RX).
@@ -1246,7 +1030,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         #[cfg(feature = "_nrf54")]
         self.pll_enable();
 
-        let rx_buf = unsafe { &mut RX_BUF };
+        let rx_buf = unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) };
         rx_buf.fill(0);
         let ptr = rx_buf.as_mut_ptr();
         self.set_packet_ptr(ptr);
@@ -1385,7 +1169,7 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         // the buffer (the AMOUNT register reads inconsistently on nRF54L,
         // so use the length byte, not the AMOUNT).
         let payload_len = unsafe { RX_BUF[0] } as usize;
-        let rx_buf = unsafe { &RX_BUF };
+        let rx_buf = unsafe { &*core::ptr::addr_of!(RX_BUF) };
         #[cfg(feature = "defmt")]
         if RXOK_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 1000 == 0 {
             defmt::info!("RXOK lenbyte={} buf={:02x}", payload_len, &rx_buf[..16]);
@@ -1407,10 +1191,6 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         Ok(Some(payload_len))
     }
 
-    async fn wait_slot(&mut self) {
-        self.slot_wait();
-    }
-
     async fn flush(&mut self) {
         self.disable();
         self.r.events_end().write_value(0);
@@ -1425,224 +1205,9 @@ impl<'d> Phy for NrfRadioPhy<'d> {
         #[cfg(feature = "_nrf54")]
         self.pll_enable();
     }
-
-    fn rx_window_us(&self) -> u16 {
-        if self.paced {
-            self.rx_window_us.min(u16::MAX as u32) as u16
-        } else {
-            0
-        }
-    }
-
-    fn set_peer_rx_window(&mut self, us: u16) {
-        self.peer_rx_window_us = us as u32;
-    }
-
-    fn tx_en_offset_us(&self) -> u8 {
-        BARE_TX_ON_AIR_US
-            .load(core::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(BARE_TX_RAMP_US) as u8
-    }
-
-    fn tx_ramp_us(&self) -> u8 {
-        BARE_TX_RAMP_US as u8
-    }
-
-    fn set_peer_tx_en_offset(&mut self, us: u8) {
-        if us > 0 {
-            self.peer_tx_en_offset_us = us as u32;
-        }
-    }
-
-    fn set_peer_tx_ramp(&mut self, us: u8) {
-        if us > 0 {
-            self.peer_tx_ramp_us = us as u32;
-        }
-    }
-
-    fn set_tx_phase_margin_us(&mut self, margin_us: i32) {
-        self.tx_phase_margin_us = margin_us;
-    }
-
-    fn slot_period_us(&self) -> u16 {
-        if self.paced {
-            self.period_us.min(u16::MAX as u32) as u16
-        } else {
-            0
-        }
-    }
-
-    fn min_slot_period_us(&self) -> u16 {
-        if self.paced {
-            self.min_period_us.min(u16::MAX as u32) as u16
-        } else {
-            0
-        }
-    }
-
-    fn initial_slot_period_us(&self) -> u16 {
-        if self.paced {
-            self.min_period_us.min(u16::MAX as u32) as u16
-        } else {
-            0
-        }
-    }
-
-    fn align_slot_period(&mut self, us: u16) {
-        if self.paced && us > 0 {
-            // Never adopt a cadence faster than the configured mode can
-            // physically support.
-            self.period_us = (us as u32).max(self.min_period_us);
-        }
-    }
-
-    fn transmit_burst_begin(&mut self, pkt: &[u8]) -> Result<(), Error<Self::Error>> {
-        NrfRadioPhy::transmit_burst_begin(self, pkt)
-    }
-
-    fn transmit_burst_send(&mut self, pkt: &[u8]) -> Result<(), Error<Self::Error>> {
-        NrfRadioPhy::transmit_burst_send(self, pkt)
-    }
-
-    #[cfg(any(feature = "nrf52840", feature = "nrf5340-net", feature = "nrf52833"))]
-    fn ccm_crypt(
-        &mut self,
-        key: &[u8; 16],
-        nonce: &[u8; 13],
-        payload: &mut [u8],
-        mic: &mut [u8; 4],
-        encrypt: bool,
-    ) -> Result<(), Error<Self::Error>> {
-        NrfRadioPhy::ccm_crypt(key, nonce, payload, mic, encrypt)
-            .map_err(|_| Error::Phy(RadioError::Crypto))
-    }
 }
 
 impl<'d> NrfRadioPhy<'d> {
-    /// Hardware AES-CCM over the EasyDMA: the config [key(16) | nonce(13) |
-    /// iv(8)] at CNFPTR, the payload at INPTR/OUTPTR, the CBC-MAC scratch at
-    /// SCRATCHPTR. KSGEN (the key schedule) then CRYPT (the AEAD); MICSTATUS
-    /// gates the decrypt. The MIC (4 bytes) is appended after the payload.
-    #[cfg(any(feature = "nrf52840", feature = "nrf5340-net", feature = "nrf52833"))]
-    fn ccm_crypt(
-        key: &[u8; 16],
-        nonce: &[u8; 13],
-        payload: &mut [u8],
-        mic: &mut [u8; 4],
-        encrypt: bool,
-    ) -> Result<(), ()> {
-        // The nrfx nrf_ccm_cnf_t: key[16] | pktctr[9] | iv[8] (33 packed bytes).
-        #[repr(C, packed)]
-        struct CcmCnf {
-            key: [u8; 16],
-            pktctr: [u8; 9],
-            iv: [u8; 8],
-        }
-        // The scratch must hold (16 + MAXPACKETSIZE) bytes when MODE.LENGTH
-        // is Extended (the keystream + the AES state); MAXPACKETSIZE resets
-        // to 251.
-        static mut CCM_CNF: CcmCnf = CcmCnf {
-            key: [0; 16],
-            pktctr: [0; 9],
-            iv: [0; 8],
-        };
-        static mut CCM_SCRATCH: [u8; 267] = [0; 267];
-        // The EasyDMA packet: [HEADER(S0) | LENGTH | RFU | payload | MIC].
-        static mut CCM_BUF: [u8; 3 + 40] = [0; 3 + 40];
-        // Separate output buffer (the in-place INPTR==OUTPTR read-back
-        // hazards the MAC for the streaming EasyDMA).
-        static mut CCM_OUT: [u8; 3 + 40 + 4] = [0; 3 + 40 + 4];
-
-        // The nonce -> the CNF mapping (PS Table 56): the pktctr field is
-        // the 5-byte packet counter + 3 reserved bytes + the direction byte;
-        // the IV carries the channel. make_nonce_13 = [seq(2) | 0*3 | channel
-        // | direction | 0*6]; the channel is dropped so the IV is zeroed.
-        let cnf = unsafe { &mut CCM_CNF };
-        cnf.key.copy_from_slice(key);
-        cnf.pktctr[..5].copy_from_slice(&nonce[..5]);
-        cnf.pktctr[5..8].fill(0);
-        cnf.pktctr[8] = nonce[6]; // the direction bit
-        cnf.iv[0] = nonce[5]; // the channel
-        cnf.iv[1..].fill(0);
-
-        let buf = unsafe { &mut CCM_BUF };
-        let len = payload.len();
-        buf[0] = 0; // the S0 header
-        // The LENGTH byte is the packet length the CCM processes: the
-        // plaintext alone on encrypt (the hardware appends the 4-byte MIC),
-        // the ciphertext + MIC on decrypt (the hardware strips the MIC).
-        buf[1] = if encrypt { len } else { len + 4 } as u8;
-        buf[2] = 0; // the RFU
-        buf[3..3 + len].copy_from_slice(payload);
-        // On decrypt, the received MIC is the input after the ciphertext.
-        if !encrypt {
-            buf[3 + len..3 + len + 4].copy_from_slice(mic);
-        }
-
-        // The 5-bit (Default) LENGTH field tops out at 31. Match nrf-hal: the
-        // encrypt's plaintext must fit so the +4 MIC output stays <= 31, the
-        // decrypt's ciphertext+MIC is the read value. Larger packets switch
-        // to the 8-bit (Extended) field and need MAXPACKETSIZE set.
-        let extended = if encrypt { len > 27 } else { len + 4 > 31 };
-
-        #[cfg(feature = "nrf52840")]
-        let ccm = unsafe { &nrf_pac::CCM };
-        #[cfg(feature = "nrf52833")]
-        let ccm = unsafe { &nrf_pac::CCM };
-        #[cfg(feature = "nrf5340-net")]
-        let ccm = unsafe { &nrf_pac::CCM_NS };
-        // The MODE register (the datarate) must be written while DISABLED;
-        // write the whole thing before enabling.
-        ccm.enable().write_value(nrf_pac::ccm::regs::Enable(0));
-        if extended {
-            ccm.maxpacketsize()
-                .write_value(nrf_pac::ccm::regs::Maxpacketsize(buf[1] as u32));
-        }
-        // MODE: bit0 = encrypt(0)/decrypt(1), bits 16-17 = the datarate
-        // (2 Mbit = 1), bit 24 = LENGTH (0 = 5-bit Default, 1 = 8-bit Extended).
-        ccm.mode().write_value(nrf_pac::ccm::regs::Mode(
-            ((extended as u32) << 24) | (1u32 << 16) | (if encrypt { 0 } else { 1 }),
-        ));
-        ccm.enable().write_value(nrf_pac::ccm::regs::Enable(2));
-        ccm.cnfptr().write_value(cnf as *const _ as u32);
-        ccm.inptr().write_value(buf.as_ptr() as u32);
-        let out = unsafe { &mut CCM_OUT };
-        ccm.outptr().write_value(out.as_ptr() as u32);
-        ccm.scratchptr()
-            .write_value(unsafe { CCM_SCRATCH.as_ptr() } as u32);
-
-        ccm.events_endksgen().write_value(0);
-        ccm.tasks_ksgen().write_value(1);
-        let mut t = 0u32;
-        while ccm.events_endksgen().read() == 0 {
-            t += 1;
-            if t > 1_000_000 {
-                return Err(());
-            }
-        }
-        ccm.events_endcrypt().write_value(0);
-        ccm.tasks_crypt().write_value(1);
-        t = 0;
-        while ccm.events_endcrypt().read() == 0 {
-            t += 1;
-            if t > 1_000_000 {
-                return Err(());
-            }
-        }
-        if encrypt {
-            payload.copy_from_slice(&out[3..3 + len]);
-            mic.copy_from_slice(&out[3 + len..3 + len + 4]);
-            Ok(())
-        } else {
-            // MICSTATUS bit 0: 0 = CheckFailed, 1 = CheckPassed.
-            if ccm.micstatus().read().0 & 0x1 == 0 {
-                return Err(());
-            }
-            payload.copy_from_slice(&out[3..3 + len]);
-            Ok(())
-        }
-    }
-
     /// Enable the RADIO PLL (nRF54 only). On nRF52/53 the PLL
     /// auto-enables on TXEN/RXEN, but RADIO3 requires an explicit
     /// TASKS_PLLEN and waits for EVENTS_PLLREADY before it can
