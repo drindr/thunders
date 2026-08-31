@@ -22,6 +22,9 @@ use crate::radio_phy::RadioMode;
 
 /// Scheduling granularity applied to mathematically derived slot durations.
 pub const MPSL_SLOT_QUANTUM_US: u16 = 25;
+/// One-shot first callback grant. Session/radio initialization performs more
+/// register work than steady-state events; subsequent grants use the mode plan.
+pub const MPSL_FIRST_CALLBACK_GRANT_US: u32 = 450;
 
 /// Compile-time MPSL schedule for a fixed one-way mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,9 +267,10 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
             let dwt_ctrl = 0xE000_1000 as *mut u32;
             dwt_ctrl.write_volatile(dwt_ctrl.read_volatile() | 1); // CYCCNTENA
         }
-        // The compile-time mode plan is authoritative from the first request.
+        // The mode period is authoritative immediately. Only the first
+        // EARLIEST grant is enlarged for one-time session/radio setup.
         state.slot_nominal = SLOT_US;
-        state.slot_len = SLOT_US.saturating_sub(150);
+        state.slot_len = MPSL_FIRST_CALLBACK_GRANT_US;
         state.rx_poll = RX_POLL;
         state.slot_distance = SLOT_US;
         state.radio_mode = _radio_mode;

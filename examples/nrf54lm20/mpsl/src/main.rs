@@ -9,9 +9,7 @@ use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, raw};
 use static_cell::StaticCell;
-use thunders::{
-    Address, AirTiming, FixedOneWayFrame, OneWaySender, OneWayState, SlotOverhead, phy::Phy,
-};
+use thunders::{Address, AirTiming, OneWayState, SlotOverhead, phy::Phy};
 use thunders_phy_nrf::{
     RadioMode,
     mpsl::{MpslRadioPhy, MpslState, OneWayMpslPlan, one_way_mpsl_plan},
@@ -88,11 +86,10 @@ async fn main(spawner: Spawner) {
     let apply = phy.slot_count().wrapping_add(6);
     assert!(phy.schedule_slot_profile(DATA_SLOT_US, FEEDBACK_SLOT_US, 33, 32, 0, apply,));
 
-    let mut sender = OneWaySender::<PAYLOAD, Mode>::new();
-    let mut wire = [0u8; 64];
     let mut feedback = [0u8; 64];
-    let mut seq = 0u32;
+    let mut state_counter = 0u32;
     let mut sent = 0u32;
+    let mut last_hw_tx = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().tx_count;
     let mut feedback_seen = false;
     let mut report_at = Instant::now();
     info!(
@@ -109,15 +106,13 @@ async fn main(spawner: Spawner) {
                 let payload = [
                     b'S',
                     b'T',
-                    seq as u8,
-                    (seq >> 8) as u8,
-                    (seq >> 16) as u8,
-                    (seq >> 24) as u8,
+                    state_counter as u8,
+                    (state_counter >> 8) as u8,
+                    (state_counter >> 16) as u8,
+                    (state_counter >> 24) as u8,
                 ];
-                let frame = sender.send(payload).unwrap();
-                let n = frame.encode::<PAYLOAD>(&mut wire).unwrap();
-                phy.op_publish_tx(&wire[..n], target, 0).await.unwrap();
-                seq = seq.wrapping_add(1);
+                phy.op_publish_tx(&payload, target, 0).await.unwrap();
+                state_counter = state_counter.wrapping_add(1);
                 sent = sent.wrapping_add(1);
             } else {
                 feedback.fill(0);
@@ -126,16 +121,19 @@ async fn main(spawner: Spawner) {
         }
         let collected = hw.wrapping_add(1);
         if let Some(feedback_len) = phy.op_collect(collected).await {
-            feedback_seen |= feedback_len < feedback.len()
-                && FixedOneWayFrame::decode::<PAYLOAD>(&feedback[1..1 + feedback_len]).is_ok();
+            feedback_seen |= feedback_len == 2;
         }
         if report_at.elapsed() >= Duration::from_secs(5) {
             let elapsed_us = report_at.elapsed().as_micros().max(1);
             let tx_slot_rate = sent as u64 * 1_000_000 / elapsed_us;
+            let hw_tx = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().tx_count;
+            let hw_delta = hw_tx.wrapping_sub(last_hw_tx);
+            let hw_rate = hw_delta as u64 * 1_000_000 / elapsed_us;
             info!(
-                "MPSL ONEWAY TX slots={} slot_rate={}/s seq={} feedback={}",
-                sent, tx_slot_rate, seq, feedback_seen
+                "MPSL ONEWAY TX published={} publish_rate={}/s hw_tx={} hw_rate={}/s state={} feedback={}",
+                sent, tx_slot_rate, hw_delta, hw_rate, state_counter, feedback_seen
             );
+            last_hw_tx = hw_tx;
             sent = 0;
             feedback_seen = false;
             report_at = Instant::now();

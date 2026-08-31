@@ -40,8 +40,10 @@ meaning of the data.
 
 `fixed_slot_plan::<Mode>(AirTiming, SlotOverhead)` derives:
 
-- exact Data wire bytes: marker + sequence + fixed payload;
-- exact feedback bytes: marker + sequence + signed time difference;
+- state Data wire bytes: exactly the fixed payload, with no marker/sequence;
+- state feedback bytes: one signed `i16 diff_us`;
+- reliable state-change Data: fixed payload plus two-byte sequence;
+- reliable feedback: two-byte sequence plus signed `i16 diff_us`;
 - on-air duration including length and CRC;
 - TX/RX ramp and setup budget;
 - shutdown tail, jitter margin, and mandatory MPSL gap;
@@ -53,10 +55,12 @@ No payload length is negotiated or transmitted at runtime.
 For a 2 Mbit Nordic frame and conservative measured MPSL overhead:
 
 ```text
-8-byte application payload
-wire = 11 bytes
-airtime = 84 us
-slot = airtime + 265 us = 349 us
+6-byte state payload
+wire = 6 bytes
+airtime = 64 us
+RX restart allowance = 150 us
+mathematical MPSL period = 479 us
+25 us quantization = 500 us
 ```
 
 A production adapter may round this mathematical floor upward, but it must not
@@ -132,42 +136,42 @@ continuous multi-packet RX grant. The next PHY adapter must keep RADIO in RX
 and collect multiple fixed frames inside that one long receiver window.
 
 This smoke result validates the fixed codec and one-way state semantics. The
-retained smoke programs now use `OneWayState<6, 32>`; six application bytes
-produce a nine-byte wire frame.
+retained smoke programs now use `OneWayState<6, 32>`. State mode has no marker
+or protocol sequence, so six application bytes produce a six-byte wire frame.
 
 ### MPSL implementation
 
-The MPSL adapter derives its schedule entirely at compile time:
+The MPSL adapter derives its schedule entirely at compile time. State packets
+contain only the six payload bytes. The timing model includes the measured
+per-packet receiver DISABLE/PLL/RXEN turnaround:
 
 ```text
-mathematical Data floor: 341us
-25us scheduling quantization: 350us
-feedback floor: 325us, raised to the 350us profile minimum
-cycle: 32 × 350us + 350us = 11550us
+2M six-byte state airtime: 64us
+RX restart allowance: 150us
+mathematical Data period: 479us
+25us scheduling quantization: 500us
+feedback period: 500us
+cycle: 32 × 500us + 500us = 16500us
 ```
 
-The LM20 transmitter uses 32 short Data events plus one feedback RX event. The
-52840 receiver uses one 11550us nominal long event; TimeDiff is transmitted
-inside that same grant, so there is no separately phased receiver feedback slot.
+The LM20 transmitter uses 32 Data events plus one feedback RX event. The 52840
+receiver uses one long event and returns a two-byte signed `diff_us`; state mode
+uses neither marker nor protocol sequence.
 
-`RxBatch` keeps RADIO inside one MPSL grant and stores up to 32
-`[len | payload]` cells without returning to the executor between packets.
-For no-ACK mode, every sequence where `seq % 32 == 31` triggers a hardware-
-relative TimeDiff reply at the following compile-time Data event boundary.
-
-LM20→52840 hardware validation at 2 Mbit measured:
+The receiver collects a completed batch before republishing the same parity
+buffer, preventing callback results from being overwritten by a future op.
+LM20→52840 validation measured:
 
 ```text
-receiver collected long-RX slots: 66–68/s
-transmitter Data slots: 2769–2770/s
-received Data frames: 1393–1562/s after acquisition
+hardware transmitter slots: 1938–1939/s
+receiver delivered frames: 1193–1269/s
+receiver CRC-valid catches: 1680–1830/s
 invalid frames: 0
-TimeDiff feedback: true
+TimeDiff feedback observed: true
 ```
 
-The sender event, feedback event, receiver window, and packet-relative reply
-offset all come from `one_way_mpsl_plan::<Mode>()`; no 500us compatibility or
-fallback constant remains.
+All durations and packet-relative reply offsets come from
+`one_way_mpsl_plan::<Mode>()` and compile-time PHY timing constants.
 
 ## Migration status
 

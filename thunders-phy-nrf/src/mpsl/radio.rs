@@ -248,40 +248,30 @@ unsafe fn receive_batch(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
             if len > 0 && len < 64 {
                 count += 1;
                 state.crc_ok = state.crc_ok.wrapping_add(1);
-                // No-ACK alignment feedback is tied to the packet itself,
-                // not to an independently phased receiver slot chain. After
-                // every 32nd fixed Data frame, transmit TimeDiff at the next
-                // configured sender event boundary while still in this grant.
-                if len >= 3
-                    && *cell.add(1) == 0xF0
+                state.one_way_rx_since_feedback = state.one_way_rx_since_feedback.wrapping_add(1);
+                if state.one_way_rx_since_feedback >= 32
                     && address_cyc != 0
                     && state.one_way_data_slot_us > 28
                 {
-                    let seq = u16::from_le_bytes([*cell.add(2), *cell.add(3)]);
-                    if seq & 31 == 31 {
-                        let tx_at =
-                            address_cyc.wrapping_add((state.one_way_data_slot_us - 28) * CPU_MHZ);
-                        let wait_cyc = tx_at.wrapping_sub(cyc());
-                        if (wait_cyc as i32) > 0
-                            && cyc().wrapping_sub(slot_start_cyc).wrapping_add(wait_cyc)
-                                < deadline_cyc
-                        {
-                            delay_us(wait_cyc / CPU_MHZ);
-                            let feedback = [5u8, 0xF2, seq as u8, (seq >> 8) as u8, 0, 0];
-                            r.packetptr().write_value(feedback.as_ptr() as u32);
-                            r.shorts().write_value(shorts_tx());
-                            r.events_end().write_value(0);
-                            r.events_phyend().write_value(0);
-                            r.events_disabled().write_value(0);
-                            r.tasks_txen().write_value(1);
-                            while !end_ev_set(r)
-                                && cyc().wrapping_sub(slot_start_cyc) < deadline_cyc
-                            {
-                            }
-                            end_ev_clear(r);
-                            r.tasks_disable().write_value(1);
-                            disable_wait(r);
-                        }
+                    let tx_at =
+                        address_cyc.wrapping_add((state.one_way_data_slot_us - 28) * CPU_MHZ);
+                    let wait_cyc = tx_at.wrapping_sub(cyc());
+                    if (wait_cyc as i32) > 0
+                        && cyc().wrapping_sub(slot_start_cyc).wrapping_add(wait_cyc) < deadline_cyc
+                    {
+                        state.one_way_rx_since_feedback = 0;
+                        delay_us(wait_cyc / CPU_MHZ);
+                        let feedback = [2u8, 0, 0];
+                        r.packetptr().write_value(feedback.as_ptr() as u32);
+                        r.shorts().write_value(shorts_tx());
+                        r.events_end().write_value(0);
+                        r.events_phyend().write_value(0);
+                        r.events_disabled().write_value(0);
+                        r.tasks_txen().write_value(1);
+                        while !end_ev_set(r) && cyc().wrapping_sub(slot_start_cyc) < deadline_cyc {}
+                        end_ev_clear(r);
+                        r.tasks_disable().write_value(1);
+                        disable_wait(r);
                     }
                 }
             }

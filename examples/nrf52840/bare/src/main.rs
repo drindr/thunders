@@ -7,10 +7,7 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
-use thunders::{
-    Address, AirTiming, FixedOneWayFrame, OneWayReceiver, OneWayState, SlotOverhead,
-    fixed_slot_plan, phy::Phy,
-};
+use thunders::{Address, AirTiming, OneWayState, SlotOverhead, fixed_slot_plan, phy::Phy};
 use thunders_phy_nrf::{NrfRadioPhy, RadioIrqHandler, RadioMode};
 use {defmt_rtt as _, panic_probe as _};
 
@@ -34,14 +31,13 @@ async fn main(_spawner: Spawner) {
     phy.set_address(&Address([0xE7; 5])).await;
     phy.set_channel(0).await;
 
-    let mut receiver = OneWayReceiver::<PAYLOAD, Mode>::new();
     let mut wire = [0u8; 64];
     let mut report_at = Instant::now();
     let mut received = 0u32;
     let mut lost = 0u32;
     let mut invalid = 0u32;
-    let mut have_seq = false;
-    let mut last_seq = 0u16;
+    let mut have_state = false;
+    let mut last_state = 0u32;
     let window = Duration::from_micros(PLAN.receiver_window_us as u64);
 
     info!(
@@ -55,22 +51,16 @@ async fn main(_spawner: Spawner) {
 
     loop {
         match phy.receive(&mut wire, window).await {
-            Ok(Some(len)) => match FixedOneWayFrame::decode::<PAYLOAD>(&wire[..len]) {
-                Ok(frame) => match receiver.receive(&frame, 0) {
-                    Ok((packet, _time_diff)) => {
-                        if have_seq {
-                            lost = lost.wrapping_add(
-                                packet.seq.wrapping_sub(last_seq).wrapping_sub(1) as u32,
-                            );
-                        }
-                        last_seq = packet.seq;
-                        have_seq = true;
-                        received = received.wrapping_add(1);
-                    }
-                    Err(()) => invalid = invalid.wrapping_add(1),
-                },
-                Err(()) => invalid = invalid.wrapping_add(1),
-            },
+            Ok(Some(len)) if len == PAYLOAD && wire[0] == b'S' && wire[1] == b'T' => {
+                let state = u32::from_le_bytes([wire[2], wire[3], wire[4], wire[5]]);
+                if have_state {
+                    lost = lost.wrapping_add(state.wrapping_sub(last_state).wrapping_sub(1));
+                }
+                last_state = state;
+                have_state = true;
+                received = received.wrapping_add(1);
+            }
+            Ok(Some(_)) => invalid = invalid.wrapping_add(1),
             Ok(None) => {}
             Err(_) => invalid = invalid.wrapping_add(1),
         }
@@ -84,7 +74,7 @@ async fn main(_spawner: Spawner) {
             };
             info!(
                 "ONEWAY RX frames={} lost={} loss={}% invalid={} last={}",
-                received, lost, loss_pct, invalid, last_seq
+                received, lost, loss_pct, invalid, last_state
             );
             received = 0;
             lost = 0;

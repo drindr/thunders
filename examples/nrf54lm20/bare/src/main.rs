@@ -7,9 +7,7 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 
-use thunders::{
-    Address, AirTiming, OneWaySender, OneWayState, SlotOverhead, fixed_slot_plan, phy::Phy,
-};
+use thunders::{Address, AirTiming, OneWayState, SlotOverhead, fixed_slot_plan, phy::Phy};
 use thunders_phy_nrf::{NrfRadioPhy, RadioIrqHandler, RadioMode};
 use {defmt_rtt as _, panic_probe as _};
 
@@ -36,8 +34,6 @@ async fn main(_spawner: Spawner) {
     phy.set_address(&Address([0xE7; 5])).await;
     phy.set_channel(0).await;
 
-    let mut sender = OneWaySender::<PAYLOAD, Mode>::new();
-    let mut wire = [0u8; 64];
     let mut seq = 0u32;
     let mut report_frames = 0u32;
 
@@ -59,9 +55,7 @@ async fn main(_spawner: Spawner) {
             (seq >> 16) as u8,
             (seq >> 24) as u8,
         ];
-        let frame = sender.send(payload).unwrap();
-        let len = frame.encode::<PAYLOAD>(&mut wire).unwrap();
-        phy.transmit(&wire[..len]).await.unwrap();
+        phy.transmit(&payload).await.unwrap();
         seq = seq.wrapping_add(1);
         report_frames = report_frames.wrapping_add(1);
 

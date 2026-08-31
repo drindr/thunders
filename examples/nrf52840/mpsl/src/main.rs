@@ -9,9 +9,7 @@ use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, raw};
 use static_cell::StaticCell;
-use thunders::{
-    Address, AirTiming, FixedOneWayFrame, OneWayReceiver, OneWayState, SlotOverhead, phy::Phy,
-};
+use thunders::{Address, AirTiming, OneWayState, SlotOverhead, phy::Phy};
 use thunders_phy_nrf::{
     RadioMode,
     mpsl::{MpslRadioPhy, MpslState, OneWayMpslPlan, one_way_mpsl_plan},
@@ -79,11 +77,13 @@ async fn main(spawner: Spawner) {
     static RECORDS1: StaticCell<[u8; BATCH * 64]> = StaticCell::new();
     let records0 = RECORDS0.init([0; BATCH * 64]);
     let records1 = RECORDS1.init([0; BATCH * 64]);
-    let mut receiver = OneWayReceiver::<PAYLOAD, Mode>::new();
-    let mut last_seq = 0u16;
+    let mut last_state = 0u32;
     let mut received = 0u32;
     let mut rx_slots = 0u32;
     let mut invalid = 0u32;
+    let mut last_addr = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().addr_events;
+    let mut last_crc_ok = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().crc_ok;
+    let mut last_crc_bad = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().crc_bad;
     let mut report_at = Instant::now();
 
     info!(
@@ -91,20 +91,11 @@ async fn main(spawner: Spawner) {
         RX_WINDOW_US, FEEDBACK_SLOT_US, apply
     );
 
+    assert!(phy.publish_rx_batch(&mut records0[..], apply));
+    assert!(phy.publish_rx_batch(&mut records1[..], apply.wrapping_add(1)));
+    let mut collected = apply;
     loop {
-        let hw = phy.slot_count();
-        let target = hw.wrapping_add(2);
-        if (target.wrapping_sub(apply) as i32) >= 0 {
-            let records: &mut [u8] = if target & 1 == 0 {
-                &mut records0[..]
-            } else {
-                &mut records1[..]
-            };
-            assert!(phy.publish_rx_batch(records, target));
-        }
-
-        let collected = hw.wrapping_add(1);
-        if (collected.wrapping_sub(apply) as i32) >= 0 {
+        {
             let count = phy.collect_rx_batch(collected).await;
             rx_slots = rx_slots.wrapping_add(1);
             let records: &[u8] = if collected & 1 == 0 {
@@ -114,27 +105,46 @@ async fn main(spawner: Spawner) {
             };
             for cell in records.chunks_exact(64).take(count) {
                 let len = cell[0] as usize;
-                if let Ok(frame) = FixedOneWayFrame::decode::<PAYLOAD>(&cell[1..1 + len]) {
-                    if let Ok((packet, _)) = receiver.receive(&frame, 0) {
-                        last_seq = packet.seq;
-                        received = received.wrapping_add(1);
-                    }
+                if len == PAYLOAD && cell[1] == b'S' && cell[2] == b'T' {
+                    last_state = u32::from_le_bytes([cell[3], cell[4], cell[5], cell[6]]);
+                    received = received.wrapping_add(1);
                 } else {
                     invalid = invalid.wrapping_add(1);
                 }
             }
-        } else {
-            let _ = phy.op_collect(collected).await;
         }
+        let target = collected.wrapping_add(2);
+        let records: &mut [u8] = if target & 1 == 0 {
+            &mut records0[..]
+        } else {
+            &mut records1[..]
+        };
+        assert!(phy.publish_rx_batch(records, target));
+        collected = collected.wrapping_add(1);
 
         if report_at.elapsed() >= Duration::from_secs(5) {
             let elapsed_us = report_at.elapsed().as_micros().max(1);
             let rx_slot_rate = rx_slots as u64 * 1_000_000 / elapsed_us;
             let frame_rate = received as u64 * 1_000_000 / elapsed_us;
+            let diag = thunders_phy_nrf::mpsl::mpsl_pll_snapshot();
+            let addr = diag.addr_events.wrapping_sub(last_addr);
+            let crc_ok = diag.crc_ok.wrapping_sub(last_crc_ok);
+            let crc_bad = diag.crc_bad.wrapping_sub(last_crc_bad);
             info!(
-                "MPSL ONEWAY RX slots={} slot_rate={}/s frames={} frame_rate={}/s invalid={} last={}",
-                rx_slots, rx_slot_rate, received, frame_rate, invalid, last_seq
+                "MPSL ONEWAY RX slots={} slot_rate={}/s frames={} frame_rate={}/s addr={} crcok={} crcbad={} invalid={} state={}",
+                rx_slots,
+                rx_slot_rate,
+                received,
+                frame_rate,
+                addr,
+                crc_ok,
+                crc_bad,
+                invalid,
+                last_state
             );
+            last_addr = diag.addr_events;
+            last_crc_ok = diag.crc_ok;
+            last_crc_bad = diag.crc_bad;
             received = 0;
             rx_slots = 0;
             invalid = 0;

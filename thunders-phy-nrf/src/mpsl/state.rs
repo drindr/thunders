@@ -147,6 +147,8 @@ pub struct MpslState {
     pub(crate) rx_poll: u32,
     /// Sender Data event duration used for packet-relative TimeDiff replies.
     pub(crate) one_way_data_slot_us: u32,
+    /// Valid state frames accumulated since the previous TimeDiff reply.
+    pub(crate) one_way_rx_since_feedback: u32,
     /// Currently active negotiated phase profile. Before the first commit,
     /// `active_profile_armed` is false and the uniform `slot_nominal` applies.
     pub(crate) active_profile_short_us: u32,
@@ -355,6 +357,7 @@ impl MpslState {
             slot_len: 0,
             rx_poll: 0,
             one_way_data_slot_us: 0,
+            one_way_rx_since_feedback: 0,
             active_profile_short_us: 0,
             active_profile_long_us: 0,
             active_profile_period: 0,
