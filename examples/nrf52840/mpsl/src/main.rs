@@ -27,6 +27,7 @@ bind_interrupts!(struct Irqs {
 const PAYLOAD: usize = 6;
 const PHASE_ALIGN: bool = cfg!(feature = "phase-align");
 const HOPPING: bool = cfg!(feature = "hopping");
+const MULTI_SENDER: bool = cfg!(feature = "multi-sender");
 const FEEDBACK_EVERY: u16 = if HOPPING { 120 } else { 128 };
 type Mode = OneWayState<PAYLOAD, FEEDBACK_EVERY>;
 const PLAN: OneWayMpslPlan =
@@ -68,7 +69,15 @@ async fn main(spawner: Spawner) {
     let mut phy = MpslRadioPhy::<{ DATA_SLOT_US as u32 }, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
-    phy.set_address(&Address([0xE7; 5])).await;
+    if MULTI_SENDER {
+        assert!(!HOPPING, "multi-sender RX currently uses one fixed channel");
+        assert!(phy.configure_state_senders(&[
+            Address([0xE7, 0xE7, 0xE7, 0xE7, 0xE7]),
+            Address([0xC3, 0xE7, 0xE7, 0xE7, 0xE7]),
+        ]));
+    } else {
+        phy.set_address(&Address([0xE7; 5])).await;
+    }
     phy.set_channel(0).await;
 
     let apply = phy.slot_count().wrapping_add(6);
@@ -91,6 +100,7 @@ async fn main(spawner: Spawner) {
     let mut last_addr = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().addr_events;
     let mut last_crc_ok = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().crc_ok;
     let mut last_crc_bad = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().crc_bad;
+    let mut last_sender_counts = [0u32; 2];
     let mut report_at = Instant::now();
 
     info!(
@@ -142,6 +152,23 @@ async fn main(spawner: Spawner) {
                 diag.hop_index,
                 diag.hop_locked
             );
+            if MULTI_SENDER {
+                let mut sender0 = [0u8; PAYLOAD];
+                let mut sender1 = [0u8; PAYLOAD];
+                let count0 = phy.sender_state(0, &mut sender0).unwrap_or(0);
+                let count1 = phy.sender_state(1, &mut sender1).unwrap_or(0);
+                let rate0 =
+                    count0.wrapping_sub(last_sender_counts[0]) as u64 * 1_000_000 / elapsed_us;
+                let rate1 =
+                    count1.wrapping_sub(last_sender_counts[1]) as u64 * 1_000_000 / elapsed_us;
+                let state0 = u32::from_le_bytes([sender0[2], sender0[3], sender0[4], sender0[5]]);
+                let state1 = u32::from_le_bytes([sender1[2], sender1[3], sender1[4], sender1[5]]);
+                info!(
+                    "MPSL MULTI sender0 rate={}/s state={} sender1 rate={}/s state={}",
+                    rate0, state0, rate1, state1
+                );
+                last_sender_counts = [count0, count1];
+            }
             last_addr = diag.addr_events;
             last_crc_ok = diag.crc_ok;
             last_crc_bad = diag.crc_bad;

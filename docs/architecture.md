@@ -362,7 +362,61 @@ hopping overhead versus no-hop bare: about 1.7-1.8%
 If feedback is missed, the transmitter returns to channel 0. A locked receiver
 that times out also returns to channel 0, clears its phase state, and reacquires.
 
-## 9. Current limitations
+## 9. Multiple state senders
+
+The MPSL receiver can accept up to eight senders in one continuous RX window.
+Sender identity uses Nordic RADIO logical addresses rather than adding an ID to
+the six-byte state payload.
+
+All configured addresses must share the same four-byte base. Their first byte is
+the independent prefix selected by `RXMATCH`:
+
+```rust
+assert!(phy.configure_state_senders(&[
+    Address([0xE7, 0xE7, 0xE7, 0xE7, 0xE7]), // sender 0
+    Address([0xC3, 0xE7, 0xE7, 0xE7, 0xE7]), // sender 1
+]));
+```
+
+At each CRC-valid END event the callback reads `RXMATCH`, copies the six-byte
+DMA state into that sender's latest-value cell, and increments that sender's
+atomic cumulative packet count. Application context reads a coherent snapshot:
+
+```rust
+let mut state = [0u8; 6];
+let cumulative_count = phy.sender_state(1, &mut state).unwrap();
+```
+
+The two-sender receiver example is built with:
+
+```bash
+cd examples/nrf52840/mpsl
+cargo build --release --no-default-features --features multi-sender
+```
+
+The alternate-prefix sender example is built with:
+
+```bash
+cd examples/nrf54lm20/mpsl
+cargo build --release --no-default-features --features sender-1
+```
+
+A sender-1 hardware smoke test measured:
+
+```text
+sender 0 rate: 0/s
+sender 1 rate: 3333/s
+sender 1 state updated correctly
+```
+
+This validates address demultiplexing but is not a simultaneous two-radio
+throughput test. Multiple active senders on the same channel must use a shared
+compile-time TDMA allocation or another collision-free schedule; unique RADIO
+addresses identify packets but do not prevent overlapping transmissions.
+Current multi-sender RX uses one fixed channel and rejects combination with the
+hopping receiver example.
+
+## 10. Current limitations
 
 - The benchmark payload embeds a state counter, but the protocol itself carries
   no sequence in `OneWayState`.

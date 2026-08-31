@@ -27,6 +27,7 @@ bind_interrupts!(struct Irqs {
 const PAYLOAD: usize = 6;
 const PHASE_ALIGN: bool = cfg!(feature = "phase-align");
 const HOPPING: bool = cfg!(feature = "hopping");
+const SENDER_1: bool = cfg!(feature = "sender-1");
 const FEEDBACK_EVERY: u16 = if HOPPING { 120 } else { 128 };
 type Mode = OneWayState<PAYLOAD, FEEDBACK_EVERY>;
 const PLAN: OneWayMpslPlan =
@@ -84,7 +85,12 @@ async fn main(spawner: Spawner) {
     let mut phy = MpslRadioPhy::<{ DATA_SLOT_US as u32 }, 1400>::new(RadioMode::Nrf2Mbit, state);
     let _ = spawner.spawn(mpsl_task(mpsl).expect("spawn"));
     phy.wait_ready().await;
-    phy.set_address(&Address([0xE7; 5])).await;
+    let address = if SENDER_1 {
+        Address([0xC3, 0xE7, 0xE7, 0xE7, 0xE7])
+    } else {
+        Address([0xE7; 5])
+    };
+    phy.set_address(&address).await;
     phy.set_channel(0).await;
     phy.configure_one_way(
         DATA_SLOT_US,
@@ -110,8 +116,8 @@ async fn main(spawner: Spawner) {
     let mut feedback_seen = false;
     let mut report_at = Instant::now();
     info!(
-        "MPSL ONEWAY TX READY payload=6 data={} feedback={} apply={}",
-        DATA_SLOT_US, FEEDBACK_SLOT_US, apply
+        "MPSL ONEWAY TX READY sender={} payload=6 data={} feedback={} apply={}",
+        SENDER_1 as u8, DATA_SLOT_US, FEEDBACK_SLOT_US, apply
     );
 
     loop {

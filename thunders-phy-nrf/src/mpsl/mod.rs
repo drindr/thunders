@@ -301,6 +301,64 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
         self.collect(slot).await.unwrap_or(0)
     }
 
+    /// Configure up to eight state senders that share the same four-byte base
+    /// address and differ by their first (prefix) byte.
+    pub fn configure_state_senders(&mut self, addresses: &[Address]) -> bool {
+        if addresses.is_empty() || addresses.len() > 8 {
+            return false;
+        }
+        let base = &addresses[0].0[1..];
+        if addresses.iter().any(|address| &address.0[1..] != base) {
+            return false;
+        }
+        let base_raw = u32::from_le_bytes([base[0], base[1], base[2], base[3]]);
+        let mut swapped = 0u32;
+        for i in 0..4 {
+            let byte = ((base_raw >> (i * 8)) & 0xFF) as u8;
+            swapped |= (byte.reverse_bits() as u32) << (i * 8);
+        }
+        let encoded_base = swapped.swap_bytes();
+        let mut prefix0 = 0u32;
+        let mut prefix1 = 0u32;
+        for (index, address) in addresses.iter().enumerate() {
+            let prefix = address.0[0].reverse_bits() as u32;
+            if index < 4 {
+                prefix0 |= prefix << (index * 8);
+            } else {
+                prefix1 |= prefix << ((index - 4) * 8);
+            }
+            self.state.multi_count[index].store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+        self.state.cur_base0 = encoded_base;
+        self.state.cur_base1 = encoded_base;
+        self.state.cur_prefix = prefix0;
+        self.state.cur_prefix1 = prefix1;
+        self.state.rx_addresses = if addresses.len() == 8 {
+            0xFF
+        } else {
+            (1u8 << addresses.len()) - 1
+        };
+        true
+    }
+
+    /// Copy one sender's latest state and return its cumulative packet count.
+    pub fn sender_state(&self, sender: usize, out: &mut [u8; 6]) -> Option<u32> {
+        if sender >= 8 || self.state.rx_addresses & (1 << sender) == 0 {
+            return None;
+        }
+        loop {
+            let before = self.state.multi_count[sender].load(core::sync::atomic::Ordering::Acquire);
+            unsafe {
+                out.copy_from_slice(&(*self.state.multi_latest.get())[sender]);
+            }
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+            let after = self.state.multi_count[sender].load(core::sync::atomic::Ordering::Acquire);
+            if before == after {
+                return Some(after);
+            }
+        }
+    }
+
     /// Publish a TX op for `target`; `grace` allows a first-TX-of-run op
     /// to execute one slot late (it still faces a listening peer).
     fn publish_tx(&mut self, pkt: &[u8], target: u32, grace: u8) -> Result<(), Error<()>> {
@@ -392,7 +450,10 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> Phy for MpslRadioPhy<'d, SLOT_U
             swapped |= (byte.reverse_bits() as u32) << (i * 8);
         }
         self.state.cur_base0 = swapped.swap_bytes();
+        self.state.cur_base1 = self.state.cur_base0;
         self.state.cur_prefix = addr.0[0].reverse_bits() as u32;
+        self.state.cur_prefix1 = 0;
+        self.state.rx_addresses = 0x01;
     }
 
     async fn transmit(&mut self, pkt: &[u8]) -> Result<(), Error<Self::Error>> {

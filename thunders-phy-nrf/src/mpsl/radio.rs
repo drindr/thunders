@@ -209,9 +209,12 @@ unsafe fn radio_configure(state: &MpslState, statlen: u8) {
     r.txpower().write_value(txpower);
 
     r.base0().write_value(state.cur_base0);
+    r.base1().write_value(state.cur_base1);
     r.prefix0().write_value(regs::Prefix0(state.cur_prefix));
+    r.prefix1().write_value(regs::Prefix1(state.cur_prefix1));
     r.txaddress().write_value(regs::Txaddress(0));
-    r.rxaddresses().write_value(regs::Rxaddresses(0x01));
+    r.rxaddresses()
+        .write_value(regs::Rxaddresses(state.rx_addresses as u32));
 }
 
 fn pll_enable(r: Radio) {
@@ -272,6 +275,16 @@ unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
         if crc_ok {
             count += 1;
             state.crc_ok = state.crc_ok.wrapping_add(1);
+            let sender = r.rxmatch().read().rxmatch() as usize;
+            if sender < 8 && state.rx_addresses & (1 << sender) != 0 {
+                core::ptr::copy_nonoverlapping(
+                    latest as *const u8,
+                    (*state.multi_latest.get())[sender].as_mut_ptr(),
+                    6,
+                );
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+                state.multi_count[sender].fetch_add(1, core::sync::atomic::Ordering::Release);
+            }
             if state.one_way_feedback_every > 0 && address_cyc != 0 {
                 if state.one_way_last_address_cyc != 0 {
                     let delta_us =

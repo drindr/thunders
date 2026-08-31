@@ -1,5 +1,6 @@
 //! State shared by the MPSL callback and application context.
 
+use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU32};
 
@@ -98,6 +99,8 @@ pub struct MpslState {
     pub(crate) tx_count: u32,
     pub(crate) crc_ok: u32,
     pub(crate) crc_bad: u32,
+    pub(crate) multi_latest: UnsafeCell<[[u8; 6]; 8]>,
+    pub(crate) multi_count: [AtomicU32; 8],
 
     pub(crate) ops: [OpEntry; 2],
     pub(crate) op_late: u32,
@@ -121,7 +124,10 @@ pub struct MpslState {
     pub(crate) radio_mode: RadioMode,
     pub(crate) cur_channel: u8,
     pub(crate) cur_base0: u32,
+    pub(crate) cur_base1: u32,
     pub(crate) cur_prefix: u32,
+    pub(crate) cur_prefix1: u32,
+    pub(crate) rx_addresses: u8,
 }
 
 impl MpslState {
@@ -159,6 +165,8 @@ impl MpslState {
             tx_count: 0,
             crc_ok: 0,
             crc_bad: 0,
+            multi_latest: UnsafeCell::new([[0; 6]; 8]),
+            multi_count: core::array::from_fn(|_| AtomicU32::new(0)),
             ops: [OpEntry::new(), OpEntry::new()],
             op_late: 0,
             coll_noop: 0,
@@ -179,7 +187,10 @@ impl MpslState {
             radio_mode: RadioMode::Nrf2Mbit,
             cur_channel: 0,
             cur_base0: 0,
+            cur_base1: 0,
             cur_prefix: 0,
+            cur_prefix1: 0,
+            rx_addresses: 0x01,
         }
     }
 }
