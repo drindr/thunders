@@ -183,3 +183,20 @@ All durations and packet-relative reply offsets come from
 `one_way_mpsl_plan::<Mode>()` and compile-time PHY timing constants. The old
 symmetric link, cadence probes, PLL servo, runtime alignment, and their debug
 state have been removed.
+
+### Exclusive bare-PHY baseline
+
+With LM20 transmitting as fast as the current per-packet TXEN/disable path and
+52840 restarting RX for every packet, hardware measured approximately:
+
+```text
+transmitter: 8812 packets/s (113.5us per packet)
+receiver: 4406 packets/s
+invalid: 0
+```
+
+The exact current bare frame occupies 64us on air, so keeping RADIO in TXIDLE
+would have a 15625 packets/s airtime ceiling. Removing the length field with
+fixed STATLEN reduces it to 60us, or 16667 packets/s. The present 50% receiver
+ratio is the deterministic per-packet RX disable/ramp blind interval, not RF
+corruption.
