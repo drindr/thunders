@@ -15,7 +15,7 @@ pub use state::{MpslState, Pkt};
 use embassy_time::Duration;
 use thunders::config::Address;
 use thunders::error::Error;
-use thunders::mode::{AirTiming, LinkMode, SlotOverhead, fixed_slot_plan, round_up_us};
+use thunders::mode::{fixed_slot_plan, round_up_us, AirTiming, LinkMode, SlotOverhead};
 use thunders::phy::Phy;
 
 use crate::radio_phy::RadioMode;
@@ -105,6 +105,10 @@ pub struct MpslStats {
     pub hopping: bool,
     /// Whether the initial hop epoch handshake completed.
     pub hop_locked: bool,
+    /// Receiver side: a recall request is asserted in every feedback beacon.
+    pub recall_active: bool,
+    /// Sender side: this node was recalled into the negotiation phase.
+    pub negotiation: bool,
 }
 
 /// Read cumulative MPSL counters.
@@ -119,6 +123,8 @@ pub fn mpsl_pll_snapshot() -> MpslStats {
             hop_index: state.hop_index,
             hopping: state.one_way_hopping,
             hop_locked: state.hop_locked,
+            recall_active: state.recall_active,
+            negotiation: state.negotiation,
         }
     }
 }
@@ -299,6 +305,30 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
     /// Collect a long state RX grant and return its valid packet count.
     pub async fn collect_state_rx(&mut self, slot: u32) -> usize {
         self.collect(slot).await.unwrap_or(0)
+    }
+
+    /// Recall one sender into the negotiation phase, addressed by the first
+    /// (prefix) byte of its application-level [`Address`]. The request is
+    /// level-triggered: every feedback beacon asserts NEG_REQ with the
+    /// target's on-air prefix until [`Self::release_recall`] clears it. A
+    /// recalled sender stops streaming and echoes a `ConfigFrame` status in
+    /// every forward slot; unmatched senders ignore the request.
+    pub fn recall_sender(&mut self, prefix: u8) {
+        // Address bytes cross the air bit-reversed (see set_address); the
+        // sender compares against its stored on-air prefix.
+        self.state.recall_prefix = prefix.reverse_bits();
+        self.state.recall_active = true;
+    }
+
+    /// Clear the recall request. A recalled sender resumes streaming at the
+    /// next batch boundary; hopping restarts from the rendezvous channel.
+    pub fn release_recall(&mut self) {
+        self.state.recall_active = false;
+    }
+
+    /// True while a recall request is asserted in every feedback beacon.
+    pub fn recall_active(&self) -> bool {
+        self.state.recall_active
     }
 
     /// Configure up to eight state senders that share the same four-byte base

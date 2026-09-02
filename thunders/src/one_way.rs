@@ -7,11 +7,7 @@
 use core::marker::PhantomData;
 use heapless::Vec;
 
-use crate::{
-    config::MAX_PAYLOAD,
-    mode::{LinkMode, LinkModeKind, OneWay},
-    packet::FixedOneWayFrame,
-};
+use crate::{config::MAX_PAYLOAD, mode::LinkMode, packet::FixedOneWayFrame};
 
 /// One-way sender errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,31 +46,47 @@ impl<const GAIN_DIV: i16, const MAX_STEP_US: i16> TimeDiffAligner<GAIN_DIV, MAX_
 }
 
 /// Compile-time fixed-payload sender.
+///
+/// Reliability is a runtime property: while `reliable` is set (the
+/// negotiation phase, or a must-deliver change), the sender retains one
+/// in-flight payload and blocks `send` until feedback confirms it. The wire
+/// format and slot plan do not change.
 pub struct OneWaySender<const PAYLOAD: usize, M: LinkMode> {
     next_seq: u16,
     in_flight_seq: u16,
     in_flight: [u8; PAYLOAD],
     waiting_ack: bool,
+    reliable: bool,
     _mode: PhantomData<M>,
 }
 
 impl<const PAYLOAD: usize, M: LinkMode> OneWaySender<PAYLOAD, M> {
-    /// Create an empty sender.
+    /// Create an empty sender in the unreliable streaming phase.
     pub const fn new() -> Self {
         Self {
             next_seq: 0,
             in_flight_seq: 0,
             in_flight: [0; PAYLOAD],
             waiting_ack: false,
+            reliable: false,
             _mode: PhantomData,
         }
     }
 
+    /// Enter or leave the reliable phase. Leaving the phase keeps a pending
+    /// in-flight payload parked; it can be retransmitted once reliability
+    /// is re-entered and the matching feedback arrives.
+    pub fn set_reliable(&mut self, reliable: bool) {
+        self.reliable = reliable;
+    }
+
+    /// True while the sender retains an unacknowledged payload.
+    pub const fn reliable(&self) -> bool {
+        self.reliable
+    }
+
     fn validate_mode() -> Result<(), OneWaySendError> {
-        if PAYLOAD == M::PAYLOAD_LEN
-            && PAYLOAD <= MAX_PAYLOAD
-            && (!M::RETRANSMIT || M::FEEDBACK_EVERY == 1)
-        {
+        if PAYLOAD == M::PAYLOAD_LEN && PAYLOAD <= MAX_PAYLOAD && M::FEEDBACK_EVERY > 0 {
             Ok(())
         } else {
             Err(OneWaySendError::ModePayloadMismatch)
@@ -94,12 +106,12 @@ impl<const PAYLOAD: usize, M: LinkMode> OneWaySender<PAYLOAD, M> {
     /// Queue and build the next fixed Data frame.
     pub fn send(&mut self, payload: [u8; PAYLOAD]) -> Result<FixedOneWayFrame, OneWaySendError> {
         Self::validate_mode()?;
-        if M::RETRANSMIT && self.waiting_ack {
+        if self.reliable && self.waiting_ack {
             return Err(OneWaySendError::AwaitingAck);
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        if M::RETRANSMIT {
+        if self.reliable {
             self.in_flight_seq = seq;
             self.in_flight = payload;
             self.waiting_ack = true;
@@ -107,11 +119,12 @@ impl<const PAYLOAD: usize, M: LinkMode> OneWaySender<PAYLOAD, M> {
         Ok(Self::frame(seq, &payload))
     }
 
-    /// Consume ACK or TimeDiff feedback.
+    /// Consume reverse feedback. The TimeDiff sequence doubles as the
+    /// cumulative ACK while the sender runs its reliable phase.
     pub fn on_feedback(&mut self, frame: &FixedOneWayFrame) -> Option<FeedbackUpdate> {
         match frame {
-            FixedOneWayFrame::Ack { seq, diff_us } if M::RETRANSMIT => {
-                let acknowledged = self.waiting_ack && *seq == self.in_flight_seq;
+            FixedOneWayFrame::TimeDiff { seq, diff_us } => {
+                let acknowledged = self.reliable && self.waiting_ack && *seq == self.in_flight_seq;
                 if acknowledged {
                     self.waiting_ack = false;
                 }
@@ -120,10 +133,6 @@ impl<const PAYLOAD: usize, M: LinkMode> OneWaySender<PAYLOAD, M> {
                     acknowledged,
                 })
             }
-            FixedOneWayFrame::TimeDiff { diff_us, .. } if !M::RETRANSMIT => Some(FeedbackUpdate {
-                diff_us: *diff_us,
-                acknowledged: false,
-            }),
             _ => None,
         }
     }
@@ -132,11 +141,7 @@ impl<const PAYLOAD: usize, M: LinkMode> OneWaySender<PAYLOAD, M> {
     pub const fn waiting_ack(&self) -> bool {
         self.waiting_ack
     }
-}
 
-impl<const PAYLOAD: usize, const FEEDBACK_EVERY: u16>
-    OneWaySender<PAYLOAD, OneWay<PAYLOAD, true, FEEDBACK_EVERY>>
-{
     /// Rebuild the reliable in-flight frame after a timeout.
     pub fn retransmit(&self) -> Option<FixedOneWayFrame> {
         self.waiting_ack
@@ -186,11 +191,7 @@ impl<const PAYLOAD: usize, M: LinkMode> OneWayReceiver<PAYLOAD, M> {
         frame: &FixedOneWayFrame,
         diff_us: i16,
     ) -> Result<(OneWayReceive<PAYLOAD>, Option<FixedOneWayFrame>), ()> {
-        if PAYLOAD != M::PAYLOAD_LEN
-            || PAYLOAD > MAX_PAYLOAD
-            || M::FEEDBACK_EVERY == 0
-            || (M::RETRANSMIT && M::FEEDBACK_EVERY != 1)
-        {
+        if PAYLOAD != M::PAYLOAD_LEN || PAYLOAD > MAX_PAYLOAD || M::FEEDBACK_EVERY == 0 {
             return Err(());
         }
         let FixedOneWayFrame::Data { seq, payload } = frame else {
@@ -207,18 +208,11 @@ impl<const PAYLOAD: usize, M: LinkMode> OneWayReceiver<PAYLOAD, M> {
         let mut bytes = [0u8; PAYLOAD];
         bytes.copy_from_slice(payload);
         self.since_feedback = self.since_feedback.saturating_add(1);
-        let feedback = if M::RETRANSMIT || self.since_feedback >= M::FEEDBACK_EVERY {
+        let feedback = if self.since_feedback >= M::FEEDBACK_EVERY {
             self.since_feedback = 0;
-            Some(if M::KIND == LinkModeKind::OneWayAck {
-                FixedOneWayFrame::Ack {
-                    seq: self.last_seq,
-                    diff_us,
-                }
-            } else {
-                FixedOneWayFrame::TimeDiff {
-                    seq: self.last_seq,
-                    diff_us,
-                }
+            Some(FixedOneWayFrame::TimeDiff {
+                seq: self.last_seq,
+                diff_us,
             })
         } else {
             None
@@ -243,10 +237,10 @@ impl<const PAYLOAD: usize, M: LinkMode> Default for OneWayReceiver<PAYLOAD, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mode::{OneWayAck, OneWayNoAck};
+    use crate::mode::OneWayState;
 
-    type Ack4 = OneWayAck<4>;
-    type NoAck4 = OneWayNoAck<4, 3>;
+    type Stream4 = OneWayState<4, 1>;
+    type NoAck4 = OneWayState<4, 3>;
 
     #[test]
     fn diff_alignment_is_bounded() {
@@ -258,22 +252,23 @@ mod tests {
     }
 
     #[test]
-    fn reliable_mode_blocks_until_matching_ack() {
-        let mut tx = OneWaySender::<4, Ack4>::new();
-        let mut rx = OneWayReceiver::<4, Ack4>::new();
+    fn reliable_phase_blocks_until_matching_feedback() {
+        let mut tx = OneWaySender::<4, Stream4>::new();
+        let mut rx = OneWayReceiver::<4, Stream4>::new();
+        tx.set_reliable(true);
         let data = tx.send([1, 2, 3, 4]).unwrap();
         assert_eq!(tx.retransmit(), Some(data.clone()));
         assert_eq!(tx.send([5, 6, 7, 8]), Err(OneWaySendError::AwaitingAck));
-        let (received, ack) = rx.receive(&data, -7).unwrap();
+        let (received, feedback) = rx.receive(&data, -7).unwrap();
         assert_eq!(received.payload, [1, 2, 3, 4]);
-        let update = tx.on_feedback(&ack.unwrap()).unwrap();
+        let update = tx.on_feedback(&feedback.unwrap()).unwrap();
         assert!(update.acknowledged);
         assert_eq!(update.diff_us, -7);
         assert!(!tx.waiting_ack());
     }
 
     #[test]
-    fn noack_mode_reports_diff_periodically() {
+    fn streaming_phase_reports_diff_periodically() {
         let mut tx = OneWaySender::<4, NoAck4>::new();
         let mut rx = OneWayReceiver::<4, NoAck4>::new();
         for n in 0..2 {
@@ -285,5 +280,8 @@ mod tests {
             rx.receive(&data, 5).unwrap().1,
             Some(FixedOneWayFrame::TimeDiff { seq: 2, diff_us: 5 })
         );
+        // The streaming sender never blocks and never arms retransmission.
+        assert!(!tx.waiting_ack());
+        assert_eq!(tx.retransmit(), None);
     }
 }

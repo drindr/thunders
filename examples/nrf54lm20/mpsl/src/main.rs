@@ -7,12 +7,12 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
-use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, raw};
+use nrf_mpsl::{raw, MultiprotocolServiceLayer, Peripherals};
 use static_cell::StaticCell;
-use thunders::{Address, AirTiming, OneWayState, SlotOverhead, phy::Phy};
+use thunders::{phy::Phy, Address, AirTiming, OneWayState, SlotOverhead};
 use thunders_phy_nrf::{
+    mpsl::{one_way_mpsl_plan, MpslRadioPhy, MpslState, OneWayMpslPlan},
     RadioMode,
-    mpsl::{MpslRadioPhy, MpslState, OneWayMpslPlan, one_way_mpsl_plan},
 };
 use {defmt_rtt as _, panic_probe as _};
 
@@ -179,6 +179,7 @@ async fn main(spawner: Spawner) {
     let mut sent = 0u32;
     let mut last_hw_tx = thunders_phy_nrf::mpsl::mpsl_pll_snapshot().tx_count;
     let mut feedback_seen = false;
+    let mut negotiation = false;
     let mut report_at = Instant::now();
     info!(
         "MPSL ONEWAY TX READY sender={} payload=6 data={} feedback={} apply={}",
@@ -211,7 +212,15 @@ async fn main(spawner: Spawner) {
         }
         let collected = hw.wrapping_add(1);
         if let Some(feedback_len) = phy.op_collect(collected).await {
-            feedback_seen |= feedback_len == 2;
+            feedback_seen |= feedback_len == 3;
+        }
+        let diag_now = thunders_phy_nrf::mpsl::mpsl_pll_snapshot();
+        if diag_now.negotiation != negotiation {
+            negotiation = diag_now.negotiation;
+            info!(
+                "MPSL ONEWAY TX negotiation={} (recalled={}, echoing ConfigFrame status)",
+                negotiation, negotiation
+            );
         }
         if report_at.elapsed() >= Duration::from_secs(5) {
             let elapsed_us = report_at.elapsed().as_micros().max(1);
@@ -221,7 +230,7 @@ async fn main(spawner: Spawner) {
             let hw_delta = hw_tx.wrapping_sub(last_hw_tx);
             let hw_rate = hw_delta as u64 * 1_000_000 / elapsed_us;
             info!(
-                "MPSL ONEWAY TX published={} publish_rate={}/s hw_tx={} hw_rate={}/s state={} feedback={} hop={} locked={}",
+                "MPSL ONEWAY TX published={} publish_rate={}/s hw_tx={} hw_rate={}/s state={} feedback={} hop={} locked={} neg={}",
                 sent,
                 tx_slot_rate,
                 hw_delta,
@@ -229,7 +238,8 @@ async fn main(spawner: Spawner) {
                 state_counter,
                 feedback_seen,
                 diag.hop_index,
-                diag.hop_locked
+                diag.hop_locked,
+                diag.negotiation
             );
             last_hw_tx = hw_tx;
             sent = 0;

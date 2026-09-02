@@ -1,59 +1,28 @@
 //! Compile-time link modes and fixed-packet timing plans.
 
-/// Extensible link-mode discriminator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum LinkModeKind {
-    /// One forward data stream with reverse reliability feedback.
-    OneWayAck,
-    /// One forward data stream without retransmission; reverse traffic only
-    /// carries periodic clock/phase error.
-    OneWayNoAck,
-}
-
 /// Compile-time behavior required by the fixed-mode link engine.
 pub trait LinkMode {
-    /// Mode discriminator.
-    const KIND: LinkModeKind;
     /// Exact application payload bytes in every data packet.
     const PAYLOAD_LEN: usize;
     /// Number of forward packets between reverse feedback opportunities.
     const FEEDBACK_EVERY: u16;
-    /// Whether failed forward packets are retained for retransmission.
-    const RETRANSMIT: bool;
 }
 
-/// One-way mode family. `ACK` is a compile-time capability, so no-ACK
-/// instantiations do not expose a retransmit API.
-pub struct OneWay<const PAYLOAD: usize, const ACK: bool, const FEEDBACK_EVERY: u16>;
+/// One-way mode family. Reliability is a runtime phase, not a type
+/// parameter: the wire format and timing plan are identical whether the
+/// link currently streams state or has been recalled into the negotiation
+/// phase (see [`crate::negotiation`]).
+pub struct OneWay<const PAYLOAD: usize, const FEEDBACK_EVERY: u16>;
 
-impl<const PAYLOAD: usize, const ACK: bool, const FEEDBACK_EVERY: u16> LinkMode
-    for OneWay<PAYLOAD, ACK, FEEDBACK_EVERY>
-{
-    const KIND: LinkModeKind = if ACK {
-        LinkModeKind::OneWayAck
-    } else {
-        LinkModeKind::OneWayNoAck
-    };
+impl<const PAYLOAD: usize, const FEEDBACK_EVERY: u16> LinkMode for OneWay<PAYLOAD, FEEDBACK_EVERY> {
     const PAYLOAD_LEN: usize = PAYLOAD;
     const FEEDBACK_EVERY: u16 = FEEDBACK_EVERY;
-    const RETRANSMIT: bool = ACK;
 }
 
-/// Reliable one-way stream. The first implementation is stop-and-wait.
-pub type OneWayAck<const PAYLOAD: usize> = OneWay<PAYLOAD, true, 1>;
-
 /// Unreliable one-way state snapshots. Delivery is not guaranteed; periodic
-/// reverse feedback is used only for time alignment.
-pub type OneWayNoAck<const PAYLOAD: usize, const DIFF_EVERY: u16 = 32> =
-    OneWay<PAYLOAD, false, DIFF_EVERY>;
-
-/// Semantic alias for continuously refreshed state where the newest value wins.
+/// reverse feedback carries timing error and the optional addressed recall.
 pub type OneWayState<const PAYLOAD: usize, const DIFF_EVERY: u16 = 32> =
-    OneWayNoAck<PAYLOAD, DIFF_EVERY>;
-
-/// Semantic alias for state changes/events that must be delivered.
-pub type OneWayChanges<const PAYLOAD: usize> = OneWayAck<PAYLOAD>;
+    OneWay<PAYLOAD, DIFF_EVERY>;
 
 /// Radio framing timing used by the const slot planner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,12 +148,9 @@ impl FixedSlotPlan {
     }
 }
 
-/// Reliable state-change Data carries only a two-byte sequence.
-pub const ONE_WAY_ACK_DATA_OVERHEAD: usize = 2;
-/// Reliable feedback carries sequence plus signed timing difference.
-pub const ONE_WAY_ACK_FEEDBACK_LEN: usize = 4;
-/// State snapshots carry no protocol header; timing-only feedback is one i16.
-pub const ONE_WAY_STATE_FEEDBACK_LEN: usize = 2;
+/// Reverse feedback is three bytes on air: one flags byte plus two
+/// phase-dependent bytes (see [`crate::negotiation`]).
+pub const ONE_WAY_FEEDBACK_LEN: usize = 3;
 
 /// Round a compile-time duration upward to a hardware scheduling quantum.
 pub const fn round_up_us(value: u16, quantum: u16) -> u16 {
@@ -202,26 +168,16 @@ pub const fn round_up_us(value: u16, quantum: u16) -> u16 {
 
 /// Build a const timing plan from a mode's associated constants.
 pub const fn fixed_slot_plan<M: LinkMode>(air: AirTiming, overhead: SlotOverhead) -> FixedSlotPlan {
-    let data_overhead = if M::RETRANSMIT {
-        ONE_WAY_ACK_DATA_OVERHEAD
-    } else {
-        0
-    };
-    let feedback_wire = if M::RETRANSMIT {
-        ONE_WAY_ACK_FEEDBACK_LEN
-    } else {
-        ONE_WAY_STATE_FEEDBACK_LEN
-    };
-    let data_wire = M::PAYLOAD_LEN.saturating_add(data_overhead);
+    let data_wire = M::PAYLOAD_LEN;
     FixedSlotPlan {
         data_wire_len: if data_wire > u16::MAX as usize {
             u16::MAX
         } else {
             data_wire as u16
         },
-        feedback_wire_len: feedback_wire as u16,
+        feedback_wire_len: ONE_WAY_FEEDBACK_LEN as u16,
         data_slot_us: overhead.slot_us(air, data_wire),
-        feedback_slot_us: overhead.slot_us(air, feedback_wire),
+        feedback_slot_us: overhead.slot_us(air, ONE_WAY_FEEDBACK_LEN),
         feedback_every: M::FEEDBACK_EVERY,
         receiver_window_us: overhead.slot_us(air, data_wire) as u32 * M::FEEDBACK_EVERY as u32,
     }
@@ -231,32 +187,25 @@ pub const fn fixed_slot_plan<M: LinkMode>(air: AirTiming, overhead: SlotOverhead
 mod tests {
     use super::*;
 
-    type Ack8 = OneWayAck<8>;
-    type Stream32 = OneWayNoAck<32, 16>;
+    type Stream8 = OneWay<8, 1>;
+    type Stream32 = OneWay<32, 16>;
 
     #[test]
     fn two_mbit_plan_is_payload_aware() {
-        const ACK8: FixedSlotPlan =
-            fixed_slot_plan::<Ack8>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
+        const STREAM8: FixedSlotPlan =
+            fixed_slot_plan::<Stream8>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
         const STREAM32: FixedSlotPlan =
             fixed_slot_plan::<Stream32>(AirTiming::NRF_2MBIT, SlotOverhead::MPSL_CONSERVATIVE);
-        assert_eq!(ACK8.data_wire_len, 10);
-        assert_eq!(ACK8.data_slot_us, 316);
-        assert_eq!(ACK8.feedback_slot_us, 292);
-        assert_eq!(ACK8.receiver_window_us, 316);
-        assert_eq!(ACK8.receiver_physical_slots(), 2);
+        assert_eq!(STREAM8.data_wire_len, 8);
+        assert_eq!(STREAM8.data_slot_us, 308);
+        assert_eq!(STREAM8.feedback_wire_len, ONE_WAY_FEEDBACK_LEN as u16);
+        assert_eq!(STREAM8.feedback_slot_us, 288);
+        assert_eq!(STREAM8.receiver_window_us, 308);
+        assert_eq!(STREAM8.receiver_physical_slots(), 2);
         assert_eq!(STREAM32.data_wire_len, 32);
         assert_eq!(STREAM32.data_slot_us, 404);
         assert_eq!(STREAM32.feedback_every, 16);
         assert_eq!(STREAM32.receiver_window_us, 16 * 404);
-        assert_eq!(STREAM32.period_us(), 16 * 404 + 284);
-    }
-
-    #[test]
-    fn ack_and_noack_are_compile_time_distinct() {
-        assert!(Ack8::RETRANSMIT);
-        assert!(!Stream32::RETRANSMIT);
-        assert_eq!(Ack8::KIND, LinkModeKind::OneWayAck);
-        assert_eq!(Stream32::KIND, LinkModeKind::OneWayNoAck);
+        assert_eq!(STREAM32.period_us(), 16 * 404 + 288);
     }
 }

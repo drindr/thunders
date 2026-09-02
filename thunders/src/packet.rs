@@ -4,7 +4,6 @@ use crate::config::MAX_PAYLOAD;
 use heapless::Vec;
 
 const ONE_WAY_DATA: u8 = 0xF0;
-const ONE_WAY_ACK: u8 = 0xF1;
 const ONE_WAY_TIME_DIFF: u8 = 0xF2;
 
 /// Compact fixed-length frame used by compile-time one-way modes.
@@ -18,14 +17,9 @@ pub enum FixedOneWayFrame {
         /// Payload whose length equals the mode's compile-time value.
         payload: Vec<u8, MAX_PAYLOAD>,
     },
-    /// Reverse cumulative ACK plus measured phase error.
-    Ack {
-        /// Highest accepted forward sequence.
-        seq: u16,
-        /// Receiver timing error in microseconds.
-        diff_us: i16,
-    },
-    /// Reverse timing-only feedback for no-ACK streaming mode.
+    /// Reverse feedback: the most recently observed forward sequence plus
+    /// the measured phase error. When the sender runs its reliable phase,
+    /// the sequence doubles as the cumulative ACK.
     TimeDiff {
         /// Most recently observed forward sequence.
         seq: u16,
@@ -47,15 +41,11 @@ impl FixedOneWayFrame {
                 out[3..3 + PAYLOAD].copy_from_slice(payload);
                 Ok(PAYLOAD + 3)
             }
-            Self::Ack { seq, diff_us } | Self::TimeDiff { seq, diff_us } => {
+            Self::TimeDiff { seq, diff_us } => {
                 if out.len() < 5 {
                     return Err(());
                 }
-                out[0] = if matches!(self, Self::Ack { .. }) {
-                    ONE_WAY_ACK
-                } else {
-                    ONE_WAY_TIME_DIFF
-                };
+                out[0] = ONE_WAY_TIME_DIFF;
                 out[1..3].copy_from_slice(&seq.to_le_bytes());
                 out[3..5].copy_from_slice(&diff_us.to_le_bytes());
                 Ok(5)
@@ -75,14 +65,10 @@ impl FixedOneWayFrame {
                 payload.extend_from_slice(&bytes[3..]).map_err(|_| ())?;
                 Ok(Self::Data { seq, payload })
             }
-            ONE_WAY_ACK | ONE_WAY_TIME_DIFF if bytes.len() == 5 => {
+            ONE_WAY_TIME_DIFF if bytes.len() == 5 => {
                 let seq = u16::from_le_bytes([bytes[1], bytes[2]]);
                 let diff_us = i16::from_le_bytes([bytes[3], bytes[4]]);
-                if bytes[0] == ONE_WAY_ACK {
-                    Ok(Self::Ack { seq, diff_us })
-                } else {
-                    Ok(Self::TimeDiff { seq, diff_us })
-                }
+                Ok(Self::TimeDiff { seq, diff_us })
             }
             _ => Err(()),
         }
@@ -103,19 +89,12 @@ mod tests {
         assert_eq!(n, 11);
         assert_eq!(FixedOneWayFrame::decode::<8>(&out[..n]), Ok(data));
 
-        for feedback in [
-            FixedOneWayFrame::Ack {
-                seq: 7,
-                diff_us: -13,
-            },
-            FixedOneWayFrame::TimeDiff {
-                seq: 7,
-                diff_us: 19,
-            },
-        ] {
-            let n = feedback.encode::<8>(&mut out).unwrap();
-            assert_eq!(n, 5);
-            assert_eq!(FixedOneWayFrame::decode::<8>(&out[..n]), Ok(feedback));
-        }
+        let feedback = FixedOneWayFrame::TimeDiff {
+            seq: 7,
+            diff_us: 19,
+        };
+        let n = feedback.encode::<8>(&mut out).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(FixedOneWayFrame::decode::<8>(&out[..n]), Ok(feedback));
     }
 }

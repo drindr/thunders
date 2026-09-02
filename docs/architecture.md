@@ -9,23 +9,26 @@ payload contracts, and bidirectional selective-repeat scheduler were removed.
 The mode family is:
 
 ```rust
-OneWay<PAYLOAD, ACK, FEEDBACK_EVERY>
+OneWay<PAYLOAD, FEEDBACK_EVERY>
 ```
 
-Public aliases:
+Public alias:
 
 ```rust
-OneWayState<PAYLOAD, DIFF_EVERY> // ACK=false; newest state wins
-OneWayChanges<PAYLOAD>           // ACK=true; changes must be delivered
+OneWayState<PAYLOAD, DIFF_EVERY> // newest state wins
 ```
+
+Reliability is a runtime phase rather than a type parameter: the wire format
+and timing plan are identical whether the link streams state or has been
+recalled into the negotiation phase (see `docs/negotiation.md`). The
+`OneWaySender` engine exposes the reliable phase as `set_reliable`, retaining
+one in-flight payload until feedback confirms it.
 
 `OneWayState` does not promise delivery of every snapshot. It is appropriate for
 position, orientation, sensor state, current actuator target, and similar data
-where a newer packet replaces an older packet.
-
-`OneWayChanges` is for commands and transitions that must not disappear. Its
-current engine is stop-and-wait: retain one payload, retransmit until the
-matching ACK, then accept the next change.
+where a newer packet replaces an older packet. Commands and transitions that
+must not disappear travel inside the negotiation phase, where the receiver can
+recall the sender over the feedback channel.
 
 ## 2. Current hardware test configuration
 
@@ -90,16 +93,20 @@ total              60 us
 
 There is no transmitted length, marker, or protocol sequence.
 
-### 3.2 TimeDiff feedback packet
+### 3.2 Feedback packet
 
-When enabled, reverse feedback is exactly:
+Reverse feedback is fixed at three bytes:
 
 ```text
-i16 diff_us, little-endian
+byte 0:    flags (bit0 = NEG_REQ, the addressed recall request)
+byte 1..2: NEG_REQ clear -> i16 diff_us, little-endian
+           NEG_REQ set   -> byte 1 = target sender on-air prefix, byte 2 = 0
 ```
 
-Its fixed `STATLEN` is two bytes. Complete on-air duration is approximately
-44 us with the same preamble/address/CRC configuration.
+Its fixed `STATLEN` is three bytes. Complete on-air duration is approximately
+48 us with the same preamble/address/CRC configuration. The compile-time
+feedback event was already floored at data+10 us (310 us), so the wider
+beacon does not change the schedule.
 
 ### 3.3 Bare exclusive packet
 
@@ -501,12 +508,27 @@ division at compile time. Roles use separate binaries instead of Cargo features:
 The measured stable 190 us schedule publishes about 5.2k packets/s per sender;
 the LM20 receives roughly 5.2k/s from sender 0 and 4.8k/s from sender 1.
 
-## 10. Current limitations
+## 10. Addressed recall and the negotiation phase
+
+The receiver can recall one sender into a reliable negotiation phase by
+asserting `NEG_REQ` plus the target's on-air address prefix in every feedback
+beacon (level-triggered). A recalled sender stops streaming application data
+and echoes a six-byte `ConfigFrame` status in every forward slot until the
+beacon clears the flag. Both peers switch phase at the batch boundary that
+already synchronizes hopping, so the slot grid never changes; under hopping,
+the recall pins both peers to the rendezvous channel.
+
+The full design — beacon format, handshake, quality guarantees, and the
+planned power/frequency command loop — lives in `docs/negotiation.md`.
+
+## 11. Current limitations
 
 - The benchmark payload embeds a state counter, but the protocol itself carries
   no sequence in `OneWayState`.
-- TimeDiff is currently transported and used as the batch/hop synchronization
-  boundary; a full long-term oscillator-frequency servo remains a future
-  refinement.
-- `OneWayChanges` has a core stop-and-wait engine but does not yet have the same
-  optimized MPSL/bare hardware examples as `OneWayState`.
+- The MPSL fast path transports the beacon but currently fills the timing
+  bytes with zero; a full long-term oscillator-frequency servo remains a
+  future refinement.
+- The negotiation command loop (TX power / frequency adjustment) is designed
+  but not yet implemented; only the addressed recall + echo loop exists.
+- The bare PHY path and the free-running multi-sender benchmark senders do
+  not yet listen to feedback, so recall is unavailable there.

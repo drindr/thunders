@@ -2,6 +2,7 @@
 
 use nrf_pac::radio::regs;
 use nrf_pac::radio::vals;
+use thunders::negotiation::{ConfigFrame, FeedbackBeacon};
 
 use super::state::{MpslState, OpKind};
 
@@ -318,8 +319,14 @@ unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
                 r.tasks_disable().write_value(1);
                 disable_wait(r);
                 delay_us(wait / CPU_MHZ);
-                let feedback = [0u8; 2];
-                radio_configure(state, 2);
+                let feedback = if state.recall_active {
+                    // Level-triggered addressed recall: asserted in every
+                    // beacon until the target sender's echo is observed.
+                    FeedbackBeacon::recall(state.recall_prefix).encode()
+                } else {
+                    FeedbackBeacon::time_diff(0).encode()
+                };
+                radio_configure(state, 3);
                 r.packetptr().write_value(feedback.as_ptr() as u32);
                 r.shorts().write_value(shorts_tx());
                 r.events_end().write_value(0);
@@ -359,9 +366,18 @@ unsafe fn receive_state(state: &mut MpslState, ei: usize, slot_start_cyc: u32) {
     r.tasks_disable().write_value(1);
     disable_wait(r);
     if sync_feedback_sent && state.one_way_hopping {
-        hop_next(state);
-        state.hop_pending = true;
-        state.hop_locked = true;
+        if state.recall_active {
+            // Pin the rendezvous channel while a recall is in flight; the
+            // recalled sender pins the same channel when it sees NEG_REQ.
+            state.hop_index = 0;
+            state.cur_channel = HOP_SEQUENCE[0];
+            state.hop_pending = false;
+            state.hop_locked = true;
+        } else {
+            hop_next(state);
+            state.hop_pending = true;
+            state.hop_locked = true;
+        }
     }
     if state.one_way_hopping && count == 0 {
         hop_reset(state);
@@ -384,7 +400,7 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, exec: Option<usize>) {
     };
     let statlen = match kind {
         x if x == OpKind::Tx as u8 => state.ops[exec.unwrap_or(0)].tx_buf[0],
-        x if x == OpKind::Rx as u8 => 2,
+        x if x == OpKind::Rx as u8 => 3,
         x if x == OpKind::RxState as u8 => 6,
         _ => 6,
     };
@@ -392,7 +408,24 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, exec: Option<usize>) {
     match kind {
         x if x == OpKind::Tx as u8 => {
             let ei = exec.unwrap_or(0);
+            // A recalled sender stops streaming application data: every
+            // forward slot carries a ConfigFrame status echo instead.
+            let echo = if state.negotiation {
+                let frame = ConfigFrame::echo(
+                    state.neg_cfg_seq,
+                    (state.cur_prefix & 0xFF) as u8,
+                    state.cur_channel,
+                );
+                state.neg_cfg_seq = state.neg_cfg_seq.wrapping_add(1);
+                Some(frame.encode())
+            } else {
+                None
+            };
             let buf: &mut [u8] = &mut state.ops[ei].tx_buf;
+            if let Some(encoded) = echo {
+                buf[0] = encoded.len() as u8;
+                buf[1..1 + encoded.len()].copy_from_slice(&encoded);
+            }
             r.packetptr().write_value(buf.as_ptr().add(1) as u32);
             state.tx_count = state.tx_count.wrapping_add(1);
             pll_enable(r);
@@ -445,10 +478,28 @@ pub unsafe fn timeslot_do_work(state: &mut MpslState, exec: Option<usize>) {
             disable_wait(r);
             if got_end && crc_ok {
                 state.crc_ok = state.crc_ok.wrapping_add(1);
-                hop_next(state);
-                state.hop_locked = true;
-                state.ops[ei].rx_ok = rx_cap >= 2;
-                state.ops[ei].rx_result = 2;
+                if rx_cap >= 3 {
+                    // Level-triggered recall: the negotiation phase lasts
+                    // exactly as long as the beacon asserts NEG_REQ with
+                    // this sender's own on-air prefix.
+                    let own_prefix = (state.cur_prefix & 0xFF) as u8;
+                    let target =
+                        FeedbackBeacon::decode(&buf[..3]).and_then(|beacon| beacon.recall_target());
+                    state.negotiation = target == Some(own_prefix);
+                }
+                if state.negotiation {
+                    // Pin the rendezvous channel; hopping resumes from the
+                    // epoch boundary once the receiver releases the recall.
+                    state.hop_index = 0;
+                    state.cur_channel = HOP_SEQUENCE[0];
+                    state.hop_pending = false;
+                    state.hop_locked = true;
+                } else {
+                    hop_next(state);
+                    state.hop_locked = true;
+                }
+                state.ops[ei].rx_ok = rx_cap >= 3;
+                state.ops[ei].rx_result = 3;
             } else {
                 if got_end {
                     state.crc_bad = state.crc_bad.wrapping_add(1);

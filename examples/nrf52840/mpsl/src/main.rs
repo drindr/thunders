@@ -7,12 +7,12 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
-use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, raw};
+use nrf_mpsl::{raw, MultiprotocolServiceLayer, Peripherals};
 use static_cell::StaticCell;
-use thunders::{Address, AirTiming, OneWayState, SlotOverhead, phy::Phy};
+use thunders::{negotiation::ConfigFrame, phy::Phy, Address, AirTiming, OneWayState, SlotOverhead};
 use thunders_phy_nrf::{
+    mpsl::{one_way_mpsl_plan, MpslRadioPhy, MpslState, OneWayMpslPlan},
     RadioMode,
-    mpsl::{MpslRadioPhy, MpslState, OneWayMpslPlan, one_way_mpsl_plan},
 };
 use {defmt_rtt as _, panic_probe as _};
 
@@ -155,6 +155,17 @@ async fn main(spawner: Spawner) {
     let mut last_sender_counts = [0u32; 2];
     let mut report_at = Instant::now();
 
+    // Addressed recall demo (single-sender phase-align builds only): first
+    // assert a recall for a foreign prefix (the sender must ignore it),
+    // then recall the actual sender, hold after its echo, and release.
+    // 0 = baseline, 1 = foreign recall, 2 = addressed recall,
+    // 3 = hold after echo, 4 = released (terminal).
+    let mut demo: u8 = if PHASE_ALIGN && !MULTI_SENDER { 0 } else { 4 };
+    let mut demo_at = Instant::now();
+    let mut echo_seen = false;
+    let mut echo_prefix = 0u8;
+    let mut echo_channel = 0u8;
+
     info!(
         "MPSL ONEWAY RX READY payload=6 window={} feedback={} apply={}",
         RX_WINDOW_US, FEEDBACK_SLOT_US, apply
@@ -172,6 +183,10 @@ async fn main(spawner: Spawner) {
                 if latest[0] == b'S' && latest[1] == b'T' {
                     last_state = u32::from_le_bytes([latest[2], latest[3], latest[4], latest[5]]);
                     received = received.wrapping_add(count as u32);
+                } else if let Some(frame) = ConfigFrame::decode(latest) {
+                    echo_seen = true;
+                    echo_prefix = frame.value[0];
+                    echo_channel = frame.value[1];
                 } else {
                     invalid = invalid.wrapping_add(count as u32);
                 }
@@ -182,6 +197,45 @@ async fn main(spawner: Spawner) {
         phy.publish_state_rx(latest, target);
         collected = collected.wrapping_add(1);
 
+        match demo {
+            0 if demo_at.elapsed() >= Duration::from_secs(15) => {
+                phy.recall_sender(0xC3);
+                info!("RECALL DEMO foreign prefix 0xC3 asserted (sender must ignore)");
+                demo = 1;
+                demo_at = Instant::now();
+            }
+            1 if demo_at.elapsed() >= Duration::from_secs(10) => {
+                phy.recall_sender(0xE7);
+                echo_seen = false;
+                info!("RECALL DEMO addressed recall prefix 0xE7");
+                demo = 2;
+                demo_at = Instant::now();
+            }
+            2 if echo_seen => {
+                info!(
+                    "RECALL DEMO echo confirmed prefix={} channel={} after {}ms",
+                    echo_prefix,
+                    echo_channel,
+                    demo_at.elapsed().as_millis()
+                );
+                demo = 3;
+                demo_at = Instant::now();
+            }
+            2 if demo_at.elapsed() >= Duration::from_secs(30) => {
+                info!("RECALL FAILED no echo within 30 s; releasing recall");
+                phy.release_recall();
+                demo = 4;
+                demo_at = Instant::now();
+            }
+            3 if demo_at.elapsed() >= Duration::from_secs(5) => {
+                phy.release_recall();
+                info!("RECALL DEMO released; sender resumes streaming");
+                demo = 4;
+                demo_at = Instant::now();
+            }
+            _ => {}
+        }
+
         if report_at.elapsed() >= Duration::from_secs(5) {
             let elapsed_us = report_at.elapsed().as_micros().max(1);
             let rx_slot_rate = rx_slots as u64 * 1_000_000 / elapsed_us;
@@ -191,7 +245,7 @@ async fn main(spawner: Spawner) {
             let crc_ok = diag.crc_ok.wrapping_sub(last_crc_ok);
             let crc_bad = diag.crc_bad.wrapping_sub(last_crc_bad);
             info!(
-                "MPSL ONEWAY RX slots={} slot_rate={}/s frames={} frame_rate={}/s addr={} crcok={} crcbad={} invalid={} state={} hop={} locked={}",
+                "MPSL ONEWAY RX slots={} slot_rate={}/s frames={} frame_rate={}/s addr={} crcok={} crcbad={} invalid={} state={} hop={} locked={} recall={} echo={}",
                 rx_slots,
                 rx_slot_rate,
                 received,
@@ -202,7 +256,9 @@ async fn main(spawner: Spawner) {
                 invalid,
                 last_state,
                 diag.hop_index,
-                diag.hop_locked
+                diag.hop_locked,
+                diag.recall_active,
+                echo_seen
             );
             if MULTI_SENDER {
                 let mut sender0 = [0u8; PAYLOAD];

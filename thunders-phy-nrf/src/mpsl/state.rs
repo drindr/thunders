@@ -80,6 +80,15 @@ pub struct MpslState {
     pub(crate) hop_pending: bool,
     pub(crate) hop_locked: bool,
 
+    /// Receiver side: assert NEG_REQ in every feedback beacon, addressed to
+    /// `recall_prefix` (on-air, bit-reversed form).
+    pub(crate) recall_active: bool,
+    pub(crate) recall_prefix: u8,
+    /// Sender side: a matched recall moved this node into the negotiation
+    /// phase; forward slots carry ConfigFrame echoes instead of app data.
+    pub(crate) negotiation: bool,
+    pub(crate) neg_cfg_seq: u8,
+
     pub(crate) active_profile_short_us: u32,
     pub(crate) active_profile_long_us: u32,
     pub(crate) active_profile_period: u32,
@@ -148,6 +157,10 @@ impl MpslState {
             hop_index: 0,
             hop_pending: false,
             hop_locked: false,
+            recall_active: false,
+            recall_prefix: 0,
+            negotiation: false,
+            neg_cfg_seq: 0,
             active_profile_short_us: 0,
             active_profile_long_us: 0,
             active_profile_period: 0,
