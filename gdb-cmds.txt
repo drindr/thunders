@@ -1,9 +1,0 @@
-set pagination off
-set mi-async on
-target remote 127.0.0.1:3333
-continue &
-python import time; time.sleep(6)
-info registers r0 r4 pc lr
-x/24xw 0x20000740
-x/32xw 0x20000240
-quit

@@ -96,7 +96,7 @@ probe-rs run --chip nRF52840_xxAA --probe "0d28:0204-3:0700..." \
 # sender: nRF54LM20 (J-Link; auto-detect fails, --chip is required)
 cd examples/nrf54lm20/mpsl
 cargo build --release --no-default-features --features phase-align
-probe-rs run --chip nRF54LM20A --probe 1366:1069 \
+probe-rs run --verify --chip nRF54LM20A --probe 1366:1069 \
   target/thumbv8m.main-none-eabihf/release/thunders-mpsl
 ```
 
@@ -120,17 +120,20 @@ nRF5340 net core is debug-locked: every flash needs `--allow-erase-all`.
   required on silicon (0-length PDUs / no RX otherwise).
 - **Errata 54L/49**: the first on-air payload bits need a hidden register
   (0x5008C58C) set.
-- **Post-flash boot faults (unresolved)**: a boot immediately after a *real*
-  flash (different image written) sometimes faults during MPSL/app init —
-  mixed signatures: blob assert, null-pointer call (`pc=0x0`), precise bus
-  fault at address 0, bogus index. Plain resets and same-image reflashes are
-  always clean, so this is a probe-rs flash-algo ↔ RRAM interaction, not
-  application code; a suspect is the RRAMC write buffer surviving reset and
-  merging stale data into fetches of freshly written wordlines until it
-  auto-commits (boot delays reduce but do not eliminate it). Workaround:
-  reflash or reset and retry. Removing dead code shifts the boot timing and
-  can make this nearly deterministic — that is why a legacy bare-scheduler
-  excision in `thunders-phy-nrf` was reverted. Both LM20 examples install a
+- **Post-flash boot faults = corrupted flash content**: a boot right after a
+  *real* flash (different image written) used to fault semi-randomly during
+  MPSL/app init — blob assert, null-pointer call, precise bus fault at
+  address 0, bogus index. Root cause found by diffing RRAM against the ELF
+  after a failed boot: probe-rs's nRF54LM20 flash algorithm occasionally
+  leaves stale words behind (observed pattern: the word at page+0x004 in a
+  few 4 KiB pages keeps the previous image's content). The CPU then executes
+  corrupted instructions; which addresses are bad — and whether they sit on
+  the boot path — decides the signature, which is why removing dead code
+  ("layout-sensitive landmine") could make it deterministic. Plain resets
+  and same-image reflashes are clean because the content is already
+  correct. **Always flash the LM20 with `--verify`** (read-back compare);
+  on `Flash content verification failed` just retry — the reflash rewrites
+  the bad words and the next boot is clean. Both LM20 examples install a
   precise HardFault handler (CFSR/HFSR/BFAR, stacked PC/R0/LR, fault-context
   and peripheral-register dump over defmt) so any recurrence is diagnosable.
 
