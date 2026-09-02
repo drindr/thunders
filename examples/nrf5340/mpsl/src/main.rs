@@ -7,12 +7,12 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
-use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, raw};
+use nrf_mpsl::{raw, MultiprotocolServiceLayer, Peripherals};
 use static_cell::StaticCell;
-use thunders::{Address, AirTiming, OneWayState, SlotOverhead, phy::Phy};
+use thunders::{phy::Phy, Address, AirTiming, OneWayState, SlotOverhead};
 use thunders_phy_nrf::{
+    mpsl::{one_way_mpsl_plan, MpslRadioPhy, MpslState, OneWayMpslPlan},
     RadioMode,
-    mpsl::{MpslRadioPhy, MpslState, OneWayMpslPlan, one_way_mpsl_plan},
 };
 use {defmt_rtt as _, panic_probe as _};
 

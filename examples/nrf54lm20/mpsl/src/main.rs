@@ -254,3 +254,26 @@ async fn main(spawner: Spawner) {
 fn _defmt_timestamp() -> u64 {
     0
 }
+
+/// Precise HardFault dump: this board intermittently escalates a UsageFault
+/// during exception entry and the MPSL blob can assert at boot in a
+/// layout-sensitive way; capture CFSR/BFAR and the stacked PC/registers
+/// instead of the opaque default trampoline.
+#[cortex_m_rt::exception]
+unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    let cfsr = unsafe { (0xE000_ED28 as *const u32).read_volatile() };
+    let hfsr = unsafe { (0xE000_ED2C as *const u32).read_volatile() };
+    let bfar = unsafe { (0xE000_ED38 as *const u32).read_volatile() };
+    defmt::error!(
+        "HARDFAULT cfsr={=u32:08x} hfsr={=u32:08x} bfar={=u32:08x} pc={=u32:08x} r0={=u32:08x} lr={=u32:08x}",
+        cfsr,
+        hfsr,
+        bfar,
+        frame.pc(),
+        frame.r0(),
+        frame.lr()
+    );
+    loop {
+        cortex_m::asm::wfi();
+    }
+}

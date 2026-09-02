@@ -1,8 +1,8 @@
 //! Minimal MPSL callback for compile-time one-way schedules.
 
-use super::STATE;
 use super::radio;
 use super::state::{MpslState, OpKind};
+use super::STATE;
 use core::sync::atomic::Ordering;
 
 #[inline(always)]

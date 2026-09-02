@@ -7,7 +7,7 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_time::{Duration, Instant};
-use thunders::{Address, AirTiming, OneWayState, SlotOverhead, fixed_slot_plan, phy::Phy};
+use thunders::{fixed_slot_plan, phy::Phy, Address, AirTiming, OneWayState, SlotOverhead};
 use thunders_phy_nrf::{NrfRadioPhy, RadioIrqHandler, RadioMode};
 use {defmt_rtt as _, panic_probe as _};
 

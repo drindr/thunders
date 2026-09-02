@@ -4,7 +4,7 @@ members = [
     "thunders-phy-nrf",
     "examples/*",
 ]
-exclude = ["examples/nrf5340-net", "examples/nrf5340", "examples/nrf54lm20", "examples/nrf52840", "examples/nrf5340-app"]
+exclude = ["examples/nrf5340", "examples/nrf54lm20", "examples/nrf52840"]
 resolver = "2"
 
 [workspace.dependencies]
