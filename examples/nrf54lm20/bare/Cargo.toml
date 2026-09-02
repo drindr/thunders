@@ -25,6 +25,10 @@ hopping = []
 name = "thunders-bare"
 path = "src/main.rs"
 
+[[bin]]
+name = "tdma-receiver"
+path = "src/bin/tdma_receiver.rs"
+
 [patch.crates-io]
 embassy-nrf = { path = "../../../../embassy-nrf54/embassy-nrf" }
 embassy-time-driver = { path = "../../../../embassy-nrf54/embassy-time-driver" }

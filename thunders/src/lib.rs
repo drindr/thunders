@@ -13,6 +13,7 @@ pub mod mode;
 pub mod one_way;
 pub mod packet;
 pub mod phy;
+pub mod tdma;
 
 pub use config::{Address, MAX_PAYLOAD};
 pub use error::Error;
@@ -25,3 +26,4 @@ pub use one_way::{
 };
 pub use packet::FixedOneWayFrame;
 pub use phy::{Phy, RxTiming};
+pub use tdma::{StaticTdma, TdmaNode};

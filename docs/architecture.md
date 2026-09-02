@@ -476,6 +476,31 @@ still collide, and the 52840 transmitter's actual MPSL publication rate in this
 configuration is 1384/s rather than the nominal 1666/s. These measurements are
 for the current asynchronous divisor schedule, not synchronized TDMA.
 
+### Bare const-generic TDMA
+
+`examples/tdma_config.rs` holds one shared compile-time schedule:
+
+```rust
+pub const SENDERS: usize = 2;
+pub const SCHEDULE: StaticTdma<SENDERS, 190, 100> = StaticTdma::new([
+    Address([0xE7; 5]),
+    Address([0xC3, 0xE7, 0xE7, 0xE7, 0xE7]),
+]);
+let sender = SCHEDULE.sender::<1>();
+```
+
+`StaticTdma` validates the sender count, logical addresses, node index, and frame
+division at compile time. Roles use separate binaries instead of Cargo features:
+
+```bash
+(cd examples/nrf52840/bare && cargo build --release --bin tdma-sender)
+(cd examples/nrf5340/bare && cargo build --release --bin tdma-sender)
+(cd examples/nrf54lm20/bare && cargo build --release --bin tdma-receiver)
+```
+
+The measured stable 190 us schedule publishes about 5.2k packets/s per sender;
+the LM20 receives roughly 5.2k/s from sender 0 and 4.8k/s from sender 1.
+
 ## 10. Current limitations
 
 - The benchmark payload embeds a state counter, but the protocol itself carries

@@ -360,6 +360,26 @@ impl<'d> NrfRadioPhy<'d> {
         r.power().write(|w| w.set_power(false));
         r.power().write(|w| w.set_power(true));
 
+        // nRF5340 anomaly 158: powering RADIO clears factory analog trims.
+        // Reapply every FICR trim entry targeting the RADIO register block.
+        #[cfg(feature = "nrf5340-net")]
+        {
+            for index in 0..32 {
+                let trim = nrf_pac::FICR_NS.trimcnf(index);
+                let address = trim.addr().read();
+                if address & 0xFFFF_F000 == r.as_ptr() as u32 {
+                    unsafe { (address as *mut u32).write_volatile(trim.data().read()) };
+                }
+            }
+
+            // The nRF5340 high-voltage RADIO supply adds 3 dB to the
+            // TXPOWER=0 dBm setting, yielding the chip's +3 dBm maximum.
+            nrf_pac::VREQCTRL_NS
+                .vregradio()
+                .vreqh()
+                .modify(|w| w.set_vreqh(true));
+        }
+
         let (mode_val, plen) = match mode {
             RadioMode::Nrf1Mbit => (Mode::Nrf1mbit, Plen::_8bit),
             // Nordic ESB uses a 16-bit preamble at 2 Mbps (2 Mbit sync needs it).
@@ -369,6 +389,16 @@ impl<'d> NrfRadioPhy<'d> {
         };
 
         r.mode().write(|w| w.set_mode(mode_val));
+        // nRF5340 anomaly 117: changing MODE requires updating the hidden
+        // modulation configuration register from FICR.
+        #[cfg(feature = "nrf5340-net")]
+        unsafe {
+            let source = match mode {
+                RadioMode::Nrf2Mbit | RadioMode::Ble2Mbit => 0x01FF_0084 as *const u32,
+                _ => 0x01FF_0080 as *const u32,
+            };
+            (0x4100_8588 as *mut u32).write_volatile(source.read_volatile());
+        }
         // Fast ramp (40 us, not the 129 us Legacy): both the slot scheduler's
         // TX/RX offset assumptions and the tight RX window depend on it.
         r.modecnf0().modify(|w| w.set_ru(Ru::Fast));
@@ -422,8 +452,8 @@ impl<'d> NrfRadioPhy<'d> {
             w.set_whiteen(whiteen);
         });
 
-        // Board TX power ceiling: the 52840 runs +8 dBm; the 5340 net core
-        // stays at its 0 dBm maximum.
+        // Board TX power ceiling: the 52840 runs +8 dBm; the nRF5340 net
+        // core uses TXPOWER=0 dBm plus the +3 dB high-voltage gain path.
         #[cfg(feature = "nrf52840")]
         r.txpower().write(|w| w.set_txpower(Txpower::Pos8dBm));
         #[cfg(feature = "nrf5340-net")]
@@ -987,19 +1017,35 @@ impl<'d> NrfRadioPhy<'d> {
     }
 
     fn configure_fixed_len(&mut self, len: u8) {
-        self.r.pcnf0().modify(|w| {
+        self.r.pcnf0().write(|w| {
             w.set_lflen(0);
             w.set_s0len(false);
             w.set_s1len(0);
-            w.set_plen(Plen::_8bit);
+            w.set_s1incl(S1incl::Automatic);
+            w.set_cilen(0);
+            w.set_plen(Plen::_16bit);
+            w.set_crcinc(Crcinc::Exclude);
+            w.set_termlen(0);
         });
-        self.r.pcnf1().modify(|w| {
+        self.r.pcnf1().write(|w| {
             w.set_maxlen(len);
             w.set_statlen(len);
+            w.set_balen(4);
+            w.set_endian(Endian::Big);
+            w.set_whiteen(false);
         });
+        self.r.crccnf().write(|w| {
+            w.set_len(Len::Two);
+            w.set_skipaddr(Skipaddr::Include);
+        });
+        self.r.crcpoly().write(|w| w.set_crcpoly(0x11021));
+        self.r.crcinit().write(|w| w.set_crcinit(0xFFFF));
     }
 
-    /// Start exclusive fixed-state TX and leave RADIO in TXIDLE.
+    /// Transmit one fixed-state packet.
+    ///
+    /// nRF52/53 disables RADIO at END so TXIDLE cannot emit a continuous
+    /// carrier between TDMA packets. nRF54 keeps TXIDLE for its streaming path.
     pub fn state_tx_begin(&mut self, state: &[u8; 6]) {
         self.disable();
         #[cfg(feature = "_nrf54")]
@@ -1007,10 +1053,14 @@ impl<'d> NrfRadioPhy<'d> {
         self.configure_fixed_len(6);
         let tx_buf = unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) };
         tx_buf[..6].copy_from_slice(state);
+        compiler_fence(Ordering::Release);
         self.set_packet_ptr(tx_buf.as_ptr());
         self.r.shorts().write(|w| {
             #[cfg(not(feature = "_nrf54"))]
-            w.set_txready_start(true);
+            {
+                w.set_txready_start(true);
+                w.set_end_disable(true);
+            }
             #[cfg(feature = "_nrf54")]
             w.set_ready_start(true);
         });
@@ -1019,10 +1069,16 @@ impl<'d> NrfRadioPhy<'d> {
         self.r.tasks_txen().write_value(1);
         while !self.rx_end_set() {}
         self.rx_end_clear();
+        #[cfg(not(feature = "_nrf54"))]
+        while self.state() != State::Disabled {}
     }
 
-    /// Transmit the next state without DISABLE, PLL or TXEN ramp.
+    /// Transmit the next state, re-enabling RADIO when it is not in TXIDLE.
     pub fn state_tx_send(&mut self, state: &[u8; 6]) {
+        if self.state() != State::TxIdle {
+            self.state_tx_begin(state);
+            return;
+        }
         let tx_buf = unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) };
         tx_buf[..6].copy_from_slice(state);
         compiler_fence(Ordering::Release);
@@ -1054,12 +1110,12 @@ impl<'d> NrfRadioPhy<'d> {
         while self.r.events_ready().read() == 0 {}
     }
 
-    /// Receive the next state with a bounded wait and immediately re-arm.
-    pub fn state_rx_next_timeout(
+    /// Receive the next state with sender identity and a bounded wait.
+    pub fn state_rx_next_from_timeout(
         &mut self,
         state: &mut [u8; 6],
         timeout_us: u32,
-    ) -> Option<(bool, u32)> {
+    ) -> Option<(bool, u32, u8)> {
         let start = dwt_cycles();
         while !self.rx_end_set() {
             if dwt_cycles().wrapping_sub(start) >= timeout_us * CPU_MHZ {
@@ -1069,6 +1125,7 @@ impl<'d> NrfRadioPhy<'d> {
         let stamp = dwt_cycles();
         compiler_fence(Ordering::Acquire);
         let crc_ok = self.r.crcstatus().read().0 & 1 == 1;
+        let sender = self.r.rxmatch().read().rxmatch();
         if crc_ok {
             let rx_ptr = core::ptr::addr_of!(RX_BUF) as *const u8;
             unsafe { core::ptr::copy_nonoverlapping(rx_ptr, state.as_mut_ptr(), 6) };
@@ -1076,7 +1133,17 @@ impl<'d> NrfRadioPhy<'d> {
         self.rx_end_clear();
         self.r.events_address().write_value(0);
         self.r.tasks_start().write_value(1);
-        Some((crc_ok, stamp))
+        Some((crc_ok, stamp, sender))
+    }
+
+    /// Receive the next state with a bounded wait.
+    pub fn state_rx_next_timeout(
+        &mut self,
+        state: &mut [u8; 6],
+        timeout_us: u32,
+    ) -> Option<(bool, u32)> {
+        self.state_rx_next_from_timeout(state, timeout_us)
+            .map(|(crc_ok, stamp, _)| (crc_ok, stamp))
     }
 
     /// Receive the next state without a timeout.
@@ -1167,6 +1234,61 @@ impl<'d> NrfRadioPhy<'d> {
             w.set_frequency(freq);
             w.set_map(false);
         });
+    }
+
+    /// Configure up to eight fixed-state logical addresses with one shared base.
+    pub fn state_configure_senders(&mut self, addresses: &[Address]) -> bool {
+        if addresses.is_empty() || addresses.len() > 8 {
+            return false;
+        }
+        let base_bytes = &addresses[0].0[1..];
+        if addresses
+            .iter()
+            .any(|address| &address.0[1..] != base_bytes)
+        {
+            return false;
+        }
+        self.disable();
+        let base_raw =
+            u32::from_le_bytes([base_bytes[0], base_bytes[1], base_bytes[2], base_bytes[3]]);
+        let base = Self::bytewise_bit_swap(base_raw).swap_bytes();
+        let mut prefix0 = 0u32;
+        let mut prefix1 = 0u32;
+        for (index, address) in addresses.iter().enumerate() {
+            let prefix = address.0[0].reverse_bits() as u32;
+            if index < 4 {
+                prefix0 |= prefix << (index * 8);
+            } else {
+                prefix1 |= prefix << ((index - 4) * 8);
+            }
+        }
+        self.r.base0().write_value(base);
+        self.r.base1().write_value(base);
+        self.r
+            .prefix0()
+            .write_value(nrf_pac::radio::regs::Prefix0(prefix0));
+        self.r
+            .prefix1()
+            .write_value(nrf_pac::radio::regs::Prefix1(prefix1));
+        let mask = if addresses.len() == 8 {
+            0xFF
+        } else {
+            (1u32 << addresses.len()) - 1
+        };
+        self.r
+            .rxaddresses()
+            .write_value(nrf_pac::radio::regs::Rxaddresses(mask));
+        true
+    }
+
+    /// Current DWT cycle counter used by raw-TDMA examples.
+    pub fn state_cycles(&self) -> u32 {
+        dwt_cycles()
+    }
+
+    /// Busy-wait until an absolute DWT cycle target.
+    pub fn state_wait_until(&self, target: u32) {
+        while (target.wrapping_sub(dwt_cycles()) as i32) > 0 {}
     }
 }
 
