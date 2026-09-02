@@ -217,10 +217,11 @@ async fn main(spawner: Spawner) {
         let diag_now = thunders_phy_nrf::mpsl::mpsl_pll_snapshot();
         if diag_now.negotiation != negotiation {
             negotiation = diag_now.negotiation;
-            info!(
-                "MPSL ONEWAY TX negotiation={} (recalled={}, echoing ConfigFrame status)",
-                negotiation, negotiation
-            );
+            if negotiation {
+                info!("MPSL ONEWAY TX recalled into negotiation; echoing ConfigFrame status");
+            } else {
+                info!("MPSL ONEWAY TX recall released; resuming stream");
+            }
         }
         if report_at.elapsed() >= Duration::from_secs(5) {
             let elapsed_us = report_at.elapsed().as_micros().max(1);

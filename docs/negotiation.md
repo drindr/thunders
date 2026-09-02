@@ -114,6 +114,19 @@ combos):
   `OneWaySender` engine's stop-and-wait reliability is now a runtime
   property (`set_reliable`) shared with the negotiation phase
 
+Measured on hardware (nRF54LM20 sender -> nRF52840 receiver, phase-align
+build, channel 0):
+
+```text
+baseline streaming:        3306 packets/s, feedback locked
+foreign-prefix recall:     sender kept streaming (neg=false), addressing OK
+addressed recall -> echo:  confirmed after 232 ms (~6 batch boundaries,
+                           includes app-loop detection latency)
+during negotiation:        full-rate echoes, 0 CRC-bad
+release:                   streaming resumed at 3306/s, state counter
+                           continuous across the phase round trip
+```
+
 Not yet implemented:
 
 - the config command loop (power up/down, frequency step, apply-at-boundary)
