@@ -30,8 +30,8 @@ name = "tdma-receiver"
 path = "src/bin/tdma_receiver.rs"
 
 [patch.crates-io]
-embassy-nrf = { path = "../../../../embassy-nrf54/embassy-nrf" }
-embassy-time-driver = { path = "../../../../embassy-nrf54/embassy-time-driver" }
+embassy-nrf = { git = "https://github.com/embassy-rs/embassy", rev = "712c715944f338d841043c7f4d20add67449bc94" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", rev = "712c715944f338d841043c7f4d20add67449bc94" }
 
 [profile.release]
 debug = 2

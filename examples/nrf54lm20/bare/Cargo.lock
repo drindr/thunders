@@ -298,12 +298,13 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 [[package]]
 name = "embassy-embedded-hal"
 version = "0.6.0"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
 dependencies = [
  "defmt 1.1.1",
  "embassy-futures",
  "embassy-hal-internal",
- "embassy-sync 0.8.0",
- "embassy-time 0.5.1",
+ "embassy-sync 0.8.0 (git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94)",
+ "embassy-time 0.5.1 (git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94)",
  "embedded-hal 0.2.7",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
@@ -323,7 +324,7 @@ dependencies = [
  "critical-section",
  "document-features",
  "embassy-executor-macros",
- "embassy-executor-timer-queue 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "embassy-executor-timer-queue 0.1.0",
 ]
 
 [[package]]
@@ -341,20 +342,26 @@ dependencies = [
 [[package]]
 name = "embassy-executor-timer-queue"
 version = "0.1.0"
-
-[[package]]
-name = "embassy-executor-timer-queue"
-version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fc328bf943af66b80b98755db9106bf7e7471b0cf47dc8559cd9a6be504cc9c"
 
 [[package]]
+name = "embassy-executor-timer-queue"
+version = "0.1.1"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
+dependencies = [
+ "unitrait",
+]
+
+[[package]]
 name = "embassy-futures"
 version = "0.1.2"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
 
 [[package]]
 name = "embassy-hal-internal"
 version = "0.5.0"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
 dependencies = [
  "cortex-m",
  "critical-section",
@@ -365,6 +372,7 @@ dependencies = [
 [[package]]
 name = "embassy-nrf"
 version = "0.11.0"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
 dependencies = [
  "bitflags 2.13.1",
  "cfg-if",
@@ -376,7 +384,7 @@ dependencies = [
  "embassy-embedded-hal",
  "embassy-futures",
  "embassy-hal-internal",
- "embassy-sync 0.8.0",
+ "embassy-sync 0.8.0 (git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94)",
  "embassy-time-driver",
  "embassy-time-queue-utils",
  "embassy-usb-driver",
@@ -393,19 +401,7 @@ dependencies = [
  "rand_core 0.10.1",
  "rand_core 0.6.4",
  "rand_core 0.9.5",
-]
-
-[[package]]
-name = "embassy-sync"
-version = "0.8.0"
-dependencies = [
- "cfg-if",
- "critical-section",
- "defmt 1.1.1",
- "embedded-io-async 0.7.0",
- "futures-core",
- "futures-sink",
- "heapless",
+ "thiserror",
 ]
 
 [[package]]
@@ -423,17 +419,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "embassy-time"
-version = "0.5.1"
+name = "embassy-sync"
+version = "0.8.0"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
 dependencies = [
  "cfg-if",
  "critical-section",
- "document-features",
- "embassy-time-driver",
- "embedded-hal 0.2.7",
- "embedded-hal 1.0.0",
- "embedded-hal-async",
+ "defmt 1.1.1",
+ "embedded-io-async 0.7.0",
  "futures-core",
+ "futures-sink",
+ "heapless",
 ]
 
 [[package]]
@@ -453,8 +449,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "embassy-time"
+version = "0.5.1"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
+dependencies = [
+ "cfg-if",
+ "critical-section",
+ "document-features",
+ "embassy-time-driver",
+ "embedded-hal 0.2.7",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "futures-core",
+]
+
+[[package]]
 name = "embassy-time-driver"
 version = "0.2.2"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
 dependencies = [
  "document-features",
 ]
@@ -462,14 +474,16 @@ dependencies = [
 [[package]]
 name = "embassy-time-queue-utils"
 version = "0.3.2"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
 dependencies = [
- "embassy-executor-timer-queue 0.1.0",
+ "embassy-executor-timer-queue 0.1.1",
  "heapless",
 ]
 
 [[package]]
 name = "embassy-usb-driver"
 version = "0.2.2"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
 dependencies = [
  "defmt 1.1.1",
  "embedded-io-async 0.6.1",
@@ -479,11 +493,11 @@ dependencies = [
 [[package]]
 name = "embassy-usb-synopsys-otg"
 version = "0.4.0"
+source = "git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94#712c715944f338d841043c7f4d20add67449bc94"
 dependencies = [
- "critical-section",
  "defmt 1.1.1",
- "embassy-sync 0.8.0",
- "embassy-time 0.5.1",
+ "document-features",
+ "embassy-sync 0.8.0 (git+https://github.com/embassy-rs/embassy?rev=712c715944f338d841043c7f4d20add67449bc94)",
  "embassy-usb-driver",
  "portable-atomic",
 ]
@@ -1208,6 +1222,26 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unitrait"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e1e3ee3aa62b245f34e2e52292a7dc2f97716f8d95f3ab384a6d9b19244ccdd"
+dependencies = [
+ "unitrait-macros",
+]
+
+[[package]]
+name = "unitrait-macros"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0707a2f7725395e3c1a4ef68ba9c02b7253c9e8f45045d791bf2056e965ab14"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "valuable"
