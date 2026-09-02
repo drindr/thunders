@@ -11,5 +11,5 @@ pub mod mpsl;
 #[cfg(feature = "mpsl")]
 pub use mpsl::MpslRadioPhy;
 #[cfg(feature = "_nrf54")]
-pub use radio_phy::hfxo_cap_trim;
+pub use radio_phy::{hfxo_cap_trim, rramc_fast_fetch};
 pub use radio_phy::{NrfRadioPhy, RadioError, RadioIrqHandler, RadioMode};

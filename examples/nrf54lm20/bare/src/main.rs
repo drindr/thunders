@@ -122,6 +122,7 @@ unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
         frame.r0(),
         frame.lr()
     );
+    cortex_m::asm::bkpt();
     loop {
         cortex_m::asm::wfi();
     }

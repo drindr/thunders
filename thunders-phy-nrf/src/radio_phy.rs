@@ -3,10 +3,10 @@
 //! Supports nRF52, nRF53, and nRF54 series chips.
 
 use core::marker::PhantomData;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use embassy_nrf::interrupt::typelevel::{self, Binding, Handler, Interrupt};
-use embassy_nrf::{Peri, peripherals};
+use embassy_nrf::{peripherals, Peri};
 
 /// nRF54L HFXO load-cap trim (call once at boot). The 32 MHz crystal's
 /// internal capacitors come from FICR.XOSC32MTRIM + the DK's 15 pF target;
@@ -30,13 +30,21 @@ pub fn hfxo_cap_trim() {
         (0x5012_071C as *mut u32).write_volatile(cap as u32); // OSCILLATORS.XO32M.CONFIG.INTCAP
     }
 }
-use embassy_time::Duration;
-#[cfg(not(any(feature = "nrf5340-net", feature = "_nrf54")))]
-use nrf_pac::RADIO as PAC_RADIO;
-#[cfg(feature = "nrf5340-net")]
-use nrf_pac::RADIO_NS as PAC_RADIO;
+
+/// nRF54L RRAM fast-fetch (call once at boot, before any MPSL use). The
+/// code-fetch RAM comes out of reset in a low-latency-critical-unfriendly
+/// mode; the MPSL blob's session arming runs on hard deadlines and asserts
+/// (observed: MPSL assert 106:179) when instruction fetch is slow. The
+/// first timeslot can be granted before the phy constructor returns, so
+/// `MpslRadioPhy::new` calls this before opening the session — but calling
+/// it at the top of main is cheaper still.
 #[cfg(feature = "_nrf54")]
-use nrf_pac::RADIO_S as PAC_RADIO;
+pub fn rramc_fast_fetch() {
+    let lowpower = nrf_pac::RRAMC_S.power().lowpowerconfig();
+    lowpower.write(|w| w.set_mode(nrf_pac::rramc::vals::Mode::Standby));
+}
+
+use embassy_time::Duration;
 use nrf_pac::radio::vals::S1incl;
 #[cfg(not(feature = "_nrf54"))]
 use nrf_pac::radio::vals::{
@@ -44,6 +52,12 @@ use nrf_pac::radio::vals::{
 };
 #[cfg(feature = "_nrf54")]
 use nrf_pac::radio::vals::{Crcinc, Crcstatus, Endian, Len, Mode, Plen, Skipaddr, State, Txpower};
+#[cfg(not(any(feature = "nrf5340-net", feature = "_nrf54")))]
+use nrf_pac::RADIO as PAC_RADIO;
+#[cfg(feature = "nrf5340-net")]
+use nrf_pac::RADIO_NS as PAC_RADIO;
+#[cfg(feature = "_nrf54")]
+use nrf_pac::RADIO_S as PAC_RADIO;
 use thunders::{config::Address, error::Error, phy::Phy};
 
 /// RADIO mode.

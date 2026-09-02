@@ -18,6 +18,8 @@ use thunders::error::Error;
 use thunders::mode::{fixed_slot_plan, round_up_us, AirTiming, LinkMode, SlotOverhead};
 use thunders::phy::Phy;
 
+#[cfg(feature = "_nrf54")]
+use crate::radio_phy::rramc_fast_fetch;
 use crate::radio_phy::RadioMode;
 
 /// Scheduling granularity applied to mathematically derived slot durations.
@@ -146,6 +148,12 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
     /// MPSL must already be initialized; `state` must outlive the phy.
     pub fn new(_radio_mode: RadioMode, state: &'d mut MpslState) -> Self {
         // hfxo_cap_trim(): called by the example before embassy_nrf::init.
+        // Fast RRAM fetch FIRST: the blob's init/arming paths run on hard
+        // deadlines and assert (observed: MPSL assert 106:179) when the
+        // fetch RAM is in PowerOff — which it is out of reset, and the
+        // first timeslot can be granted before this constructor returns.
+        #[cfg(feature = "_nrf54")]
+        rramc_fast_fetch();
         // The DWT cycle counter (the follower's echo TX delay; embassy's
         // 30 us tick is too coarse for echo placement).
         unsafe {
@@ -206,15 +214,14 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
             let _ = request_result;
         }
 
-        // The nRF54L needs its RADIO/TIMER NVIC lines + the RRAM out of
-        // PowerOff (the chained arming asserts otherwise).
+        // The nRF54L needs its RADIO/TIMER NVIC lines (the blob's chained
+        // arming runs on those IRQs; the RRAM fast-fetch was already set
+        // above, before the session could grant anything).
         #[cfg(feature = "_nrf54")]
         unsafe {
             use embassy_nrf::interrupt::typelevel::{Interrupt as _, RADIO_0, TIMER10};
             RADIO_0::enable();
             TIMER10::enable();
-            let lowpower = nrf_pac::RRAMC_S.power().lowpowerconfig();
-            lowpower.write(|w| w.set_mode(nrf_pac::rramc::vals::Mode::Standby));
         }
         // The MPSL's radio processing runs on the RADIO IRQ.
         #[cfg(feature = "nrf5340-net")]

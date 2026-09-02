@@ -108,28 +108,31 @@ nRF5340 net core is debug-locked: every flash needs `--allow-erase-all`.
 
 - **TXPOWER is encoded**: 0 dBm = `0x18`. The raw `0x00` leaves the PA off
   (the "phantom TX" — the radio runs its TX state machine but emits no RF).
-- **RRAM fetch latency**: the MPSL's timeslot arming needs the code-fetch RAM
-  out of PowerOff (`RRAMC.LOWPOWERCONFIG = Standby`) or the session deadline
-  asserts.
+- **RRAM fetch latency**: the MPSL blob's timeslot arming runs on hard
+  deadlines and asserts (MPSL assert `106:179`) when instruction fetch is
+  slow. `RRAMC.LOWPOWERCONFIG = Standby` must be set *before* the session
+  opens — the first timeslot can be granted immediately after the first
+  request. `rramc_fast_fetch()` runs at the top of `MpslRadioPhy::new` and
+  at the top of the LM20 examples' main.
 - **Event block at 0x200+**: the nRF54L radio's events sit at 0x200-0x220 (the
   nRF5340's at 0x100-0x110).
 - **TXD/RXD DMA amounts**: no SVD registers at 0xEE8/0xED4, but the writes are
   required on silicon (0-length PDUs / no RX otherwise).
 - **Errata 54L/49**: the first on-air payload bits need a hidden register
   (0x5008C58C) set.
-- **Boot HardFault**: the LM20 occasionally escalates a BusFault inside the
-  MPSL blob right after flashing; reflashing clears it. Observed with both
-  the local and upstream embassy builds — not application code.
-- **Layout-sensitive landmine**: removing ~900 lines of dead code from
-  `thunders-phy-nrf` (bare-only legacy scheduler) made the MPSL blob assert
-  deterministically at boot on the LM20 (call through a null callback at
-  `pc=0x0`, `CFSR=0x00080000`, escalation into HardFault), while the exact
-  same runtime code with the dead code present runs fine — and the bare link
-  was unaffected. The root cause sits inside the closed-source blob's init
-  and is layout/timing sensitive, so the legacy `NrfRadioPhy` code stays in
-  the tree until that is understood. Both LM20 examples install a precise
-  HardFault handler that prints CFSR/HFSR/BFAR and the stacked PC/R0/LR to
-  make any recurrence diagnosable.
+- **Post-flash boot faults (unresolved)**: a boot immediately after a *real*
+  flash (different image written) sometimes faults during MPSL/app init —
+  mixed signatures: blob assert, null-pointer call (`pc=0x0`), precise bus
+  fault at address 0, bogus index. Plain resets and same-image reflashes are
+  always clean, so this is a probe-rs flash-algo ↔ RRAM interaction, not
+  application code; a suspect is the RRAMC write buffer surviving reset and
+  merging stale data into fetches of freshly written wordlines until it
+  auto-commits (boot delays reduce but do not eliminate it). Workaround:
+  reflash or reset and retry. Removing dead code shifts the boot timing and
+  can make this nearly deterministic — that is why a legacy bare-scheduler
+  excision in `thunders-phy-nrf` was reverted. Both LM20 examples install a
+  precise HardFault handler (CFSR/HFSR/BFAR, stacked PC/R0/LR, fault-context
+  and peripheral-register dump over defmt) so any recurrence is diagnosable.
 
 ## Repository layout
 

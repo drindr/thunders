@@ -103,8 +103,50 @@ async fn run_multi_receiver(mut phy: MpslRadioPhy<'static, { DATA_SLOT_US as u32
     }
 }
 
+/// TEMP DIAG: dump the residue-suspect register basket (same dump runs at
+/// boot and in the HardFault handler so the two can be diffed).
+fn dump_regs(tag: &str) {
+    let read = |a: u32| unsafe { (a as *const u32).read_volatile() };
+    defmt::info!(
+        "DUMP[{}] RRAMC 500={=u32:08x} 504={=u32:08x} 508={=u32:08x} 50c={=u32:08x} 510={=u32:08x} 514={=u32:08x} 518={=u32:08x}",
+        tag,
+        read(0x5004_e500),
+        read(0x5004_e504),
+        read(0x5004_e508),
+        read(0x5004_e50c),
+        read(0x5004_e510),
+        read(0x5004_e514),
+        read(0x5004_e518),
+    );
+    defmt::info!(
+        "DUMP[{}] CPWR 00={=u32:08x} 04={=u32:08x} 08={=u32:08x} 0c={=u32:08x} 10={=u32:08x} 14={=u32:08x} 400={=u32:08x} 404={=u32:08x}",
+        tag,
+        read(0x5010_e000),
+        read(0x5010_e004),
+        read(0x5010_e008),
+        read(0x5010_e00c),
+        read(0x5010_e010),
+        read(0x5010_e014),
+        read(0x5010_e400),
+        read(0x5010_e404),
+    );
+    defmt::info!(
+        "DUMP[{}] GRTC 00={=u32:08x} 04={=u32:08x} 500={=u32:08x} 504={=u32:08x} 508={=u32:08x} 50c={=u32:08x} 510={=u32:08x} 514={=u32:08x}",
+        tag,
+        read(0x500e_2000),
+        read(0x500e_2004),
+        read(0x500e_2500),
+        read(0x500e_2504),
+        read(0x500e_2508),
+        read(0x500e_250c),
+        read(0x500e_2510),
+        read(0x500e_2514),
+    );
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    thunders_phy_nrf::rramc_fast_fetch();
     thunders_phy_nrf::hfxo_cap_trim();
     let mut config = embassy_nrf::config::Config::default();
     config.flpr_reset = embassy_nrf::config::FlprReset::Leave;
@@ -273,6 +315,26 @@ unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
         frame.r0(),
         frame.lr()
     );
+    // TEMP DIAG: dump the null-callback struct the blob called through
+    // (r0 == context pointer at the fault) and the register basket.
+    let r0 = frame.r0() as usize;
+    if (0x2000_0000..0x2008_0000).contains(&r0) {
+        let p = r0 as *const u32;
+        defmt::error!(
+            "FAULTCTX @{=u32:08x}: {=u32:08x} {=u32:08x} {=u32:08x} {=u32:08x} {=u32:08x} {=u32:08x} {=u32:08x} {=u32:08x}",
+            r0 as u32,
+            unsafe { p.read_volatile() },
+            unsafe { p.add(1).read_volatile() },
+            unsafe { p.add(2).read_volatile() },
+            unsafe { p.add(3).read_volatile() },
+            unsafe { p.add(4).read_volatile() },
+            unsafe { p.add(5).read_volatile() },
+            unsafe { p.add(6).read_volatile() },
+            unsafe { p.add(7).read_volatile() },
+        );
+    }
+    dump_regs("fault");
+    cortex_m::asm::bkpt();
     loop {
         cortex_m::asm::wfi();
     }
