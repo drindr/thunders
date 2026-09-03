@@ -41,10 +41,12 @@ git dependency; embassy HAL is upstream `embassy-rs/embassy` via
 | MPSL one-way, `phase-align` | LM20 3331/s | 52833 | 3331 pkt/s | 0 CRC-bad, 0 invalid |
 | MPSL one-way, `hopping` | LM20 3304/s | 52840 | 3267 pkt/s | 0 CRC-bad while hopping 8 channels |
 | MPSL multi-sender | LM20 1666/s + 5340 1111/s | 52840 | 1623/s + 898/s | both senders demultiplexed concurrently |
+| MPSL multi-sender | 52833 1384/s + 5340 1111/s | LM20 | 1373/s + 900/s | 52833 as sender 0, 99% delivery |
 | Bare one-way | LM20 14705/s | 52840 | 14627 pkt/s | 0% loss, feedback flowing |
 | Bare one-way | LM20 15183/s | 52833 | 15183 pkt/s | 0% loss (1 frame lost in 380k) |
 | Bare one-way, `hopping` | LM20 14723/s | 52840 | 14625 pkt/s | 0% loss |
 | Bare TDMA, 2 senders | 52840 5265/s + 5340 5221/s | LM20 | 5258/s + 5160/s | 0 invalid; ~2% CRC-bad from collisions |
+| Bare TDMA, 2 senders | 52833 5264/s + 5340 5221/s | LM20 | 5263/s + 5183/s | 52833 as TDMA master; same collision noise |
 
 ## Optional features (MPSL examples)
 
