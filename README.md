@@ -124,18 +124,26 @@ nRF5340 net core is debug-locked: every flash needs `--allow-erase-all`.
   *real* flash (different image written) used to fault semi-randomly during
   MPSL/app init — blob assert, null-pointer call, precise bus fault at
   address 0, bogus index. Root cause found by diffing RRAM against the ELF
-  after a failed boot: probe-rs's nRF54LM20 flash algorithm occasionally
-  leaves stale words behind (observed pattern: the word at page+0x004 in a
-  few 4 KiB pages keeps the previous image's content). The CPU then executes
-  corrupted instructions; which addresses are bad — and whether they sit on
-  the boot path — decides the signature, which is why removing dead code
-  ("layout-sensitive landmine") could make it deterministic. Plain resets
-  and same-image reflashes are clean because the content is already
-  correct. **Always flash the LM20 with `--verify`** (read-back compare);
-  on `Flash content verification failed` just retry — the reflash rewrites
-  the bad words and the next boot is clean. Both LM20 examples install a
-  precise HardFault handler (CFSR/HFSR/BFAR, stacked PC/R0/LR, fault-context
-  and peripheral-register dump over defmt) so any recurrence is diagnosable.
+  after a failed boot: probe-rs's nRF54LM20 flash algorithm silently
+  mis-programs words. Measured signature over many flash cycles: in long
+  multi-page sessions nearly every rewritten page gets a "write-buffer slip"
+  near its start — the word at page+0x004 (occasionally +0x008) is lost and
+  the *next* word's value lands in both slots (dup-next) — and the last
+  partially-filled 512-byte write buffer of the image drops a word (left
+  erased, 0xFFFFFFFF). Only pages actually erased+rewritten are affected;
+  the incremental flasher compare-skips matching pages, which is why
+  re-flashing an unchanged image is always safe and why a same-image reflash
+  after corruption only rewrites the few mismatched pages and usually
+  repairs them. Resets never change the picture either way: the corruption
+  is in the stored RRAM content, not a runtime state. Which addresses are
+  bad — and whether they sit on the boot path — decides the fault
+  signature, which is why removing dead code ("layout-sensitive landmine")
+  could make it deterministic. **Always flash the LM20 with `--verify`**
+  (read-back compare); on `Flash content verification failed` just retry —
+  each retry rewrites the mismatched pages with a fresh roll, so the loop
+  converges within one or two tries. Both LM20 examples install a precise
+  HardFault handler (CFSR/HFSR/BFAR, stacked PC/R0/LR, fault-context and
+  peripheral-register dump over defmt) so any recurrence is diagnosable.
 
 ## Repository layout
 
