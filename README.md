@@ -53,7 +53,19 @@ sender runs N data slots plus one feedback listen; the receiver holds one
 long RX window per batch and answers after the last data phase — that beacon
 is also the hop/negotiation epoch boundary. See `docs/architecture.md` for
 the exact arithmetic and the measured rates (3.3k packets/s over MPSL,
-16.2k packets/s bare, both with CRC16 and zero invalid frames).
+14.7k packets/s bare, both with CRC16 and zero invalid frames).
+
+## Measured rates (full bench over every example combination)
+
+| Link | TX | RX | Throughput | Integrity |
+|---|---|---|---|---|
+| MPSL one-way, default | LM20 3333/s | 52840 | 3332 pkt/s | 0 CRC-bad, 0 invalid |
+| MPSL one-way, `phase-align` | LM20 3306/s | 52840 | 3306 pkt/s | 0 CRC-bad over 83k frames; recall demo echo confirmed |
+| MPSL one-way, `hopping` | LM20 3304/s | 52840 | 3267 pkt/s | 0 CRC-bad while hopping 8 channels |
+| MPSL multi-sender | LM20 1666/s + 5340 1111/s | 52840 | 1623/s + 898/s | both senders demultiplexed concurrently |
+| Bare one-way | LM20 14705/s | 52840 | 14627 pkt/s | 0% loss, feedback flowing |
+| Bare one-way, `hopping` | LM20 14723/s | 52840 | 14625 pkt/s | 0% loss |
+| Bare TDMA, 2 senders | 52840 5265/s + 5340 5221/s | LM20 | 5258/s + 5160/s | 0 invalid; ~2% CRC-bad from collisions |
 
 ## Optional features (MPSL examples)
 
@@ -65,7 +77,7 @@ the exact arithmetic and the measured rates (3.3k packets/s over MPSL,
 | `multi-sender-bench` / `multi-receiver` | The 2-TX/1-RX benchmark roles. |
 | `sender-1` | nrf54lm20 transmits with the 0xC3 prefix (second-sender role). |
 
-The bare examples carry the same one-way stream at ~16.2k packets/s and a
+The bare examples carry the same one-way stream at ~14.7k packets/s and a
 const-generic TDMA pair (`--bin tdma-sender` / `--bin tdma-receiver`, shared
 schedule in `examples/tdma_config.rs`).
 
