@@ -9,7 +9,7 @@ use super::state::{MpslState, OpKind};
 type Radio = nrf_pac::radio::Radio;
 
 // RX completion event: EVENTS_END on the 5340/52840, EVENTS_PHYEND on the LM20.
-#[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
+#[cfg(any(feature = "nrf5340-net", feature = "nrf52840", feature = "nrf52833"))]
 fn end_ev_set(r: Radio) -> bool {
     r.events_end().read() != 0
 }
@@ -18,7 +18,7 @@ fn end_ev_set(r: Radio) -> bool {
     r.events_phyend().read() != 0
 }
 fn end_ev_clear(r: Radio) {
-    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
+    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840", feature = "nrf52833"))]
     r.events_end().write_value(0);
     #[cfg(feature = "_nrf54")]
     r.events_phyend().write_value(0);
@@ -26,7 +26,7 @@ fn end_ev_clear(r: Radio) {
 
 #[cfg(feature = "nrf5340-net")]
 pub(crate) const CPU_MHZ: u32 = 64;
-#[cfg(feature = "nrf52840")]
+#[cfg(any(feature = "nrf52840", feature = "nrf52833"))]
 pub(crate) const CPU_MHZ: u32 = 64;
 #[cfg(feature = "_nrf54")]
 pub(crate) const CPU_MHZ: u32 = 128;
@@ -84,7 +84,7 @@ fn disable_wait(r: Radio) {
 /// auto-disables at the frame end (END/PHYEND->DISABLE).
 fn shorts_rx() -> regs::Shorts {
     let mut s = regs::Shorts(0);
-    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
+    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840", feature = "nrf52833"))]
     {
         s.set_rxready_start(true);
         s.set_end_disable(true);
@@ -104,7 +104,7 @@ fn shorts_rx() -> regs::Shorts {
 /// State-window RX ramps once and returns to RXIDLE after each packet.
 fn shorts_rx_state() -> regs::Shorts {
     let mut s = regs::Shorts(0);
-    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
+    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840", feature = "nrf52833"))]
     {
         s.set_rxready_start(true);
     }
@@ -118,7 +118,7 @@ fn shorts_rx_state() -> regs::Shorts {
 /// The TX shortcuts (same idea, keyed on TXREADY on the 5340/52840).
 fn shorts_tx() -> regs::Shorts {
     let mut s = regs::Shorts(0);
-    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
+    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840", feature = "nrf52833"))]
     {
         s.set_txready_start(true);
         s.set_end_disable(true);
@@ -151,7 +151,7 @@ unsafe fn radio_configure(state: &MpslState, statlen: u8) {
     power_constlat();
 
     // MODECNF0.RU = Fast: the radio ramp drops from 129 us (Legacy) to 40 us.
-    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
+    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840", feature = "nrf52833"))]
     r.modecnf0().modify(|w| w.set_ru(vals::Ru::Fast));
 
     // Configure the selected on-air mode (the two families name the mode
@@ -162,7 +162,7 @@ unsafe fn radio_configure(state: &MpslState, statlen: u8) {
         crate::radio_phy::RadioMode::Ble1Mbit => (vals::Mode::Ble1mbit as u32, vals::Plen::_8bit),
         crate::radio_phy::RadioMode::Ble2Mbit => (vals::Mode::Ble2mbit as u32, vals::Plen::_16bit),
     };
-    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
+    #[cfg(any(feature = "nrf5340-net", feature = "nrf52840", feature = "nrf52833"))]
     r.mode().write_value(regs::Mode(mode_val));
     #[cfg(feature = "_nrf54")]
     r.mode().write_value(regs::RadioMode(mode_val));
@@ -203,7 +203,7 @@ unsafe fn radio_configure(state: &MpslState, statlen: u8) {
     // Board TX power ceiling: LM20 and 52840 run +8 dBm, the 5340 net core
     // is limited to 0 dBm by its RADIO frontend.
     let mut txpower = regs::Txpower(0);
-    #[cfg(any(feature = "_nrf54", feature = "nrf52840"))]
+    #[cfg(any(feature = "_nrf54", feature = "nrf52840", feature = "nrf52833"))]
     txpower.set_txpower(vals::Txpower::Pos8dBm);
     #[cfg(feature = "nrf5340-net")]
     txpower.set_txpower(vals::Txpower::_0dBm);

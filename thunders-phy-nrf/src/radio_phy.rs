@@ -99,11 +99,11 @@ pub enum RadioError {
 /// CPU frequency per chip family (the DWT cycle counter ticks at this rate).
 #[cfg(feature = "nrf5340-net")]
 const CPU_MHZ: u32 = 64;
-#[cfg(feature = "nrf52840")]
+#[cfg(any(feature = "nrf52840", feature = "nrf52833"))]
 const CPU_MHZ: u32 = 64;
 #[cfg(feature = "_nrf54")]
 const CPU_MHZ: u32 = 128;
-#[cfg(not(any(feature = "nrf5340-net", feature = "nrf52840", feature = "_nrf54")))]
+#[cfg(not(any(feature = "nrf5340-net", feature = "nrf52840", feature = "nrf52833", feature = "_nrf54")))]
 const CPU_MHZ: u32 = 64;
 
 /// The fixed slot period for the bare software slot scheduler (us). Both
@@ -455,7 +455,7 @@ impl<'d> NrfRadioPhy<'d> {
 
         // Board TX power ceiling: the 52840 runs +8 dBm; the nRF5340 net
         // core uses TXPOWER=0 dBm plus the +3 dB high-voltage gain path.
-        #[cfg(feature = "nrf52840")]
+        #[cfg(any(feature = "nrf52840", feature = "nrf52833"))]
         r.txpower().write(|w| w.set_txpower(Txpower::Pos8dBm));
         #[cfg(feature = "nrf5340-net")]
         r.txpower().write(|w| w.set_txpower(Txpower::_0dBm));

@@ -2,8 +2,8 @@
 
 A compile-time, fixed-packet **one-way** link layer for the Nordic 2.4 GHz
 RADIO, over two backends — a bare exclusive RADIO driver and an MPSL
-timeslot backend. Three heterogeneous boards interoperate on one wire
-format: **nRF52840**, **nRF5340** (net core), **nRF54LM20**.
+timeslot backend. Four heterogeneous boards interoperate on one wire
+format: **nRF52833**, **nRF52840**, **nRF5340** (net core), **nRF54LM20**.
 
 ```
 ┌──────────────────┐  fixed 6-byte state   ┌──────────────────┐
@@ -26,7 +26,7 @@ into a reliable negotiation phase. Details: [`docs/architecture.md`](docs/archit
 |---|---|
 | `thunders` | Protocol core: one-way modes, const slot planner, negotiation codec, `StaticTdma`, the `Phy` trait. `no_std`, board-agnostic. |
 | `thunders-phy-nrf` | nRF PHY: **bare** (exclusive RADIO, TXIDLE/RXIDLE restart per packet) and **mpsl** (RADIO inside MPSL timeslots). Registers via `nrf-pac`. |
-| `examples/{nrf52840,nrf5340,nrf54lm20}/{bare,mpsl}` | Board firmware; sender/receiver roles are separate binaries/Cargo features. |
+| `examples/{nrf52833,nrf52840,nrf5340,nrf54lm20}/{bare,mpsl}` | Board firmware; sender/receiver roles are separate binaries/Cargo features. |
 
 MPSL is the stock [`alexmoon/nrf-sdc`](https://github.com/alexmoon/nrf-sdc)
 git dependency; embassy HAL is upstream `embassy-rs/embassy` via
@@ -38,9 +38,11 @@ git dependency; embassy HAL is upstream `embassy-rs/embassy` via
 |---|---|---|---|---|
 | MPSL one-way, default | LM20 3333/s | 52840 | 3332 pkt/s | 0 CRC-bad, 0 invalid |
 | MPSL one-way, `phase-align` | LM20 3306/s | 52840 | 3306 pkt/s | 0 CRC-bad over 83k frames; recall demo echo confirmed |
+| MPSL one-way, `phase-align` | LM20 3331/s | 52833 | 3331 pkt/s | 0 CRC-bad, 0 invalid |
 | MPSL one-way, `hopping` | LM20 3304/s | 52840 | 3267 pkt/s | 0 CRC-bad while hopping 8 channels |
 | MPSL multi-sender | LM20 1666/s + 5340 1111/s | 52840 | 1623/s + 898/s | both senders demultiplexed concurrently |
 | Bare one-way | LM20 14705/s | 52840 | 14627 pkt/s | 0% loss, feedback flowing |
+| Bare one-way | LM20 15183/s | 52833 | 15183 pkt/s | 0% loss (1 frame lost in 380k) |
 | Bare one-way, `hopping` | LM20 14723/s | 52840 | 14625 pkt/s | 0% loss |
 | Bare TDMA, 2 senders | 52840 5265/s + 5340 5221/s | LM20 | 5258/s + 5160/s | 0 invalid; ~2% CRC-bad from collisions |
 
@@ -59,7 +61,7 @@ The bare examples add a const-generic TDMA pair (`--bin tdma-sender` /
 
 ## Building & flashing
 
-Prereqs: `probe-rs`, Rust targets `thumbv7em-none-eabihf` (nRF52840),
+Prereqs: `probe-rs`, Rust targets `thumbv7em-none-eabihf` (nRF52833/52840),
 `thumbv8m.main-none-eabi` (nRF5340), `thumbv8m.main-none-eabihf` (nRF54LM20).
 
 ```sh
@@ -92,12 +94,13 @@ needs `--allow-erase-all`.
   (0x5008C58C) set.
 - **Post-flash boot faults = corrupted flash content**: probe-rs's
   *double-buffered* flashing downloads the next page buffer over MEM-AP
-  while the CPU runs the RRAMC buffered-write algorithm; the bus contention
-  mis-slots one word near the start of each `ProgramPage` call (dropped +
-  next word duplicated). Boots then fault semi-randomly (blob assert, null
-  call, bus fault); resets don't help because the corruption is in the RRAM
-  content itself. Always flash the LM20 with `--disable-double-buffering`
-  and/or `--verify`. Both LM20 examples install a precise HardFault handler
+  while the CPU runs the flash algorithm; the bus contention mis-slots one
+  word near the start of each `ProgramPage` call (dropped + next word
+  duplicated). Observed on the LM20 (RRAMC buffered write) and the 52833
+  (NVMC) — always flash both with `--disable-double-buffering` and/or
+  `--verify`. Boots then fault semi-randomly (blob assert, null call, bus
+  fault); resets don't help because the corruption is in the stored flash
+  content itself. Both LM20 examples install a precise HardFault handler
   (CFSR/HFSR/BFAR, stacked PC/R0/LR, fault-context dump over defmt) so any
   recurrence is diagnosable.
 - **Retracted**: an early `RRAMC.LOWPOWERCONFIG = Standby` write turned out

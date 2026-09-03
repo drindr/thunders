@@ -176,7 +176,7 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
 
         // MODECNF0.RU = Fast BEFORE the session opens: the grant machinery
         // sizes the radio ramp from this register.
-        #[cfg(any(feature = "nrf5340-net", feature = "nrf52840"))]
+        #[cfg(any(feature = "nrf5340-net", feature = "nrf52840", feature = "nrf52833"))]
         {
             state
                 .radio
