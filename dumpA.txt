@@ -1,2 +1,0 @@
-0x0001cfc4 in ?? ()
-0x5004e000:	[Inferior 1 (process 1) detached]

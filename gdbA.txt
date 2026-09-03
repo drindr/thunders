@@ -1,6 +1,0 @@
-set pagination off
-target remote 127.0.0.1:3333
-x/96xw 0x5004e000
-x/96xw 0x5010e000
-x/96xw 0x500e2000
-quit

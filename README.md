@@ -96,8 +96,8 @@ probe-rs run --chip nRF52840_xxAA --probe "0d28:0204-3:0700..." \
 # sender: nRF54LM20 (J-Link; auto-detect fails, --chip is required)
 cd examples/nrf54lm20/mpsl
 cargo build --release --no-default-features --features phase-align
-probe-rs run --verify --chip nRF54LM20A --probe 1366:1069 \
-  target/thumbv8m.main-none-eabihf/release/thunders-mpsl
+probe-rs run --verify --disable-double-buffering --chip nRF54LM20A \
+  --probe 1366:1069 target/thumbv8m.main-none-eabihf/release/thunders-mpsl
 ```
 
 The receiver's RTT log shows the recall demo (foreign prefix, addressed
@@ -132,10 +132,10 @@ nRF5340 net core is debug-locked: every flash needs `--allow-erase-all`.
   decides the fault signature, which is why removing dead code
   ("layout-sensitive landmine") could make it deterministic; resets never
   change anything because the corruption is in the stored RRAM content.
-  Fixed in our probe-rs fork (44fb5aa4 + `disable_double_buffering` flag in
-  `probe-rs-target`, set for all nRF54L targets); with the stock tool,
-  flash with `--disable-double-buffering` and/or `--verify` — verification
-  catches the bad words and retrying converges within one or two tries.
+  Mitigation: flash the LM20 with `--disable-double-buffering` (forces
+  single-buffered programming; corruption-free across repeated
+  bidirectional flash cycles) and/or `--verify` — verification catches the
+  bad words and retrying converges within one or two tries.
   Both LM20 examples install a precise HardFault handler (CFSR/HFSR/BFAR,
   stacked PC/R0/LR, fault-context and peripheral-register dump over defmt)
   so any recurrence is diagnosable.
