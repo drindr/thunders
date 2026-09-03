@@ -146,7 +146,6 @@ fn dump_regs(tag: &str) {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    thunders_phy_nrf::rramc_fast_fetch();
     thunders_phy_nrf::hfxo_cap_trim();
     let mut config = embassy_nrf::config::Config::default();
     config.flpr_reset = embassy_nrf::config::FlprReset::Leave;

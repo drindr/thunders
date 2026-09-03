@@ -108,12 +108,13 @@ nRF5340 net core is debug-locked: every flash needs `--allow-erase-all`.
 
 - **TXPOWER is encoded**: 0 dBm = `0x18`. The raw `0x00` leaves the PA off
   (the "phantom TX" — the radio runs its TX state machine but emits no RF).
-- **RRAM fetch latency**: the MPSL blob's timeslot arming runs on hard
-  deadlines and asserts (MPSL assert `106:179`) when instruction fetch is
-  slow. `RRAMC.LOWPOWERCONFIG = Standby` must be set *before* the session
-  opens — the first timeslot can be granted immediately after the first
-  request. `rramc_fast_fetch()` runs at the top of `MpslRadioPhy::new` and
-  at the top of the LM20 examples' main.
+- **RRAM fetch latency (retracted)**: we once believed the MPSL blob's
+  timeslot arming asserted (MPSL assert `106:179`) when the code-fetch RRAM
+  was in its reset-default low-power mode, and set
+  `RRAMC.LOWPOWERCONFIG = Standby` early. Controlled re-test with
+  verified-intact flash content shows 8/8 clean full-rate boots *without*
+  the write — those asserts were flash-corruption artifacts too. The helper
+  is removed; don't cargo-cult it back.
 - **Event block at 0x200+**: the nRF54L radio's events sit at 0x200-0x220 (the
   nRF5340's at 0x100-0x110).
 - **TXD/RXD DMA amounts**: no SVD registers at 0xEE8/0xED4, but the writes are
@@ -123,27 +124,21 @@ nRF5340 net core is debug-locked: every flash needs `--allow-erase-all`.
 - **Post-flash boot faults = corrupted flash content**: a boot right after a
   *real* flash (different image written) used to fault semi-randomly during
   MPSL/app init — blob assert, null-pointer call, precise bus fault at
-  address 0, bogus index. Root cause found by diffing RRAM against the ELF
-  after a failed boot: probe-rs's nRF54LM20 flash algorithm silently
-  mis-programs words. Measured signature over many flash cycles: in long
-  multi-page sessions nearly every rewritten page gets a "write-buffer slip"
-  near its start — the word at page+0x004 (occasionally +0x008) is lost and
-  the *next* word's value lands in both slots (dup-next) — and the last
-  partially-filled 512-byte write buffer of the image drops a word (left
-  erased, 0xFFFFFFFF). Only pages actually erased+rewritten are affected;
-  the incremental flasher compare-skips matching pages, which is why
-  re-flashing an unchanged image is always safe and why a same-image reflash
-  after corruption only rewrites the few mismatched pages and usually
-  repairs them. Resets never change the picture either way: the corruption
-  is in the stored RRAM content, not a runtime state. Which addresses are
-  bad — and whether they sit on the boot path — decides the fault
-  signature, which is why removing dead code ("layout-sensitive landmine")
-  could make it deterministic. **Always flash the LM20 with `--verify`**
-  (read-back compare); on `Flash content verification failed` just retry —
-  each retry rewrites the mismatched pages with a fresh roll, so the loop
-  converges within one or two tries. Both LM20 examples install a precise
-  HardFault handler (CFSR/HFSR/BFAR, stacked PC/R0/LR, fault-context and
-  peripheral-register dump over defmt) so any recurrence is diagnosable.
+  address 0, bogus index. Root cause: probe-rs's *double-buffered* flashing
+  downloads the next page buffer over MEM-AP while the CPU runs the RRAMC
+  buffered-write algorithm, and the bus contention mis-slots one word near
+  the start of each `ProgramPage` call (the word is dropped and the next
+  word's value lands in both slots — "dup-next"). Which addresses are bad
+  decides the fault signature, which is why removing dead code
+  ("layout-sensitive landmine") could make it deterministic; resets never
+  change anything because the corruption is in the stored RRAM content.
+  Fixed in our probe-rs fork (44fb5aa4 + `disable_double_buffering` flag in
+  `probe-rs-target`, set for all nRF54L targets); with the stock tool,
+  flash with `--disable-double-buffering` and/or `--verify` — verification
+  catches the bad words and retrying converges within one or two tries.
+  Both LM20 examples install a precise HardFault handler (CFSR/HFSR/BFAR,
+  stacked PC/R0/LR, fault-context and peripheral-register dump over defmt)
+  so any recurrence is diagnosable.
 
 ## Repository layout
 

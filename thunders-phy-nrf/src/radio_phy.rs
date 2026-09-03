@@ -31,19 +31,6 @@ pub fn hfxo_cap_trim() {
     }
 }
 
-/// nRF54L RRAM fast-fetch (call once at boot, before any MPSL use). The
-/// code-fetch RAM comes out of reset in a low-latency-critical-unfriendly
-/// mode; the MPSL blob's session arming runs on hard deadlines and asserts
-/// (observed: MPSL assert 106:179) when instruction fetch is slow. The
-/// first timeslot can be granted before the phy constructor returns, so
-/// `MpslRadioPhy::new` calls this before opening the session — but calling
-/// it at the top of main is cheaper still.
-#[cfg(feature = "_nrf54")]
-pub fn rramc_fast_fetch() {
-    let lowpower = nrf_pac::RRAMC_S.power().lowpowerconfig();
-    lowpower.write(|w| w.set_mode(nrf_pac::rramc::vals::Mode::Standby));
-}
-
 use embassy_time::Duration;
 use nrf_pac::radio::vals::S1incl;
 #[cfg(not(feature = "_nrf54"))]

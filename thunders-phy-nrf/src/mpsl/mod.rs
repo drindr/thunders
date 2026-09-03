@@ -19,7 +19,6 @@ use thunders::mode::{fixed_slot_plan, round_up_us, AirTiming, LinkMode, SlotOver
 use thunders::phy::Phy;
 
 #[cfg(feature = "_nrf54")]
-use crate::radio_phy::rramc_fast_fetch;
 use crate::radio_phy::RadioMode;
 
 /// Scheduling granularity applied to mathematically derived slot durations.
@@ -153,7 +152,6 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
         // fetch RAM is in PowerOff — which it is out of reset, and the
         // first timeslot can be granted before this constructor returns.
         #[cfg(feature = "_nrf54")]
-        rramc_fast_fetch();
         // The DWT cycle counter (the follower's echo TX delay; embassy's
         // 30 us tick is too coarse for echo placement).
         unsafe {
