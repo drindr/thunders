@@ -18,7 +18,6 @@ use thunders::error::Error;
 use thunders::mode::{fixed_slot_plan, round_up_us, AirTiming, LinkMode, SlotOverhead};
 use thunders::phy::Phy;
 
-#[cfg(feature = "_nrf54")]
 use crate::radio_phy::RadioMode;
 
 /// Scheduling granularity applied to mathematically derived slot durations.
