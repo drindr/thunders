@@ -146,11 +146,6 @@ impl<'d, const SLOT_US: u32, const RX_POLL: u32> MpslRadioPhy<'d, SLOT_US, RX_PO
     /// MPSL must already be initialized; `state` must outlive the phy.
     pub fn new(_radio_mode: RadioMode, state: &'d mut MpslState) -> Self {
         // hfxo_cap_trim(): called by the example before embassy_nrf::init.
-        // Fast RRAM fetch FIRST: the blob's init/arming paths run on hard
-        // deadlines and assert (observed: MPSL assert 106:179) when the
-        // fetch RAM is in PowerOff — which it is out of reset, and the
-        // first timeslot can be granted before this constructor returns.
-        #[cfg(feature = "_nrf54")]
         // The DWT cycle counter (the follower's echo TX delay; embassy's
         // 30 us tick is too coarse for echo placement).
         unsafe {
